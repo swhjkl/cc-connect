@@ -1613,8 +1613,10 @@ app_secret = "your-feishu-app-secret"
 # # Optional: connect to the shared Codex remote-control daemon instead of
 # # starting a private app-server process. Unix only; disabled by default.
 # app_server_transport = "daemon"
-# # One-time prerequisite: codex app-server daemon enable-remote-control
-# # Start the daemon: codex app-server daemon start
+# # Current Codex CLI: codex remote-control start
+# # Older compatible CLI versions:
+# #   codex app-server daemon enable-remote-control
+# #   codex app-server daemon start
 # # Socket defaults to $CODEX_HOME/app-server-control/app-server-control.sock
 # app_server_socket = "/home/you/.codex/app-server-control/app-server-control.sock"
 #

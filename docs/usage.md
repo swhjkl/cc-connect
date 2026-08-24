@@ -107,11 +107,14 @@ app_server_transport = "daemon"
 app_server_socket = "/home/you/.codex/app-server-control/app-server-control.sock"
 ```
 
-Enable remote control once with
-`codex app-server daemon enable-remote-control`, then start the daemon with
+Current Codex CLI versions start the daemon with `codex remote-control start`.
+For older compatible versions, run
+`codex app-server daemon enable-remote-control` once and then
 `codex app-server daemon start`. The daemon transport uses the configuration of
 the running Codex daemon; per-session process environment overrides do not
-restart or reconfigure that daemon.
+restart or reconfigure that daemon. See the
+[Codex daemon + Feishu server deployment guide](./codex-daemon-feishu-server.md)
+for a complete Linux runbook.
 
 ### Cursor Agent Modes
 

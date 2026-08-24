@@ -105,9 +105,11 @@ app_server_transport = "daemon"
 app_server_socket = "/home/you/.codex/app-server-control/app-server-control.sock"
 ```
 
-首次使用前执行 `codex app-server daemon enable-remote-control`，随后通过
-`codex app-server daemon start` 启动 daemon。daemon transport 使用正在运行的
-Codex daemon 自身配置；每个 session 的进程环境覆盖不会重启或重新配置该 daemon。
+当前 Codex CLI 使用 `codex remote-control start` 启动 daemon。旧版兼容命令是先执行
+`codex app-server daemon enable-remote-control`，再执行
+`codex app-server daemon start`。daemon transport 使用正在运行的 Codex daemon
+自身配置；每个 session 的进程环境覆盖不会重启或重新配置该 daemon。Linux 服务器的
+完整步骤见 [Codex daemon + 飞书部署指南](./codex-daemon-feishu-server.md)。
 
 ### Cursor Agent 模式
 

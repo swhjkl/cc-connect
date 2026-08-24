@@ -2,6 +2,9 @@
 
 本文档介绍如何将 **cc-connect** 接入飞书，让你可以通过飞书机器人远程调用 Claude Code。
 
+如果要在 Linux 服务器上连接共享 Codex app-server daemon，请直接参考
+[Codex daemon + cc-connect + 飞书部署指南](./codex-daemon-feishu-server.md)。
+
 ## 前置要求
 
 - 飞书账号（个人或企业均可）

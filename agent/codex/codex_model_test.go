@@ -70,15 +70,55 @@ func TestNormalizeAppServerURL_EmptyKeepsWebSocketDefault(t *testing.T) {
 	}
 }
 
-func TestWorkspaceAgentOptions_PreservesStdIOAppServerURL(t *testing.T) {
+func TestNormalizeAppServerTransport(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{name: "default preserves process transport", want: appServerTransportProcess},
+		{name: "process", raw: " process ", want: appServerTransportProcess},
+		{name: "daemon", raw: " DAEMON ", want: appServerTransportDaemon},
+		{name: "invalid", raw: "socket", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeAppServerTransport(tt.raw)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("normalizeAppServerTransport(%q) error = nil", tt.raw)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeAppServerTransport(%q) error: %v", tt.raw, err)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeAppServerTransport(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkspaceAgentOptions_PreservesAppServerOptions(t *testing.T) {
 	a := &Agent{
-		backend:      "app_server",
-		appServerURL: normalizeAppServerURL("stdio"),
+		backend:            "app_server",
+		appServerTransport: appServerTransportDaemon,
+		appServerURL:       "stdio://",
+		appServerSocket:    "/tmp/codex.sock",
 	}
 
 	opts := a.WorkspaceAgentOptions()
+	if got := opts["app_server_transport"]; got != appServerTransportDaemon {
+		t.Fatalf("WorkspaceAgentOptions()[app_server_transport] = %#v, want daemon", got)
+	}
 	if got := opts["app_server_url"]; got != "stdio://" {
 		t.Fatalf("WorkspaceAgentOptions()[app_server_url] = %#v, want stdio://", got)
+	}
+	if got := opts["app_server_socket"]; got != "/tmp/codex.sock" {
+		t.Fatalf("WorkspaceAgentOptions()[app_server_socket] = %#v, want /tmp/codex.sock", got)
 	}
 }
 

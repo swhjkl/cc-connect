@@ -93,6 +93,26 @@ All agents support permission modes switchable at runtime via `/mode`.
 | Full Auto | `full-auto` | Auto-approve with sandbox |
 | YOLO | `yolo` | Bypass all approvals and sandbox |
 
+#### Codex App Server Transports
+
+`backend = "app_server"` starts a private `codex app-server` process by
+default, preserving the existing `app_server_url` behavior. On Unix, you can
+explicitly connect cc-connect to the shared Codex remote-control daemon:
+
+```toml
+[projects.agent.options]
+backend = "app_server"
+app_server_transport = "daemon"
+# Optional; defaults to $CODEX_HOME/app-server-control/app-server-control.sock
+app_server_socket = "/home/you/.codex/app-server-control/app-server-control.sock"
+```
+
+Enable remote control once with
+`codex app-server daemon enable-remote-control`, then start the daemon with
+`codex app-server daemon start`. The daemon transport uses the configuration of
+the running Codex daemon; per-session process environment overrides do not
+restart or reconfigure that daemon.
+
 ### Cursor Agent Modes
 
 | Mode | Config Value | Behavior |

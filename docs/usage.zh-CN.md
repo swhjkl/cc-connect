@@ -91,6 +91,24 @@ reset_on_idle_mins = 60
 | 全自动 | `full-auto` | 自动通过 + 沙箱保护 |
 | YOLO | `yolo` | 跳过所有审批 |
 
+#### Codex App Server 传输模式
+
+`backend = "app_server"` 默认仍会启动独立的 `codex app-server` 进程，并保留
+原有的 `app_server_url` 行为。在 Unix 系统上，可以显式连接 Codex
+remote-control 管理的共享 daemon：
+
+```toml
+[projects.agent.options]
+backend = "app_server"
+app_server_transport = "daemon"
+# 可选；默认是 $CODEX_HOME/app-server-control/app-server-control.sock
+app_server_socket = "/home/you/.codex/app-server-control/app-server-control.sock"
+```
+
+首次使用前执行 `codex app-server daemon enable-remote-control`，随后通过
+`codex app-server daemon start` 启动 daemon。daemon transport 使用正在运行的
+Codex daemon 自身配置；每个 session 的进程环境覆盖不会重启或重新配置该 daemon。
+
 ### Cursor Agent 模式
 
 | 模式 | 配置值 | 行为 |

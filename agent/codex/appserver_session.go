@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
+	"github.com/gorilla/websocket"
 )
 
 type rpcResponseEnvelope struct {
@@ -141,7 +143,9 @@ type appServerRequestUserInputAnswer struct {
 }
 
 type appServerSession struct {
+	transport      string
 	url            string
+	socketPath     string
 	workDir        string
 	model          string
 	effort         string
@@ -157,10 +161,11 @@ type appServerSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	procMu  sync.Mutex
-	writeMu sync.Mutex
+	cmd         *exec.Cmd
+	wsConn      *websocket.Conn
+	stdin       io.WriteCloser
+	transportMu sync.Mutex
+	writeMu     sync.Mutex
 
 	nextID atomic.Int64
 
@@ -187,14 +192,20 @@ type appServerSession struct {
 }
 
 const (
+	appServerTransportProcess    = "process"
+	appServerTransportDaemon     = "daemon"
 	appServerRequestTimeout      = 120 * time.Second
+	appServerInitializeTimeout   = 15 * time.Second
 	appServerUsageRefreshTimeout = 1500 * time.Millisecond
+	appServerMaxMessageSize      = 10 * 1024 * 1024
 )
 
-func newAppServerSession(ctx context.Context, url, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string) (*appServerSession, error) {
+func newAppServerSession(ctx context.Context, transport, url, socketPath, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string) (*appServerSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	s := &appServerSession{
+		transport:        transport,
 		url:              url,
+		socketPath:       strings.TrimSpace(socketPath),
 		workDir:          workDir,
 		model:            model,
 		effort:           effort,
@@ -220,6 +231,9 @@ func newAppServerSession(ctx context.Context, url, workDir, model, effort, mode,
 
 	if err := s.initialize(); err != nil {
 		_ = s.Close()
+		if s.transport == appServerTransportDaemon {
+			return nil, fmt.Errorf("%w (ensure the shared daemon is running and remote control is enabled with `codex app-server daemon enable-remote-control`)", err)
+		}
 		return nil, err
 	}
 
@@ -235,6 +249,13 @@ func newAppServerSession(ctx context.Context, url, workDir, model, effort, mode,
 }
 
 func (s *appServerSession) connect() error {
+	if s.transport == appServerTransportDaemon {
+		return s.connectDaemon()
+	}
+	return s.connectProcess()
+}
+
+func (s *appServerSession) connectProcess() error {
 	args := []string{"app-server"}
 	if strings.TrimSpace(s.url) != "" {
 		args = append(args, "--listen", strings.TrimSpace(s.url))
@@ -277,18 +298,83 @@ func (s *appServerSession) connect() error {
 		return fmt.Errorf("codex app-server start: %w", err)
 	}
 
-	s.procMu.Lock()
+	s.transportMu.Lock()
 	s.cmd = cmd
 	s.stdin = stdin
-	s.procMu.Unlock()
+	s.transportMu.Unlock()
 
-	slog.Info("codex app-server session started", "transport", "stdio", "pid", cmd.Process.Pid, "work_dir", s.workDir)
+	slog.Info("codex app-server session started", "transport", "process", "pid", cmd.Process.Pid, "work_dir", s.workDir)
 
 	s.wg.Add(3)
 	go s.readLoop(stdout)
 	go s.stderrLoop(stderr)
 	go s.waitLoop()
 	return nil
+}
+
+func (s *appServerSession) connectDaemon() error {
+	socketPath := strings.TrimSpace(s.socketPath)
+	if socketPath == "" {
+		return fmt.Errorf("codex app-server socket path is empty")
+	}
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: appServerInitializeTimeout,
+		NetDialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var netDialer net.Dialer
+			return netDialer.DialContext(ctx, "unix", socketPath)
+		},
+	}
+	conn, response, err := dialer.DialContext(s.ctx, "ws://localhost/", nil)
+	if err != nil {
+		if response != nil {
+			_ = response.Body.Close()
+			return fmt.Errorf("codex app-server websocket handshake (%s): %w", response.Status, err)
+		}
+		return fmt.Errorf("codex app-server connect socket %q: %w", socketPath, err)
+	}
+	conn.SetReadLimit(appServerMaxMessageSize)
+
+	s.transportMu.Lock()
+	s.wsConn = conn
+	s.transportMu.Unlock()
+
+	slog.Info("codex app-server session connected", "transport", "websocket-unix", "socket", socketPath, "work_dir", s.workDir)
+
+	s.wg.Add(1)
+	go s.readWebSocketLoop(conn)
+	return nil
+}
+
+func resolveAppServerSocket(explicitSocket, explicitCodexHome string, extraEnv []string) (string, error) {
+	if socketPath := strings.TrimSpace(explicitSocket); socketPath != "" {
+		return expandAppServerSocketPath(socketPath)
+	}
+
+	env := append([]string(nil), extraEnv...)
+	if codexHome := strings.TrimSpace(explicitCodexHome); codexHome != "" {
+		env = append(env, "CODEX_HOME="+codexHome)
+	}
+	codexHome, err := resolveCodexHome(env)
+	if err != nil {
+		return "", err
+	}
+	return expandAppServerSocketPath(filepath.Join(codexHome, "app-server-control", "app-server-control.sock"))
+}
+
+func expandAppServerSocketPath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return filepath.Clean(path), nil
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	if path == "~" {
+		return homeDir, nil
+	}
+	return filepath.Join(homeDir, strings.TrimPrefix(path, "~/")), nil
 }
 
 func (s *appServerSession) initialize() error {
@@ -312,7 +398,13 @@ func (s *appServerSession) initialize() error {
 	}
 
 	var resp initResponse
-	if err := s.request("initialize", params, &resp); err != nil {
+	var err error
+	if s.transport == appServerTransportDaemon {
+		err = s.requestWithTimeout("initialize", params, &resp, appServerInitializeTimeout)
+	} else {
+		err = s.request("initialize", params, &resp)
+	}
+	if err != nil {
 		return fmt.Errorf("codex app-server initialize: %w", err)
 	}
 	if err := s.notify("initialized", nil); err != nil {
@@ -341,7 +433,7 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 	}
 
 	var resp threadStartResponse
-	if err := s.request("thread/start", s.threadRequestParams(), &resp); err != nil {
+	if err := s.request("thread/start", s.threadStartRequestParams(), &resp); err != nil {
 		return err
 	}
 	if resp.Thread.ID == "" {
@@ -351,6 +443,22 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 	s.threadID.Store(resp.Thread.ID)
 	slog.Info("codex app-server thread started", "thread_id", resp.Thread.ID)
 	return nil
+}
+
+func (s *appServerSession) threadStartRequestParams() map[string]any {
+	params := s.threadRequestParams()
+	if s.transport != appServerTransportDaemon {
+		return params
+	}
+	workDir := strings.TrimSpace(s.GetWorkDir())
+	if workDir == "" {
+		return params
+	}
+	if absWorkDir, err := filepath.Abs(workDir); err == nil {
+		workDir = absWorkDir
+	}
+	params["cwd"] = workDir
+	return params
 }
 
 func (s *appServerSession) threadRequestParams() map[string]any {
@@ -939,9 +1047,15 @@ func (s *appServerSession) Alive() bool {
 
 func (s *appServerSession) Close() error {
 	s.alive.Store(false)
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
 
-	s.procMu.Lock()
+	// Daemon transport owns only the client connection; process transport owns
+	// the private child process and tears it down with the session.
+	s.transportMu.Lock()
+	conn := s.wsConn
+	s.wsConn = nil
 	if s.stdin != nil {
 		_ = s.stdin.Close()
 		s.stdin = nil
@@ -949,7 +1063,10 @@ func (s *appServerSession) Close() error {
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
-	s.procMu.Unlock()
+	s.transportMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -972,7 +1089,7 @@ func (s *appServerSession) readLoop(r io.Reader) {
 	defer s.wg.Done()
 	scanner := bufio.NewScanner(r)
 	scanBuf := make([]byte, 0, 64*1024)
-	const maxLineSize = 10 * 1024 * 1024 // 10MB
+	const maxLineSize = 10 * 1024 * 1024
 	scanner.Buffer(scanBuf, maxLineSize)
 
 	for scanner.Scan() {
@@ -981,41 +1098,7 @@ func (s *appServerSession) readLoop(r io.Reader) {
 			return
 		default:
 		}
-
-		data := scanner.Bytes()
-
-		var probe map[string]json.RawMessage
-		if err := json.Unmarshal(data, &probe); err != nil {
-			slog.Debug("codex app-server: invalid JSON", "error", err)
-			continue
-		}
-
-		_, hasID := probe["id"]
-		_, hasMethod := probe["method"]
-
-		switch {
-		case hasID && !hasMethod:
-			// Response to one of our requests.
-			var resp rpcResponseEnvelope
-			if err := json.Unmarshal(data, &resp); err != nil {
-				slog.Debug("codex app-server: bad response envelope", "error", err)
-				continue
-			}
-			s.handleResponse(resp)
-
-		case hasID && hasMethod:
-			// Server-initiated request that requires a response (e.g. approval).
-			s.handleServerRequest(probe)
-
-		default:
-			// Notification (no id).
-			var notif rpcNotificationEnvelope
-			if err := json.Unmarshal(data, &notif); err != nil {
-				slog.Debug("codex app-server: bad notification envelope", "error", err)
-				continue
-			}
-			s.handleNotification(notif.Method, notif.Params)
-		}
+		s.handleIncomingMessage(scanner.Bytes())
 	}
 
 	err := scanner.Err()
@@ -1059,9 +1142,9 @@ func (s *appServerSession) stderrLoop(r io.Reader) {
 func (s *appServerSession) waitLoop() {
 	defer s.wg.Done()
 
-	s.procMu.Lock()
+	s.transportMu.Lock()
 	cmd := s.cmd
-	s.procMu.Unlock()
+	s.transportMu.Unlock()
 	if cmd == nil {
 		return
 	}
@@ -1076,6 +1159,66 @@ func (s *appServerSession) waitLoop() {
 		err = io.EOF
 	}
 	s.rejectPending(err)
+}
+
+func (s *appServerSession) readWebSocketLoop(conn *websocket.Conn) {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		messageType, data, err := conn.ReadMessage()
+		if err != nil {
+			if s.ctx.Err() == nil {
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					slog.Warn("codex app-server websocket read failed", "error", err)
+					s.emitError(fmt.Errorf("codex app-server connection closed: %w", err))
+				}
+				s.alive.Store(false)
+				s.rejectPending(err)
+				s.rejectPendingApprovals(err)
+			}
+			return
+		}
+		if messageType != websocket.TextMessage {
+			slog.Debug("codex app-server: ignoring non-text websocket frame", "message_type", messageType)
+			continue
+		}
+		s.handleIncomingMessage(data)
+	}
+}
+
+func (s *appServerSession) handleIncomingMessage(data []byte) {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		slog.Debug("codex app-server: invalid JSON", "error", err)
+		return
+	}
+
+	_, hasID := probe["id"]
+	_, hasMethod := probe["method"]
+
+	switch {
+	case hasID && !hasMethod:
+		var resp rpcResponseEnvelope
+		if err := json.Unmarshal(data, &resp); err != nil {
+			slog.Debug("codex app-server: bad response envelope", "error", err)
+			return
+		}
+		s.handleResponse(resp)
+	case hasID && hasMethod:
+		s.handleServerRequest(probe)
+	default:
+		var notif rpcNotificationEnvelope
+		if err := json.Unmarshal(data, &notif); err != nil {
+			slog.Debug("codex app-server: bad notification envelope", "error", err)
+			return
+		}
+		s.handleNotification(notif.Method, notif.Params)
+	}
 }
 
 func (s *appServerSession) handleResponse(resp rpcResponseEnvelope) {
@@ -1680,7 +1823,9 @@ func (s *appServerSession) abortTransport() {
 		s.cancel()
 	}
 
-	s.procMu.Lock()
+	s.transportMu.Lock()
+	conn := s.wsConn
+	s.wsConn = nil
 	if s.stdin != nil {
 		_ = s.stdin.Close()
 		s.stdin = nil
@@ -1688,7 +1833,10 @@ func (s *appServerSession) abortTransport() {
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
-	s.procMu.Unlock()
+	s.transportMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 func (s *appServerSession) notify(method string, params any) error {
@@ -1708,15 +1856,22 @@ func (s *appServerSession) writeJSON(v any) error {
 		return fmt.Errorf("codex app-server encode: %w", err)
 	}
 
-	s.procMu.Lock()
+	s.transportMu.Lock()
+	conn := s.wsConn
 	stdin := s.stdin
-	s.procMu.Unlock()
-	if stdin == nil {
+	s.transportMu.Unlock()
+	if conn == nil && stdin == nil {
 		return fmt.Errorf("codex app-server connection is closed")
 	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if conn != nil {
+		if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
+			return fmt.Errorf("codex app-server websocket write: %w", err)
+		}
+		return nil
+	}
 	if _, err := stdin.Write(append(b, '\n')); err != nil {
 		return fmt.Errorf("codex app-server write: %w", err)
 	}

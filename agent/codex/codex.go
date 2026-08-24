@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -34,22 +35,24 @@ func init() {
 //   - "full-auto": --sandbox workspace-write + approval_policy=never
 //   - "yolo":      --dangerously-bypass-approvals-and-sandbox
 type Agent struct {
-	workDir         string
-	model           string
-	reasoningEffort string
-	mode            string // "suggest" | "auto-edit" | "full-auto" | "yolo"
-	backend         string // "exec" | "app_server"
-	appServerURL    string
-	codexHome       string
-	systemPrompt    string
-	appendPrompt    string
-	cmd             string   // CLI binary name, default "codex"
-	cliExtraArgs    []string // extra args parsed from cmd after the binary
-	providers       []core.ProviderConfig
-	activeIdx       int      // -1 = no provider set
-	configEnv       []string // env vars from [projects.agent.options.env] — persists across SetSessionEnv calls
-	sessionEnv      []string
-	mu              sync.RWMutex
+	workDir            string
+	model              string
+	reasoningEffort    string
+	mode               string // "suggest" | "auto-edit" | "full-auto" | "yolo"
+	backend            string // "exec" | "app_server"
+	appServerTransport string
+	appServerURL       string
+	appServerSocket    string
+	codexHome          string
+	systemPrompt       string
+	appendPrompt       string
+	cmd                string   // CLI binary name, default "codex"
+	cliExtraArgs       []string // extra args parsed from cmd after the binary
+	providers          []core.ProviderConfig
+	activeIdx          int      // -1 = no provider set
+	configEnv          []string // env vars from [projects.agent.options.env] — persists across SetSessionEnv calls
+	sessionEnv         []string
+	mu                 sync.RWMutex
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -61,12 +64,19 @@ func New(opts map[string]any) (core.Agent, error) {
 	reasoningEffort, _ := opts["reasoning_effort"].(string)
 	mode, _ := opts["mode"].(string)
 	backend, _ := opts["backend"].(string)
+	appServerTransport, _ := opts["app_server_transport"].(string)
 	appServerURL, _ := opts["app_server_url"].(string)
+	appServerSocket, _ := opts["app_server_socket"].(string)
 	codexHome, _ := opts["codex_home"].(string)
 	systemPrompt, _ := opts["system_prompt"].(string)
 	appendPrompt, _ := opts["append_system_prompt"].(string)
 	mode = normalizeMode(mode)
 	backend = normalizeBackend(backend)
+	var err error
+	appServerTransport, err = normalizeAppServerTransport(appServerTransport)
+	if err != nil {
+		return nil, err
+	}
 	appServerURL = normalizeAppServerURL(appServerURL)
 
 	cmd, cliExtraArgs := core.ParseCmdOpts(opts, "codex")
@@ -93,19 +103,21 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 
 	return &Agent{
-		workDir:         workDir,
-		model:           model,
-		reasoningEffort: normalizeReasoningEffort(reasoningEffort),
-		mode:            mode,
-		backend:         backend,
-		appServerURL:    appServerURL,
-		codexHome:       strings.TrimSpace(codexHome),
-		systemPrompt:    strings.TrimSpace(systemPrompt),
-		appendPrompt:    strings.TrimSpace(appendPrompt),
-		cmd:             cmd,
-		cliExtraArgs:    cliExtraArgs,
-		configEnv:       configEnv,
-		activeIdx:       -1,
+		workDir:            workDir,
+		model:              model,
+		reasoningEffort:    normalizeReasoningEffort(reasoningEffort),
+		mode:               mode,
+		backend:            backend,
+		appServerTransport: appServerTransport,
+		appServerURL:       appServerURL,
+		appServerSocket:    strings.TrimSpace(appServerSocket),
+		codexHome:          strings.TrimSpace(codexHome),
+		systemPrompt:       strings.TrimSpace(systemPrompt),
+		appendPrompt:       strings.TrimSpace(appendPrompt),
+		cmd:                cmd,
+		cliExtraArgs:       cliExtraArgs,
+		configEnv:          configEnv,
+		activeIdx:          -1,
 	}, nil
 }
 
@@ -115,6 +127,17 @@ func normalizeBackend(raw string) string {
 		return "app_server"
 	default:
 		return "exec"
+	}
+}
+
+func normalizeAppServerTransport(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", appServerTransportProcess:
+		return appServerTransportProcess, nil
+	case appServerTransportDaemon:
+		return appServerTransportDaemon, nil
+	default:
+		return "", fmt.Errorf("codex: invalid app_server_transport %q (want %q or %q)", raw, appServerTransportProcess, appServerTransportDaemon)
 	}
 }
 
@@ -466,7 +489,9 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	model := a.model
 	reasoningEffort := a.reasoningEffort
 	backend := a.backend
+	appServerTransport := a.appServerTransport
 	appServerURL := a.appServerURL
+	appServerSocket := a.appServerSocket
 	codexHome := a.codexHome
 	systemPrompt := a.systemPrompt
 	appendPrompt := a.appendPrompt
@@ -500,7 +525,18 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 
 	if backend == "app_server" {
-		return newAppServerSession(ctx, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
+		var socketPath string
+		if appServerTransport == appServerTransportDaemon {
+			if runtime.GOOS == "windows" {
+				return nil, fmt.Errorf("codex: app_server_transport=%q is not supported on Windows; use %q", appServerTransportDaemon, appServerTransportProcess)
+			}
+			var err error
+			socketPath, err = resolveAppServerSocket(appServerSocket, codexHome, extraEnv)
+			if err != nil {
+				return nil, fmt.Errorf("codex: resolve app-server socket: %w", err)
+			}
+		}
+		return newAppServerSession(ctx, appServerTransport, appServerURL, socketPath, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
 	}
 	if codexHome != "" {
 		extraEnv = append(extraEnv, "CODEX_HOME="+codexHome)
@@ -565,8 +601,14 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	if a.reasoningEffort != "" {
 		opts["reasoning_effort"] = a.reasoningEffort
 	}
+	if a.appServerTransport != "" {
+		opts["app_server_transport"] = a.appServerTransport
+	}
 	if a.appServerURL != "" {
 		opts["app_server_url"] = a.appServerURL
+	}
+	if a.appServerSocket != "" {
+		opts["app_server_socket"] = a.appServerSocket
 	}
 	if a.codexHome != "" {
 		opts["codex_home"] = a.codexHome

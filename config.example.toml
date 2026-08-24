@@ -1607,6 +1607,16 @@ app_secret = "your-feishu-app-secret"
 # [projects.agent.options]
 # work_dir = "/path/to/project"
 # mode = "suggest"  # "suggest" | "auto-edit" | "full-auto" | "yolo"
+# backend = "app_server"  # Optional JSON-RPC backend; "exec" remains the default
+# app_server_url = "stdio"  # Existing process transport (default for app_server)
+#
+# # Optional: connect to the shared Codex remote-control daemon instead of
+# # starting a private app-server process. Unix only; disabled by default.
+# app_server_transport = "daemon"
+# # One-time prerequisite: codex app-server daemon enable-remote-control
+# # Start the daemon: codex app-server daemon start
+# # Socket defaults to $CODEX_HOME/app-server-control/app-server-control.sock
+# app_server_socket = "/home/you/.codex/app-server-control/app-server-control.sock"
 #
 # Mode options / 模式说明:
 # - "suggest":   ask permission for every tool call (default, safest) / 每次调用都需确认（默认，最安全）

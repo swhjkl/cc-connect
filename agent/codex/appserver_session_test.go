@@ -4,14 +4,199 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
+	"github.com/gorilla/websocket"
 )
+
+func TestAppServerSession_ConnectsWithWebSocketFramesOverUnixSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets are not available on Windows")
+	}
+	socketFile, err := os.CreateTemp("", "cc-codex-*.sock")
+	if err != nil {
+		t.Fatalf("reserve Unix socket path: %v", err)
+	}
+	socketPath := socketFile.Name()
+	if err := socketFile.Close(); err != nil {
+		t.Fatalf("close temporary socket file: %v", err)
+	}
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatalf("remove temporary socket file: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen on Unix socket: %v", err)
+	}
+	serverResult := make(chan error, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			serverResult <- fmt.Errorf("upgrade websocket: %w", err)
+			return
+		}
+		defer conn.Close()
+
+		var initialize map[string]any
+		if err := conn.ReadJSON(&initialize); err != nil {
+			serverResult <- fmt.Errorf("read initialize frame: %w", err)
+			return
+		}
+		if initialize["method"] != "initialize" {
+			serverResult <- fmt.Errorf("first method = %#v, want initialize", initialize["method"])
+			return
+		}
+		if err := conn.WriteJSON(map[string]any{
+			"id":     initialize["id"],
+			"result": map[string]any{"userAgent": "test-app-server"},
+		}); err != nil {
+			serverResult <- fmt.Errorf("write initialize response: %w", err)
+			return
+		}
+
+		var initialized map[string]any
+		if err := conn.ReadJSON(&initialized); err != nil {
+			serverResult <- fmt.Errorf("read initialized frame: %w", err)
+			return
+		}
+		if initialized["method"] != "initialized" {
+			serverResult <- fmt.Errorf("second method = %#v, want initialized", initialized["method"])
+			return
+		}
+		serverResult <- nil
+	})}
+	go func() { _ = server.Serve(listener) }()
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &appServerSession{
+		transport:        appServerTransportDaemon,
+		socketPath:       socketPath,
+		ctx:              ctx,
+		cancel:           cancel,
+		events:           make(chan core.Event, 4),
+		pending:          make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+	}
+	s.alive.Store(true)
+	if err := s.connect(); err != nil {
+		t.Fatalf("connect() error: %v", err)
+	}
+	defer s.Close()
+	if err := s.initialize(); err != nil {
+		t.Fatalf("initialize() error: %v", err)
+	}
+
+	select {
+	case err := <-serverResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive WebSocket initialize handshake")
+	}
+}
+
+func TestAppServerSession_LiveDaemonReadOnly(t *testing.T) {
+	socketPath := strings.TrimSpace(os.Getenv("CC_CONNECT_CODEX_APP_SERVER_SOCKET"))
+	if socketPath == "" {
+		t.Skip("set CC_CONNECT_CODEX_APP_SERVER_SOCKET to run the live daemon test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	s := &appServerSession{
+		transport:        appServerTransportDaemon,
+		socketPath:       socketPath,
+		ctx:              ctx,
+		cancel:           cancel,
+		events:           make(chan core.Event, 4),
+		pending:          make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+	}
+	s.alive.Store(true)
+	if err := s.connect(); err != nil {
+		t.Fatalf("connect() error: %v", err)
+	}
+	defer s.Close()
+	if err := s.initialize(); err != nil {
+		t.Fatalf("initialize() error: %v", err)
+	}
+
+	var response struct {
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := s.requestWithTimeout("thread/list", map[string]any{
+		"limit":          1,
+		"useStateDbOnly": true,
+	}, &response, 5*time.Second); err != nil {
+		t.Fatalf("thread/list error: %v", err)
+	}
+	if len(response.Data) > 1 {
+		t.Fatalf("thread/list returned %d entries, want at most 1", len(response.Data))
+	}
+}
+
+func TestResolveAppServerSocket_UsesExplicitSocket(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	got, err := resolveAppServerSocket(" ~/.codex/custom.sock ", "/ignored", []string{"CODEX_HOME=/also-ignored"})
+	if err != nil {
+		t.Fatalf("resolveAppServerSocket() error: %v", err)
+	}
+	want := filepath.Join(home, ".codex", "custom.sock")
+	if got != want {
+		t.Fatalf("resolveAppServerSocket() = %q, want %q", got, want)
+	}
+}
+
+func TestResolveAppServerSocket_DefaultsToConfiguredCodexHome(t *testing.T) {
+	codexHome := t.TempDir()
+	got, err := resolveAppServerSocket("", codexHome, []string{"CODEX_HOME=/ignored"})
+	if err != nil {
+		t.Fatalf("resolveAppServerSocket() error: %v", err)
+	}
+	want := filepath.Join(codexHome, "app-server-control", "app-server-control.sock")
+	if got != want {
+		t.Fatalf("resolveAppServerSocket() = %q, want %q", got, want)
+	}
+}
+
+func TestAppServerSession_DaemonThreadStartParamsIncludeAbsoluteWorkDir(t *testing.T) {
+	s := &appServerSession{transport: appServerTransportDaemon, workDir: ".", model: "gpt-5.4", mode: "suggest"}
+	wantWorkDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("filepath.Abs(): %v", err)
+	}
+
+	params := s.threadStartRequestParams()
+	if got := params["cwd"]; got != wantWorkDir {
+		t.Fatalf("thread start cwd = %#v, want %q", got, wantWorkDir)
+	}
+	if got := s.threadRequestParams()["cwd"]; got != nil {
+		t.Fatalf("resume params cwd = %#v, want nil so the canonical thread cwd is preserved", got)
+	}
+}
+
+func TestAppServerSession_ProcessThreadStartParamsPreserveLegacyShape(t *testing.T) {
+	s := &appServerSession{transport: appServerTransportProcess, workDir: "."}
+	if got := s.threadStartRequestParams()["cwd"]; got != nil {
+		t.Fatalf("process thread start cwd = %#v, want nil", got)
+	}
+}
 
 func TestAppServerSession_ApplyThreadRuntimeState(t *testing.T) {
 	s := &appServerSession{}

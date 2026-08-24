@@ -16,7 +16,7 @@ func TestNew_ParsesProjectEnvFromOpts(t *testing.T) {
 	// to be installed on the test runner.
 	opts := map[string]any{
 		"work_dir": t.TempDir(),
-		"cmd": "go",
+		"cmd":      "go",
 		"env": map[string]string{
 			"HTTPS_PROXY": "http://127.0.0.1:10808",
 			"HTTP_PROXY":  "http://127.0.0.1:10808",
@@ -50,7 +50,7 @@ func TestNew_ParsesProjectEnvFromOpts(t *testing.T) {
 func TestNew_ParsesProjectEnvFromMapStringAny(t *testing.T) {
 	opts := map[string]any{
 		"work_dir": t.TempDir(),
-		"cmd": "go",
+		"cmd":      "go",
 		"env": map[string]any{
 			"OPENAI_BASE_URL": "https://api.example.com/v1",
 			"CUSTOM_FLAG":     "yes",
@@ -80,7 +80,7 @@ func TestNew_ParsesProjectEnvFromMapStringAny(t *testing.T) {
 func TestNew_NoEnvOpts(t *testing.T) {
 	opts := map[string]any{
 		"work_dir": t.TempDir(),
-		"cmd": "go",
+		"cmd":      "go",
 	}
 
 	a, err := New(opts)
@@ -94,6 +94,52 @@ func TestNew_NoEnvOpts(t *testing.T) {
 
 	if len(agent.configEnv) != 0 {
 		t.Fatalf("expected 0 env vars, got %d: %v", len(agent.configEnv), agent.configEnv)
+	}
+}
+
+func TestNew_ParsesAppServerSocket(t *testing.T) {
+	opts := map[string]any{
+		"work_dir":             t.TempDir(),
+		"cmd":                  "go",
+		"backend":              "app_server",
+		"app_server_transport": "daemon",
+		"app_server_socket":    " /tmp/codex.sock ",
+	}
+
+	a, err := New(opts)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	agent := a.(*Agent)
+	if agent.backend != "app_server" {
+		t.Fatalf("backend = %q, want app_server", agent.backend)
+	}
+	if agent.appServerTransport != appServerTransportDaemon {
+		t.Fatalf("appServerTransport = %q, want daemon", agent.appServerTransport)
+	}
+	if agent.appServerSocket != "/tmp/codex.sock" {
+		t.Fatalf("appServerSocket = %q, want /tmp/codex.sock", agent.appServerSocket)
+	}
+}
+
+func TestNew_AppServerTransportDefaultsToProcess(t *testing.T) {
+	a, err := New(map[string]any{
+		"work_dir":       t.TempDir(),
+		"cmd":            "go",
+		"backend":        "app_server",
+		"app_server_url": "stdio",
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	agent := a.(*Agent)
+	if agent.appServerTransport != appServerTransportProcess {
+		t.Fatalf("appServerTransport = %q, want process", agent.appServerTransport)
+	}
+	if agent.appServerURL != "stdio://" {
+		t.Fatalf("appServerURL = %q, want stdio://", agent.appServerURL)
 	}
 }
 

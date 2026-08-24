@@ -151,12 +151,25 @@ git clone --branch ws/feat/codex-daemon-feishu-ready --single-branch \
   https://github.com/swhjkl/cc-connect.git
 cd cc-connect
 go version
-make build-noweb AGENTS=codex PLATFORMS_INCLUDE=feishu
+node --version
+npm --version
+make build AGENTS=codex PLATFORMS_INCLUDE=feishu
+test -f web/dist/index.html
 ./cc-connect --version
 ```
 
-`build-noweb` 不需要构建 Web UI，并只编译 Codex Agent 与飞书平台，适合服务器
-部署。安装二进制：
+`make build` 会在首次构建时安装 `web/` 下的 npm 依赖，生成 `web/dist`，再把
+Web 管理界面嵌入 cc-connect 二进制。`AGENTS` 和 `PLATFORMS_INCLUDE` 仍然只编译
+Codex Agent 与飞书平台，不影响 Web 管理界面。
+
+如果明确不需要 Web UI，可以改用精简构建：
+
+```bash
+make build-noweb AGENTS=codex PLATFORMS_INCLUDE=feishu
+```
+
+`build-noweb` 生成的二进制不包含 Web 管理界面，`/web` 命令也会提示该功能不可用。
+安装完整二进制：
 
 ```bash
 sudo install -m 0755 ./cc-connect /usr/local/bin/cc-connect
@@ -167,7 +180,7 @@ sudo install -m 0755 ./cc-connect /usr/local/bin/cc-connect
 ```bash
 cd /path/to/cc-connect
 git pull --rebase
-make build-noweb AGENTS=codex PLATFORMS_INCLUDE=feishu
+make build AGENTS=codex PLATFORMS_INCLUDE=feishu
 sudo install -m 0755 ./cc-connect /usr/local/bin/cc-connect
 cc-connect daemon restart
 ```
@@ -289,6 +302,46 @@ chmod 600 ~/.cc-connect/config.toml
 `[projects.platforms.options]` 下。`mode = "suggest"` 是首周测试的推荐值：Codex
 使用只读 sandbox，并通过飞书卡片请求需要的权限。`auto-edit` 和 `full-auto` 会减少
 审批，`yolo` 会跳过 sandbox，不建议在普通服务器上使用。
+
+### 6.1 启用 Web 管理界面
+
+完整构建包含前端资源，但仍需要在配置中启用 Management API 和 Bridge。使用部署
+用户执行：
+
+```bash
+cc-connect web --no-browser
+```
+
+该命令会更新默认配置文件 `~/.cc-connect/config.toml`，启用 Management 和
+Bridge，生成各自的随机 token，并打印 Web UI 地址及登录 token。token 等同于管理
+凭据，不要提交到 Git 或发送到聊天中。首次配置完成后，在第 7 节启动 cc-connect；
+如果服务已经运行，则需要重启：
+
+```bash
+cc-connect daemon restart
+```
+
+Web UI 默认使用端口 `9820`，Bridge 默认使用端口 `9810`。不要在服务器防火墙中
+直接向公网开放这两个端口。推荐从本机建立 SSH 隧道：
+
+```bash
+ssh -N -L 9820:127.0.0.1:9820 your-user@your-server
+```
+
+保持该 SSH 连接运行，在本机浏览器打开：
+
+```text
+http://localhost:9820
+```
+
+使用 `cc-connect web --no-browser` 输出的 Management token 登录。Web UI 可以管理
+项目、会话、Provider 和定时任务，也可以直接与 Codex 对话；它与飞书可以同时
+使用。
+
+当前 Web UI 尚未提供 `app_server_transport` 和 `app_server_socket` 输入框。因此
+这两个 daemon 参数仍应按本节前面的示例直接维护在 `config.toml` 中，不要因为页面
+上看不到它们而删除。若确实需要从公网访问 Web UI，应在前面部署 HTTPS 反向代理并
+增加访问控制，而不是直接暴露明文 HTTP 端口。
 
 ## 7. 首次前台联调
 
@@ -444,6 +497,8 @@ backend = "exec"
 - [ ] `codex remote-control start --json` 成功。
 - [ ] 默认 app-server Unix Socket 存在。
 - [ ] 从 `ws/feat/codex-daemon-feishu-ready` 编译 cc-connect。
+- [ ] `web/dist/index.html` 已生成，安装的是 `make build` 产生的完整二进制。
+- [ ] Web UI 已启用，并能通过 SSH 隧道在本机访问 `http://localhost:9820`。
 - [ ] 飞书机器人能力、权限、消息事件和卡片回调均已发布。
 - [ ] 前台模式完成 `/whoami`、`/status` 和一次 Codex 对话。
 - [ ] `allow_from` 和 `admin_from` 已收紧为自己的 `ou_xxx`。

@@ -16,7 +16,7 @@ Codex app-server daemon
 目标项目目录
 ```
 
-本文档对应分支：`ws/feat/codex-daemon-feishu-ready`。在功能进入上游版本前，
+本文档对应分支：`ws/feat/codex-app-server-daemon`。在功能进入上游版本前，
 服务器必须从该分支编译，不能用 npm/Homebrew 中尚未包含此功能的 cc-connect
 正式版替代。
 
@@ -147,7 +147,7 @@ app-server WebSocket 端口直接暴露到公网。
 ## 4. 编译部署分支
 
 ```bash
-git clone --branch ws/feat/codex-daemon-feishu-ready --single-branch \
+git clone --branch ws/feat/codex-app-server-daemon --single-branch \
   https://github.com/swhjkl/cc-connect.git
 cd cc-connect
 go version
@@ -443,7 +443,7 @@ backend = "exec"
 - [ ] `codex login status` 成功。
 - [ ] `codex remote-control start --json` 成功。
 - [ ] 默认 app-server Unix Socket 存在。
-- [ ] 从 `ws/feat/codex-daemon-feishu-ready` 编译 cc-connect。
+- [ ] 从 `ws/feat/codex-app-server-daemon` 编译 cc-connect。
 - [ ] 飞书机器人能力、权限、消息事件和卡片回调均已发布。
 - [ ] 前台模式完成 `/whoami`、`/status` 和一次 Codex 对话。
 - [ ] `allow_from` 和 `admin_from` 已收紧为自己的 `ou_xxx`。
@@ -459,3 +459,4 @@ backend = "exec"
 - [飞书开放平台](https://open.feishu.cn/)
 - [飞书事件订阅文档](https://open.feishu.cn/document/ukTMukTMukTM/uUTNz4SN1MjL1UzM)
 - [cc-connect 飞书接入指南](./feishu.md)
+- [`/process` 按需查看 Codex 长任务进展设计](./plans/2026-08-26-codex-process-command-design.md)

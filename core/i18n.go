@@ -411,31 +411,31 @@ const (
 	MsgCronIDLabel               MsgKey = "cron_id_label"
 	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
 
-	MsgTimerNotAvailable  MsgKey = "timer_not_available"
-	MsgTimerUsage         MsgKey = "timer_usage"
-	MsgTimerAddUsage      MsgKey = "timer_add_usage"
-	MsgTimerAdded         MsgKey = "timer_added"
-	MsgTimerAddedExec     MsgKey = "timer_added_exec"
-	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
-	MsgTimerEmpty         MsgKey = "timer_empty"
-	MsgTimerListTitle     MsgKey = "timer_list_title"
-	MsgTimerListFooter    MsgKey = "timer_list_footer"
-	MsgTimerDelUsage      MsgKey = "timer_del_usage"
-	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
-	MsgTimerDeleted       MsgKey = "timer_deleted"
-	MsgTimerNotFound      MsgKey = "timer_not_found"
-	MsgTimerMuted         MsgKey = "timer_muted"
-	MsgTimerUnmuted       MsgKey = "timer_unmuted"
-	MsgTimerCardHint      MsgKey = "timer_card_hint"
-	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
-	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
-	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
-	MsgTimerIDLabel       MsgKey = "timer_id_label"
-	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
-	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
-	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
-	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
-	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
+	MsgTimerNotAvailable    MsgKey = "timer_not_available"
+	MsgTimerUsage           MsgKey = "timer_usage"
+	MsgTimerAddUsage        MsgKey = "timer_add_usage"
+	MsgTimerAdded           MsgKey = "timer_added"
+	MsgTimerAddedExec       MsgKey = "timer_added_exec"
+	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
+	MsgTimerEmpty           MsgKey = "timer_empty"
+	MsgTimerListTitle       MsgKey = "timer_list_title"
+	MsgTimerListFooter      MsgKey = "timer_list_footer"
+	MsgTimerDelUsage        MsgKey = "timer_del_usage"
+	MsgTimerMuteUsage       MsgKey = "timer_mute_usage"
+	MsgTimerDeleted         MsgKey = "timer_deleted"
+	MsgTimerNotFound        MsgKey = "timer_not_found"
+	MsgTimerMuted           MsgKey = "timer_muted"
+	MsgTimerUnmuted         MsgKey = "timer_unmuted"
+	MsgTimerCardHint        MsgKey = "timer_card_hint"
+	MsgTimerBtnMute         MsgKey = "timer_btn_mute"
+	MsgTimerBtnUnmute       MsgKey = "timer_btn_unmute"
+	MsgTimerBtnDelete       MsgKey = "timer_btn_delete"
+	MsgTimerIDLabel         MsgKey = "timer_id_label"
+	MsgTimerScheduledLabel  MsgKey = "timer_scheduled_label"
+	MsgTimerFailedSuffix    MsgKey = "timer_failed_suffix"
+	MsgCommandsTagAgent     MsgKey = "commands_tag_agent"
+	MsgCommandsTagShell     MsgKey = "commands_tag_shell"
+	MsgUpgradeTimeoutSuffix MsgKey = "upgrade_timeout_suffix"
 
 	MsgCronScheduleLabel MsgKey = "cron_schedule_label"
 	MsgCronNextRunLabel  MsgKey = "cron_next_run_label"
@@ -589,6 +589,7 @@ const (
 	MsgBuiltinCmdName      MsgKey = "name"
 	MsgBuiltinCmdCurrent   MsgKey = "current"
 	MsgBuiltinCmdHistory   MsgKey = "history"
+	MsgBuiltinCmdTrack     MsgKey = "track"
 	MsgBuiltinCmdProvider  MsgKey = "provider"
 	MsgBuiltinCmdMemory    MsgKey = "memory"
 	MsgBuiltinCmdAllow     MsgKey = "allow"
@@ -686,10 +687,63 @@ const (
 	// send / cron / timer / relay tool documentation in their native
 	// language. Translation coverage is en + zh for this PR; additional
 	// languages fall back to en automatically.
-	MsgAgentSendToolPrompt MsgKey = "agent_send_tool_prompt"
-	MsgAgentCronToolPrompt MsgKey = "agent_cron_tool_prompt"
+	MsgAgentSendToolPrompt  MsgKey = "agent_send_tool_prompt"
+	MsgAgentCronToolPrompt  MsgKey = "agent_cron_tool_prompt"
 	MsgAgentTimerToolPrompt MsgKey = "agent_timer_tool_prompt"
 	MsgAgentRelayToolPrompt MsgKey = "agent_relay_tool_prompt"
+)
+
+const (
+	MsgHistoryReadFailed                  MsgKey = "history_read_failed"
+	MsgTrackUsage                         MsgKey = "track_usage"
+	MsgTrackNotSupported                  MsgKey = "track_not_supported"
+	MsgTrackNoSession                     MsgKey = "track_no_session"
+	MsgTrackReadFailed                    MsgKey = "track_read_failed"
+	MsgTrackNoTurns                       MsgKey = "track_no_turns"
+	MsgTrackTitle                         MsgKey = "track_title"
+	MsgTrackPromptSection                 MsgKey = "track_prompt_section"
+	MsgTrackResponseSection               MsgKey = "track_response_section"
+	MsgTrackActivitySection               MsgKey = "track_activity_section"
+	MsgTrackStatusSection                 MsgKey = "track_status_section"
+	MsgTrackWaitingSection                MsgKey = "track_waiting_section"
+	MsgTrackContentPending                MsgKey = "track_content_pending"
+	MsgTrackContentTruncated              MsgKey = "track_content_truncated"
+	MsgTrackStatusInProgress              MsgKey = "track_status_in_progress"
+	MsgTrackStatusCompleted               MsgKey = "track_status_completed"
+	MsgTrackStatusFailed                  MsgKey = "track_status_failed"
+	MsgTrackStatusInterrupted             MsgKey = "track_status_interrupted"
+	MsgTrackStatusUnknown                 MsgKey = "track_status_unknown"
+	MsgTrackWaitingApproval               MsgKey = "track_waiting_approval"
+	MsgTrackWaitingUserInput              MsgKey = "track_waiting_user_input"
+	MsgTrackActivityShell                 MsgKey = "track_activity_shell"
+	MsgTrackActivityMCP                   MsgKey = "track_activity_mcp"
+	MsgTrackActivityWebSearch             MsgKey = "track_activity_web_search"
+	MsgTrackActivityFileChange            MsgKey = "track_activity_file_change"
+	MsgTrackActivityAgent                 MsgKey = "track_activity_agent"
+	MsgTrackActivityPlan                  MsgKey = "track_activity_plan"
+	MsgTrackActivityTool                  MsgKey = "track_activity_tool"
+	MsgTrackInterruptButton               MsgKey = "track_interrupt_button"
+	MsgTrackInterruptRequested            MsgKey = "track_interrupt_requested"
+	MsgTrackInterruptStale                MsgKey = "track_interrupt_stale"
+	MsgTrackInterruptNotSupported         MsgKey = "track_interrupt_not_supported"
+	MsgTrackInterruptFailed               MsgKey = "track_interrupt_failed"
+	MsgTrackMirrorTitle                   MsgKey = "track_mirror_title"
+	MsgTrackMirrorFooter                  MsgKey = "track_mirror_footer"
+	MsgTrackEnabled                       MsgKey = "track_enabled"
+	MsgTrackProjectDisabled               MsgKey = "track_project_disabled"
+	MsgTrackDisabled                      MsgKey = "track_disabled"
+	MsgTrackStatusReport                  MsgKey = "track_status_report"
+	MsgTrackPersistFailed                 MsgKey = "track_persist_failed"
+	MsgTrackRefreshed                     MsgKey = "track_refreshed"
+	MsgTrackMirrorCompletedNotification   MsgKey = "track_mirror_completed_notification"
+	MsgTrackMirrorFailedNotification      MsgKey = "track_mirror_failed_notification"
+	MsgTrackMirrorInterruptedNotification MsgKey = "track_mirror_interrupted_notification"
+	MsgTrackMirrorCardFailedNotification  MsgKey = "track_mirror_card_failed_notification"
+	MsgTrackSteerAccepted                 MsgKey = "track_steer_accepted"
+	MsgTrackSteerStale                    MsgKey = "track_steer_stale"
+	MsgTrackSteerFailed                   MsgKey = "track_steer_failed"
+	MsgTrackSharedTurnBusy                MsgKey = "track_shared_turn_busy"
+	MsgTrackSharedTurnCheckFailed         MsgKey = "track_shared_turn_check_failed"
 )
 
 var messages = map[MsgKey]map[Language]string{
@@ -1493,6 +1547,296 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "當前會話暫無歷史訊息。",
 		LangJapanese:           "現在のセッションに履歴がありません。",
 		LangSpanish:            "No hay historial en la sesión actual.",
+	},
+	MsgHistoryReadFailed: {
+		LangEnglish:            "❌ Failed to read agent history: %v",
+		LangChinese:            "❌ 读取 Agent 历史失败：%v",
+		LangTraditionalChinese: "❌ 讀取 Agent 歷史失敗：%v",
+		LangJapanese:           "❌ エージェント履歴の読み取りに失敗しました: %v",
+		LangSpanish:            "❌ Error al leer el historial del agente: %v",
+	},
+	MsgTrackUsage: {
+		LangEnglish:            "Usage: `/track [on|off|status]`",
+		LangChinese:            "用法：`/track [on|off|status]`",
+		LangTraditionalChinese: "用法：`/track [on|off|status]`",
+		LangJapanese:           "使い方: `/track [on|off|status]`",
+		LangSpanish:            "Uso: `/track [on|off|status]`",
+	},
+	MsgTrackNotSupported: {
+		LangEnglish:            "This agent does not support authoritative turn tracking.",
+		LangChinese:            "当前 Agent 不支持权威对话追踪。",
+		LangTraditionalChinese: "目前 Agent 不支援權威對話追蹤。",
+		LangJapanese:           "このエージェントは信頼できるターン追跡に対応していません。",
+		LangSpanish:            "Este agente no admite el seguimiento autoritativo de turnos.",
+	},
+	MsgTrackNoSession: {
+		LangEnglish:            "No active agent session to track.",
+		LangChinese:            "当前没有可追踪的 Agent 会话。",
+		LangTraditionalChinese: "目前沒有可追蹤的 Agent 會話。",
+		LangJapanese:           "追跡できるアクティブなエージェントセッションがありません。",
+		LangSpanish:            "No hay una sesión activa del agente para seguir.",
+	},
+	MsgTrackReadFailed: {
+		LangEnglish:            "❌ Failed to read the latest turn: %v",
+		LangChinese:            "❌ 读取最新一轮对话失败：%v",
+		LangTraditionalChinese: "❌ 讀取最新一輪對話失敗：%v",
+		LangJapanese:           "❌ 最新ターンの読み取りに失敗しました: %v",
+		LangSpanish:            "❌ Error al leer el último turno: %v",
+	},
+	MsgTrackNoTurns: {
+		LangEnglish:            "No Codex turns found in the current session.",
+		LangChinese:            "当前会话中没有 Codex 对话。",
+		LangTraditionalChinese: "目前會話中沒有 Codex 對話。",
+		LangJapanese:           "現在のセッションに Codex ターンがありません。",
+		LangSpanish:            "No se encontraron turnos de Codex en la sesión actual.",
+	},
+	MsgTrackTitle: {
+		LangEnglish:            "Latest Codex Turn",
+		LangChinese:            "最新 Codex 对话",
+		LangTraditionalChinese: "最新 Codex 對話",
+		LangJapanese:           "最新の Codex ターン",
+		LangSpanish:            "Último turno de Codex",
+	},
+	MsgTrackPromptSection: {
+		LangEnglish:            "**Prompt**\n%s",
+		LangChinese:            "**Prompt**\n%s",
+		LangTraditionalChinese: "**Prompt**\n%s",
+		LangJapanese:           "**プロンプト**\n%s",
+		LangSpanish:            "**Prompt**\n%s",
+	},
+	MsgTrackResponseSection: {
+		LangEnglish:            "**Response**\n%s",
+		LangChinese:            "**Response**\n%s",
+		LangTraditionalChinese: "**Response**\n%s",
+		LangJapanese:           "**応答**\n%s",
+		LangSpanish:            "**Respuesta**\n%s",
+	},
+	MsgTrackActivitySection: {
+		LangEnglish:            "**Latest activity**\n%s · %s",
+		LangChinese:            "**最新活动**\n%s · %s",
+		LangTraditionalChinese: "**最新活動**\n%s · %s",
+		LangJapanese:           "**最新のアクティビティ**\n%s · %s",
+		LangSpanish:            "**Actividad más reciente**\n%s · %s",
+	},
+	MsgTrackStatusSection: {
+		LangEnglish:            "**Status**\n%s",
+		LangChinese:            "**状态**\n%s",
+		LangTraditionalChinese: "**狀態**\n%s",
+		LangJapanese:           "**状態**\n%s",
+		LangSpanish:            "**Estado**\n%s",
+	},
+	MsgTrackWaitingSection: {
+		LangEnglish:            "**Waiting**\n%s",
+		LangChinese:            "**等待中**\n%s",
+		LangTraditionalChinese: "**等待中**\n%s",
+		LangJapanese:           "**待機中**\n%s",
+		LangSpanish:            "**En espera**\n%s",
+	},
+	MsgTrackContentPending: {
+		LangEnglish:            "_Waiting for content…_",
+		LangChinese:            "_等待内容中…_",
+		LangTraditionalChinese: "_等待內容中…_",
+		LangJapanese:           "_内容を待っています…_",
+		LangSpanish:            "_Esperando contenido…_",
+	},
+	MsgTrackContentTruncated: {
+		LangEnglish:            "_Content truncated to fit the card._",
+		LangChinese:            "_内容过长，已截断以适配卡片。_",
+		LangTraditionalChinese: "_內容過長，已截斷以符合卡片限制。_",
+		LangJapanese:           "_カードの上限に合わせて内容を省略しました。_",
+		LangSpanish:            "_Contenido truncado para ajustarse a la tarjeta._",
+	},
+	MsgTrackStatusInProgress: {
+		LangEnglish: "Running", LangChinese: "执行中", LangTraditionalChinese: "執行中", LangJapanese: "実行中", LangSpanish: "En ejecución",
+	},
+	MsgTrackStatusCompleted: {
+		LangEnglish: "Completed", LangChinese: "已完成", LangTraditionalChinese: "已完成", LangJapanese: "完了", LangSpanish: "Completado",
+	},
+	MsgTrackStatusFailed: {
+		LangEnglish: "Failed", LangChinese: "失败", LangTraditionalChinese: "失敗", LangJapanese: "失敗", LangSpanish: "Fallido",
+	},
+	MsgTrackStatusInterrupted: {
+		LangEnglish: "Interrupted", LangChinese: "已中断", LangTraditionalChinese: "已中斷", LangJapanese: "中断", LangSpanish: "Interrumpido",
+	},
+	MsgTrackStatusUnknown: {
+		LangEnglish: "Unknown", LangChinese: "未知", LangTraditionalChinese: "未知", LangJapanese: "不明", LangSpanish: "Desconocido",
+	},
+	MsgTrackWaitingApproval: {
+		LangEnglish: "approval", LangChinese: "审批", LangTraditionalChinese: "審批", LangJapanese: "承認", LangSpanish: "aprobación",
+	},
+	MsgTrackWaitingUserInput: {
+		LangEnglish: "user input", LangChinese: "用户输入", LangTraditionalChinese: "使用者輸入", LangJapanese: "ユーザー入力", LangSpanish: "entrada del usuario",
+	},
+	MsgTrackActivityShell: {
+		LangEnglish: "Shell", LangChinese: "Shell", LangTraditionalChinese: "Shell", LangJapanese: "シェル", LangSpanish: "Shell",
+	},
+	MsgTrackActivityMCP: {
+		LangEnglish: "MCP tool", LangChinese: "MCP 工具", LangTraditionalChinese: "MCP 工具", LangJapanese: "MCP ツール", LangSpanish: "Herramienta MCP",
+	},
+	MsgTrackActivityWebSearch: {
+		LangEnglish: "Web search", LangChinese: "网页搜索", LangTraditionalChinese: "網頁搜尋", LangJapanese: "ウェブ検索", LangSpanish: "Búsqueda web",
+	},
+	MsgTrackActivityFileChange: {
+		LangEnglish: "File change", LangChinese: "文件修改", LangTraditionalChinese: "檔案修改", LangJapanese: "ファイル変更", LangSpanish: "Cambio de archivo",
+	},
+	MsgTrackActivityAgent: {
+		LangEnglish: "Agent", LangChinese: "Agent", LangTraditionalChinese: "Agent", LangJapanese: "エージェント", LangSpanish: "Agente",
+	},
+	MsgTrackActivityPlan: {
+		LangEnglish: "Plan", LangChinese: "计划", LangTraditionalChinese: "計畫", LangJapanese: "計画", LangSpanish: "Plan",
+	},
+	MsgTrackActivityTool: {
+		LangEnglish: "Tool", LangChinese: "工具", LangTraditionalChinese: "工具", LangJapanese: "ツール", LangSpanish: "Herramienta",
+	},
+	MsgTrackInterruptButton: {
+		LangEnglish: "Stop this turn", LangChinese: "中止当前任务", LangTraditionalChinese: "中止目前任務", LangJapanese: "このターンを中止", LangSpanish: "Detener este turno",
+	},
+	MsgTrackInterruptRequested: {
+		LangEnglish:            "⏹ Interrupt requested. The tracking card will update when Codex confirms the terminal state.",
+		LangChinese:            "⏹ 已请求中止。Codex 确认终态后，追踪卡片会自动更新。",
+		LangTraditionalChinese: "⏹ 已請求中止。Codex 確認終態後，追蹤卡片會自動更新。",
+		LangJapanese:           "⏹ 中止を要求しました。Codex が終端状態を確認すると追跡カードが更新されます。",
+		LangSpanish:            "⏹ Interrupción solicitada. La tarjeta se actualizará cuando Codex confirme el estado final.",
+	},
+	MsgTrackInterruptStale: {
+		LangEnglish:            "This tracking card is stale or the shown turn has already ended; nothing was interrupted.",
+		LangChinese:            "该追踪卡片已失效，或其中的任务已经结束；未中止任何任务。",
+		LangTraditionalChinese: "該追蹤卡片已失效，或其中的任務已經結束；未中止任何任務。",
+		LangJapanese:           "この追跡カードは古いか、表示中のターンはすでに終了しています。中止は行われませんでした。",
+		LangSpanish:            "Esta tarjeta está obsoleta o el turno ya terminó; no se interrumpió nada.",
+	},
+	MsgTrackInterruptNotSupported: {
+		LangEnglish:            "This agent cannot interrupt an authoritative tracked turn.",
+		LangChinese:            "当前 Agent 无法中止权威追踪中的任务。",
+		LangTraditionalChinese: "目前 Agent 無法中止權威追蹤中的任務。",
+		LangJapanese:           "このエージェントは追跡中のターンを中止できません。",
+		LangSpanish:            "Este agente no puede interrumpir un turno autoritativo seguido.",
+	},
+	MsgTrackInterruptFailed: {
+		LangEnglish:            "❌ Failed to interrupt the tracked turn: %v",
+		LangChinese:            "❌ 中止追踪任务失败：%v",
+		LangTraditionalChinese: "❌ 中止追蹤任務失敗：%v",
+		LangJapanese:           "❌ 追跡中ターンの中止に失敗しました: %v",
+		LangSpanish:            "❌ Error al interrumpir el turno seguido: %v",
+	},
+	MsgTrackMirrorTitle: {
+		LangEnglish:            "Codex · Shared external session",
+		LangChinese:            "Codex · 共享外部会话",
+		LangTraditionalChinese: "Codex · 共用外部會話",
+		LangJapanese:           "Codex · 共有外部セッション",
+		LangSpanish:            "Codex · Sesión externa compartida",
+	},
+	MsgTrackMirrorFooter: {
+		LangEnglish:            "Mirrored from the shared Codex session",
+		LangChinese:            "来自共享 Codex 会话的镜像",
+		LangTraditionalChinese: "來自共用 Codex 會話的鏡像",
+		LangJapanese:           "共有 Codex セッションからのミラー",
+		LangSpanish:            "Reflejado desde la sesión compartida de Codex",
+	},
+	MsgTrackEnabled: {
+		LangEnglish:            "✅ External-turn mirror is on for this destination.",
+		LangChinese:            "✅ 当前会话目标已开启外部任务镜像。",
+		LangTraditionalChinese: "✅ 目前會話目標已開啟外部任務鏡像。",
+		LangJapanese:           "✅ この送信先の外部ターンミラーを有効にしました。",
+		LangSpanish:            "✅ El reflejo de turnos externos está activado para este destino.",
+	},
+	MsgTrackProjectDisabled: {
+		LangEnglish:            "The destination override was saved, but external mirroring remains off because the project master switch is disabled.",
+		LangChinese:            "已保存当前投递目标的开启设置，但项目总开关已关闭，外部任务镜像仍不生效。",
+		LangTraditionalChinese: "已儲存目前投遞目標的開啟設定，但專案總開關已關閉，外部任務鏡像仍不生效。",
+		LangJapanese:           "送信先の上書き設定は保存されましたが、プロジェクトのマスタースイッチが無効なため外部ターンミラーは引き続き無効です。",
+		LangSpanish:            "Se guardó la activación para este destino, pero el reflejo externo sigue desactivado porque el interruptor maestro del proyecto está apagado.",
+	},
+	MsgTrackDisabled: {
+		LangEnglish:            "⏸ External-turn mirror is off for this destination. Running Codex work was not interrupted.",
+		LangChinese:            "⏸ 当前会话目标已关闭外部任务镜像；正在执行的 Codex 任务不会被中止。",
+		LangTraditionalChinese: "⏸ 目前會話目標已關閉外部任務鏡像；執行中的 Codex 任務不會被中止。",
+		LangJapanese:           "⏸ この送信先の外部ターンミラーを無効にしました。実行中の Codex 作業は中止されません。",
+		LangSpanish:            "⏸ El reflejo está desactivado para este destino. El trabajo de Codex en curso no se interrumpió.",
+	},
+	MsgTrackStatusReport: {
+		LangEnglish:            "**External mirror**\nEffective: `%s`\nProject default: `%s`\nOverride: `%s`\nThread: `%s`\nLast turn: `%s`\nRecovery gap: `%s`\nRealtime events: `%s`\nPaged reconcile: `%s`\nClient marker: `%s`\nCard recovery: `%s`\nExact steer: `%s`\nDaemon queue: `%s`\nShared-write policy: `%s`\nExact interrupt: `%s`",
+		LangChinese:            "**外部任务镜像**\n当前生效：`%s`\n项目默认：`%s`\n手动覆盖：`%s`\nThread：`%s`\n最近 turn：`%s`\n恢复缺口：`%s`\n实时事件：`%s`\n分页对账：`%s`\n客户端标记：`%s`\n卡片恢复：`%s`\n精确追加：`%s`\nDaemon 队列：`%s`\n共享写入策略：`%s`\n精确中止：`%s`",
+		LangTraditionalChinese: "**外部任務鏡像**\n目前生效：`%s`\n專案預設：`%s`\n手動覆寫：`%s`\nThread：`%s`\n最近 turn：`%s`\n復原缺口：`%s`\n即時事件：`%s`\n分頁對帳：`%s`\n用戶端標記：`%s`\n卡片復原：`%s`\n精確追加：`%s`\nDaemon 佇列：`%s`\n共用寫入策略：`%s`\n精確中止：`%s`",
+		LangJapanese:           "**外部ターンミラー**\n有効状態: `%s`\nプロジェクト既定値: `%s`\n上書き: `%s`\nThread: `%s`\n最新ターン: `%s`\n復旧ギャップ: `%s`\nリアルタイムイベント: `%s`\nページング照合: `%s`\nクライアントマーカー: `%s`\nカード復旧: `%s`\n厳密な steer: `%s`\nDaemon キュー: `%s`\n共有書き込み方針: `%s`\n厳密な中止: `%s`",
+		LangSpanish:            "**Reflejo de turnos externos**\nEfectivo: `%s`\nPredeterminado del proyecto: `%s`\nAnulación: `%s`\nThread: `%s`\nÚltimo turno: `%s`\nBrecha de recuperación: `%s`\nEventos en tiempo real: `%s`\nConciliación paginada: `%s`\nMarcador del cliente: `%s`\nRecuperación de tarjeta: `%s`\nSteer exacto: `%s`\nCola del daemon: `%s`\nPolítica de escritura compartida: `%s`\nInterrupción exacta: `%s`",
+	},
+	MsgTrackPersistFailed: {
+		LangEnglish:            "❌ Failed to persist the mirror setting: %v",
+		LangChinese:            "❌ 持久化镜像设置失败：%v",
+		LangTraditionalChinese: "❌ 持久化鏡像設定失敗：%v",
+		LangJapanese:           "❌ ミラー設定を保存できませんでした: %v",
+		LangSpanish:            "❌ No se pudo guardar la configuración del reflejo: %v",
+	},
+	MsgTrackRefreshed: {
+		LangEnglish:            "✅ The existing turn card was refreshed.",
+		LangChinese:            "✅ 已刷新现有任务卡片。",
+		LangTraditionalChinese: "✅ 已重新整理現有任務卡片。",
+		LangJapanese:           "✅ 既存のターンカードを更新しました。",
+		LangSpanish:            "✅ Se actualizó la tarjeta existente.",
+	},
+	MsgTrackMirrorCompletedNotification: {
+		LangEnglish:            "✅ The shared Codex task finished.",
+		LangChinese:            "✅ 共享 Codex 任务已完成。",
+		LangTraditionalChinese: "✅ 共用 Codex 任務已完成。",
+		LangJapanese:           "✅ 共有 Codex タスクが完了しました。",
+		LangSpanish:            "✅ La tarea compartida de Codex terminó.",
+	},
+	MsgTrackMirrorFailedNotification: {
+		LangEnglish:            "❌ The shared Codex task failed.",
+		LangChinese:            "❌ 共享 Codex 任务执行失败。",
+		LangTraditionalChinese: "❌ 共用 Codex 任務執行失敗。",
+		LangJapanese:           "❌ 共有 Codex タスクが失敗しました。",
+		LangSpanish:            "❌ La tarea compartida de Codex falló.",
+	},
+	MsgTrackMirrorInterruptedNotification: {
+		LangEnglish:            "⏹ The shared Codex turn was interrupted.",
+		LangChinese:            "⏹ 共享 Codex 任务已中止。",
+		LangTraditionalChinese: "⏹ 共用 Codex 任務已中止。",
+		LangJapanese:           "⏹ 共有 Codex ターンが中止されました。",
+		LangSpanish:            "⏹ El turno compartido de Codex fue interrumpido.",
+	},
+	MsgTrackMirrorCardFailedNotification: {
+		LangEnglish:            "⚠️ The shared Codex task ended, but its tracking card could not be updated. Use `/track` to refresh it.",
+		LangChinese:            "⚠️ 共享 Codex 任务已结束，但追踪卡片更新失败；可使用 `/track` 刷新。",
+		LangTraditionalChinese: "⚠️ 共用 Codex 任務已結束，但追蹤卡片更新失敗；可使用 `/track` 重新整理。",
+		LangJapanese:           "⚠️ 共有 Codex タスクは終了しましたが、追跡カードを更新できませんでした。`/track` で更新できます。",
+		LangSpanish:            "⚠️ La tarea compartida de Codex terminó, pero no se pudo actualizar su tarjeta. Usa `/track` para actualizarla.",
+	},
+	MsgTrackSteerAccepted: {
+		LangEnglish:            "✅ Input was appended to the exact active turn shown by this card.",
+		LangChinese:            "✅ 已将输入追加到该卡片对应的当前任务。",
+		LangTraditionalChinese: "✅ 已將輸入追加到該卡片對應的目前任務。",
+		LangJapanese:           "✅ このカードが示す実行中ターンに入力を追加しました。",
+		LangSpanish:            "✅ La entrada se añadió al turno activo exacto mostrado por esta tarjeta.",
+	},
+	MsgTrackSteerStale: {
+		LangEnglish:            "This card no longer points to the active turn. The input was not sent.",
+		LangChinese:            "该卡片已不再对应当前执行中的任务，输入未发送。",
+		LangTraditionalChinese: "該卡片已不再對應目前執行中的任務，輸入未傳送。",
+		LangJapanese:           "このカードは現在の実行中ターンを指していません。入力は送信されませんでした。",
+		LangSpanish:            "Esta tarjeta ya no apunta al turno activo. La entrada no se envió.",
+	},
+	MsgTrackSteerFailed: {
+		LangEnglish:            "❌ Failed to append input to the tracked turn; no new turn was started: %v",
+		LangChinese:            "❌ 向追踪任务追加输入失败，且未启动新任务：%v",
+		LangTraditionalChinese: "❌ 向追蹤任務追加輸入失敗，且未啟動新任務：%v",
+		LangJapanese:           "❌ 追跡中ターンへの入力追加に失敗しました。新しいターンは開始していません: %v",
+		LangSpanish:            "❌ No se pudo añadir la entrada al turno seguido; no se inició un turno nuevo: %v",
+	},
+	MsgTrackSharedTurnBusy: {
+		LangEnglish:            "A shared Codex turn is already running. Reply to its tracking card to steer that exact turn, interrupt it, or wait for it to finish. This message was not sent.",
+		LangChinese:            "共享 Codex 会话中已有任务执行中。请回复对应追踪卡片以精确追加输入、中止它，或等待结束；本条消息未发送。",
+		LangTraditionalChinese: "共用 Codex 會話中已有任務執行中。請回覆對應追蹤卡片以精確追加輸入、中止它，或等待結束；本則訊息未傳送。",
+		LangJapanese:           "共有 Codex ターンが実行中です。その追跡カードに返信して厳密に入力を追加するか、中止または完了を待ってください。このメッセージは送信されませんでした。",
+		LangSpanish:            "Ya hay un turno compartido de Codex en ejecución. Responde a su tarjeta para dirigir ese turno exacto, interrúmpelo o espera. Este mensaje no se envió.",
+	},
+	MsgTrackSharedTurnCheckFailed: {
+		LangEnglish:            "❌ Could not verify whether the shared Codex thread is idle, so the message was not sent: %v",
+		LangChinese:            "❌ 无法确认共享 Codex 会话是否空闲，为避免误追加，本条消息未发送：%v",
+		LangTraditionalChinese: "❌ 無法確認共用 Codex 會話是否閒置，為避免誤追加，本則訊息未傳送：%v",
+		LangJapanese:           "❌ 共有 Codex スレッドがアイドルか確認できないため、誤送信を避けてメッセージを送信しませんでした: %v",
+		LangSpanish:            "❌ No se pudo verificar si el hilo compartido de Codex estaba inactivo; el mensaje no se envió: %v",
 	},
 	MsgNameUsage: {
 		LangEnglish:            "Usage:\n`/name <text>` — name the current session\n`/name <number> <text>` — name a session by list number",
@@ -3633,11 +3977,18 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Mostrar sesión activa actual",
 	},
 	MsgBuiltinCmdHistory: {
-		LangEnglish:            "Show last n messages, arg: [n] (default 10)",
-		LangChinese:            "查看最近 n 条消息，参数: [n]（默认 10）",
-		LangTraditionalChinese: "查看最近 n 條訊息，參數: [n]（預設 10）",
-		LangJapanese:           "直近 n 件のメッセージを表示、引数: [n]（デフォルト 10）",
-		LangSpanish:            "Mostrar últimos n mensajes, arg: [n] (por defecto 10)",
+		LangEnglish:            "Show last n completed turns, arg: [n] (default 10)",
+		LangChinese:            "查看最近 n 个已结束对话，参数: [n]（默认 10）",
+		LangTraditionalChinese: "查看最近 n 個已結束對話，參數: [n]（預設 10）",
+		LangJapanese:           "直近 n 件の完了ターンを表示、引数: [n]（デフォルト 10）",
+		LangSpanish:            "Mostrar los últimos n turnos finalizados, arg: [n] (por defecto 10)",
+	},
+	MsgBuiltinCmdTrack: {
+		LangEnglish:            "Track the latest Codex turn in an updating card",
+		LangChinese:            "通过自动更新卡片追踪最新 Codex 对话",
+		LangTraditionalChinese: "透過自動更新卡片追蹤最新 Codex 對話",
+		LangJapanese:           "更新カードで最新の Codex ターンを追跡",
+		LangSpanish:            "Seguir el último turno de Codex en una tarjeta actualizable",
 	},
 	MsgBuiltinCmdProvider: {
 		LangEnglish:            "Manage API providers, arg: [list|add|remove|switch|clear]",

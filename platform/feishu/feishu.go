@@ -818,13 +818,14 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 	if strings.HasPrefix(actionVal, "askq:") {
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
 		go p.dispatchCoreMessage(&core.Message{
-			SessionKey: sessionKey,
-			Platform:   p.platformName,
-			UserID:     userID,
-			UserName:   p.resolveUserName(userID),
-			ChatName:   p.resolveChatName(chatID),
-			Content:    actionVal,
-			ReplyCtx:   rctx,
+			SessionKey:          sessionKey,
+			Platform:            p.platformName,
+			ReferencedMessageID: messageID,
+			UserID:              userID,
+			UserName:            p.resolveUserName(userID),
+			ChatName:            p.resolveChatName(chatID),
+			Content:             actionVal,
+			ReplyCtx:            rctx,
 		})
 
 		answerLabel, _ := event.Event.Action.Value["askq_label"].(string)
@@ -853,13 +854,14 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		slog.Info(p.tag()+": card action dispatched as command", "cmd", cmdText, "user", userID)
 
 		go p.dispatchCoreMessage(&core.Message{
-			SessionKey: sessionKey,
-			Platform:   p.platformName,
-			UserID:     userID,
-			UserName:   p.resolveUserName(userID),
-			ChatName:   p.resolveChatName(chatID),
-			Content:    cmdText,
-			ReplyCtx:   rctx,
+			SessionKey:          sessionKey,
+			Platform:            p.platformName,
+			ReferencedMessageID: messageID,
+			UserID:              userID,
+			UserName:            p.resolveUserName(userID),
+			ChatName:            p.resolveChatName(chatID),
+			Content:             cmdText,
+			ReplyCtx:            rctx,
 		})
 
 		if ac, ok := event.Event.Action.Value["after_click"].(map[string]any); ok {
@@ -1527,8 +1529,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.flushImageBatchForSession(sessionKey)
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
-			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			MessageID: messageID, ReferencedMessageID: parentID,
+			UserID: userID, UserName: userName, ChatName: chatName,
 			Content: text, ExtraContent: quoted.text, Images: quoted.images, Files: quotedFiles, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
@@ -1572,8 +1574,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		}
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
-			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			MessageID: messageID, ReferencedMessageID: parentID,
+			UserID: userID, UserName: userName, ChatName: chatName,
 			Content:           "",
 			ExtraContent:      quoted.text,
 			Images:            append(quoted.images, core.ImageAttachment{MimeType: mimeType, Data: imgData}),
@@ -1605,8 +1607,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.flushImageBatchForSession(sessionKey)
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
-			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			MessageID: messageID, ReferencedMessageID: parentID,
+			UserID: userID, UserName: userName, ChatName: chatName,
 			Audio: &core.AudioAttachment{
 				MimeType: "audio/opus",
 				Data:     audioData,
@@ -1627,8 +1629,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.flushImageBatchForSession(sessionKey)
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
-			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			MessageID: messageID, ReferencedMessageID: parentID,
+			UserID: userID, UserName: userName, ChatName: chatName,
 			Content: text, ExtraContent: quoted.text, Images: append(quoted.images, images...),
 			ReplyCtx:          rctx,
 			UserMessageTimeMs: createTimeMs,
@@ -1658,8 +1660,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.flushImageBatchForSession(sessionKey)
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
-			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			MessageID: messageID, ReferencedMessageID: parentID,
+			UserID: userID, UserName: userName, ChatName: chatName,
 			Files: []core.FileAttachment{{
 				MimeType: mimeType,
 				Data:     fileData,
@@ -1679,8 +1681,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.flushImageBatchForSession(sessionKey)
 		coreMsg := &core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
-			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			MessageID: messageID, ReferencedMessageID: parentID,
+			UserID: userID, UserName: userName, ChatName: chatName,
 			Content:           text,
 			Images:            images,
 			Files:             files,
@@ -1705,8 +1707,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			p.flushImageBatchForSession(sessionKey)
 			p.dispatchCoreMessage(&core.Message{
 				SessionKey: sessionKey, Platform: p.platformName,
-				MessageID: messageID,
-				UserID:    userID, UserName: userName, ChatName: chatName,
+				MessageID: messageID, ReferencedMessageID: parentID,
+				UserID: userID, UserName: userName, ChatName: chatName,
 				Content: "[sticker]", ExtraContent: quoted.text, ReplyCtx: rctx,
 				UserMessageTimeMs: createTimeMs,
 			})
@@ -1716,8 +1718,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.flushImageBatchForSession(sessionKey)
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
-			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			MessageID: messageID, ReferencedMessageID: parentID,
+			UserID: userID, UserName: userName, ChatName: chatName,
 			Images:            []core.ImageAttachment{{MimeType: mimeType, Data: imgData}},
 			ReplyCtx:          rctx,
 			UserMessageTimeMs: createTimeMs,
@@ -1755,8 +1757,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.flushImageBatchForSession(sessionKey)
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
-			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			MessageID: messageID, ReferencedMessageID: parentID,
+			UserID: userID, UserName: userName, ChatName: chatName,
 			Content: text, ExtraContent: quoted.text, Images: images, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
@@ -2839,6 +2841,21 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
 }
 
+// SendIdempotent implements core.IdempotentSender using Feishu's native UUID
+// request deduplication.
+func (p *Platform) SendIdempotent(ctx context.Context, rctx any, content, idempotencyKey string) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+	}
+	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
+	msgType, msgBody := buildReplyContent(content)
+	if p.shouldUseThreadOrReplyAPI(rc) {
+		return p.replyMessageWithUUID(ctx, rc, msgType, msgBody, idempotencyKey)
+	}
+	return p.createMessageWithUUID(ctx, rc.chatID, msgType, msgBody, "send idempotent", idempotencyKey)
+}
+
 // SendWithStatusFooter implements core.StatusFooterSender: send a reply with
 // the body content followed by a small/dim status-footer block. Always uses
 // the interactive card path so the footer can render with text_size:
@@ -3661,19 +3678,30 @@ func (p *Platform) sendNewMessageToChat(ctx context.Context, rc replyContext, ms
 }
 
 func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content string) *larkim.ReplyMessageReqBody {
+	return p.buildReplyMessageReqBodyWithUUID(rc, msgType, content, "")
+}
+
+func (p *Platform) buildReplyMessageReqBodyWithUUID(rc replyContext, msgType, content, uuid string) *larkim.ReplyMessageReqBody {
 	body := larkim.NewReplyMessageReqBodyBuilder().
 		MsgType(msgType).
 		Content(content)
 	if p.shouldReplyInThread(rc) {
 		body.ReplyInThread(true)
 	}
+	if uuid = strings.TrimSpace(uuid); uuid != "" {
+		body.Uuid(uuid)
+	}
 	return body.Build()
 }
 
 func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) error {
+	return p.replyMessageWithUUID(ctx, rc, msgType, content, "")
+}
+
+func (p *Platform) replyMessageWithUUID(ctx context.Context, rc replyContext, msgType, content, uuid string) error {
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(rc.messageID).
-		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
+		Body(p.buildReplyMessageReqBodyWithUUID(rc, msgType, content, uuid)).
 		Build()
 	return p.withTransientRetry(ctx, "reply", func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "reply", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
@@ -3690,13 +3718,20 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 }
 
 func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
+	return p.createMessageWithUUID(ctx, chatID, msgType, content, op, "")
+}
+
+func (p *Platform) createMessageWithUUID(ctx context.Context, chatID, msgType, content, op, uuid string) error {
+	body := larkim.NewCreateMessageReqBodyBuilder().
+		ReceiveId(chatID).
+		MsgType(msgType).
+		Content(content)
+	if uuid = strings.TrimSpace(uuid); uuid != "" {
+		body.Uuid(uuid)
+	}
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
-		Body(larkim.NewCreateMessageReqBodyBuilder().
-			ReceiveId(chatID).
-			MsgType(msgType).
-			Content(content).
-			Build()).
+		Body(body.Build()).
 		Build()
 	return p.withTransientRetry(ctx, op, func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, op, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
@@ -3877,6 +3912,29 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 		}
 	}
 	return rc, nil
+}
+
+// MirrorDestinationKey removes participant identity while retaining chat or
+// topic identity, so a proactive mirror has one stable destination.
+func (p *Platform) MirrorDestinationKey(sessionKey string) (string, error) {
+	parts := strings.SplitN(sessionKey, ":", 3)
+	if len(parts) < 2 || parts[0] != p.platformName || strings.TrimSpace(parts[1]) == "" {
+		return "", fmt.Errorf("%s: invalid session key %q", p.tag(), sessionKey)
+	}
+	destination := parts[0] + ":" + parts[1]
+	if len(parts) == 3 {
+		if _, ok := parseThreadRootID(parts[2]); ok {
+			destination += ":" + parts[2]
+		}
+	}
+	return destination, nil
+}
+
+// SupportsConversationMirror reports the runtime card capability. The method
+// keeps core from enabling a card-only mirror when interactive cards were
+// explicitly disabled for this Feishu platform instance.
+func (p *Platform) SupportsConversationMirror() bool {
+	return p.useInteractiveCard
 }
 
 // RelayGroupVisibilityKey implements core.RelayGroupVisibilityTarget for
@@ -4484,6 +4542,15 @@ func buildPreviewCardJSON(content string) string {
 // cardID stays empty in that case and the engine routes EventText through the
 // full-card Patch path (= original #657 behavior, no typewriter).
 func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content string) (any, error) {
+	return p.sendPreviewStart(ctx, rctx, content, "")
+}
+
+// SendPreviewStartIdempotent implements core.IdempotentPreviewStarter.
+func (p *Platform) SendPreviewStartIdempotent(ctx context.Context, rctx any, content, idempotencyKey string) (any, error) {
+	return p.sendPreviewStart(ctx, rctx, content, idempotencyKey)
+}
+
+func (p *Platform) sendPreviewStart(ctx context.Context, rctx any, content, idempotencyKey string) (any, error) {
 	if !p.useInteractiveCard {
 		return nil, core.ErrNotSupported
 	}
@@ -4504,17 +4571,24 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	var cardID string      // cardkit-v1 entity id (empty = no streaming text path)
 	if isCardJSON(content) {
 		cardJSON = content
-		// Try cardkit-v1 two-step flow regardless of Reply vs Create. Both
-		// Im.Message.Reply and Im.Message.Create accept the {type:card,data:{card_id}}
-		// content schema (verified by direct API call); skipping Reply mode would
-		// disable cardkit-v1 streaming on every @-mention turn (the dominant case).
-		if id, err := p.createCardEntity(ctx, cardJSON); err == nil {
-			cardID = id
-			sendContent = fmt.Sprintf(`{"type":"card","data":{"card_id":"%s"}}`, id)
-		} else {
-			slog.Info(p.tag()+": create card entity failed, falling back to inline card JSON",
-				"error", err)
+		if strings.TrimSpace(idempotencyKey) != "" {
+			// A retried UUID can return an already-created message. Creating a new
+			// CardKit entity before that retry would leave the restored handle
+			// pointing at an entity the message does not reference. Persistent
+			// mirrors therefore use inline cards and recover through Message.Patch.
 			sendContent = cardJSON
+		} else {
+			// Try cardkit-v1 two-step flow regardless of Reply vs Create. Both
+			// Im.Message.Reply and Im.Message.Create accept the
+			// {type:card,data:{card_id}} content schema.
+			if id, err := p.createCardEntity(ctx, cardJSON); err == nil {
+				cardID = id
+				sendContent = fmt.Sprintf(`{"type":"card","data":{"card_id":"%s"}}`, id)
+			} else {
+				slog.Info(p.tag()+": create card entity failed, falling back to inline card JSON",
+					"error", err)
+				sendContent = cardJSON
+			}
 		}
 	} else {
 		cardJSON = buildPreviewCardJSON(content)
@@ -4523,9 +4597,10 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 
 	var msgID string
 	if p.shouldUseThreadOrReplyAPI(rc) {
+		body := p.buildReplyMessageReqBodyWithUUID(rc, larkim.MsgTypeInteractive, sendContent, idempotencyKey)
 		req := larkim.NewReplyMessageReqBuilder().
 			MessageId(rc.messageID).
-			Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeInteractive, sendContent)).
+			Body(body).
 			Build()
 		var resp *larkim.ReplyMessageResp
 		if err := p.withTransientRetry(ctx, "send preview", func() error {
@@ -4547,13 +4622,16 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 			msgID = *resp.Data.MessageId
 		}
 	} else {
+		body := larkim.NewCreateMessageReqBodyBuilder().
+			ReceiveId(chatID).
+			MsgType(larkim.MsgTypeInteractive).
+			Content(sendContent)
+		if idempotencyKey = strings.TrimSpace(idempotencyKey); idempotencyKey != "" {
+			body.Uuid(idempotencyKey)
+		}
 		req := larkim.NewCreateMessageReqBuilder().
 			ReceiveIdType(larkim.ReceiveIdTypeChatId).
-			Body(larkim.NewCreateMessageReqBodyBuilder().
-				ReceiveId(chatID).
-				MsgType(larkim.MsgTypeInteractive).
-				Content(sendContent).
-				Build()).
+			Body(body.Build()).
 			Build()
 		var resp *larkim.CreateMessageResp
 		if err := p.withTransientRetry(ctx, "send preview", func() error {
@@ -4581,6 +4659,66 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	}
 
 	return &feishuPreviewHandle{messageID: msgID, chatID: chatID, cardID: cardID}, nil
+}
+
+type persistedFeishuPreviewHandle struct {
+	MessageID string          `json:"message_id"`
+	ChatID    string          `json:"chat_id"`
+	CardID    string          `json:"card_id,omitempty"`
+	Sequence  int             `json:"sequence,omitempty"`
+	Status    core.CardStatus `json:"status,omitempty"`
+}
+
+// EncodePreviewHandle implements core.PreviewHandleCodec.
+func (p *Platform) EncodePreviewHandle(previewHandle any) (string, error) {
+	h, ok := previewHandle.(*feishuPreviewHandle)
+	if !ok {
+		return "", fmt.Errorf("%s: invalid preview handle type %T", p.tag(), previewHandle)
+	}
+	h.mu.Lock()
+	persisted := persistedFeishuPreviewHandle{
+		MessageID: h.messageID, ChatID: h.chatID, CardID: h.cardID,
+		Sequence: h.sequence, Status: h.status,
+	}
+	h.mu.Unlock()
+	if strings.TrimSpace(persisted.MessageID) == "" || strings.TrimSpace(persisted.ChatID) == "" {
+		return "", fmt.Errorf("%s: incomplete preview handle", p.tag())
+	}
+	b, err := json.Marshal(persisted)
+	if err != nil {
+		return "", fmt.Errorf("%s: encode preview handle: %w", p.tag(), err)
+	}
+	return string(b), nil
+}
+
+// RestorePreviewHandle implements core.PreviewHandleCodec.
+func (p *Platform) RestorePreviewHandle(encoded string) (any, error) {
+	var persisted persistedFeishuPreviewHandle
+	if err := json.Unmarshal([]byte(encoded), &persisted); err != nil {
+		return nil, fmt.Errorf("%s: restore preview handle: %w", p.tag(), err)
+	}
+	if strings.TrimSpace(persisted.MessageID) == "" || strings.TrimSpace(persisted.ChatID) == "" {
+		return nil, fmt.Errorf("%s: incomplete persisted preview handle", p.tag())
+	}
+	return &feishuPreviewHandle{
+		messageID: persisted.MessageID, chatID: persisted.ChatID, cardID: persisted.CardID,
+		sequence: persisted.Sequence, status: persisted.Status,
+	}, nil
+}
+
+// PreviewMessageID implements core.PreviewHandleIdentifier.
+func (p *Platform) PreviewMessageID(previewHandle any) (string, error) {
+	h, ok := previewHandle.(*feishuPreviewHandle)
+	if !ok {
+		return "", fmt.Errorf("%s: invalid preview handle type %T", p.tag(), previewHandle)
+	}
+	h.mu.Lock()
+	messageID := strings.TrimSpace(h.messageID)
+	h.mu.Unlock()
+	if messageID == "" {
+		return "", fmt.Errorf("%s: preview handle has no message ID", p.tag())
+	}
+	return messageID, nil
 }
 
 // createCardEntity calls the cardkit-v1 Create Card Entity API
@@ -6357,15 +6495,14 @@ func isCardJSON(content string) bool {
 // buildCardJSONWithStatus builds a Feishu card JSON with a colored header
 // reflecting the given status. Used as a fallback when rich-card assembly fails.
 func buildCardJSONWithStatus(content string, status core.CardStatus) string {
+	return buildCardJSONWithRenderOptions(content, status, "", core.CardVariantDefault)
+}
+
+func buildCardJSONWithRenderOptions(content string, status core.CardStatus, title string, variant core.CardVariant) string {
 	content = sanitizeCardMarkdownForCard(content)
-	template := "grey"
-	switch status {
-	case core.CardStatusWorking, core.CardStatusThinking:
-		template = "blue"
-	case core.CardStatusDone:
-		template = "green"
-	case core.CardStatusError:
-		template = "red"
+	template, defaultTitle := richCardHeader(status, variant)
+	if strings.TrimSpace(title) == "" {
+		title = defaultTitle
 	}
 	card := map[string]any{
 		"schema": "2.0",
@@ -6374,7 +6511,7 @@ func buildCardJSONWithStatus(content string, status core.CardStatus) string {
 		},
 		"header": map[string]any{
 			"template": template,
-			"title":    map[string]any{"tag": "plain_text", "content": ""},
+			"title":    map[string]any{"tag": "plain_text", "content": title},
 		},
 		"body": map[string]any{
 			"elements": []map[string]any{
@@ -6491,11 +6628,17 @@ const maxRichCardJSONBytes = 28000
 // buildRichCard renders a Card 2.0 "single-card" turn with collapsible
 // reasoning/tool panels, streaming markdown body, status-colored header, and a
 // pre-composed multi-line statusFooter (engine-owned, includes elapsed).
-func buildRichCard(status core.CardStatus, _ string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) string {
-	b, err := buildRichCardJSONBytes(status, steps, markdown, streaming, statusFooter)
+func buildRichCard(status core.CardStatus, title string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) string {
+	return buildRichCardWithOptions(core.RichCardRenderOptions{
+		Status: status, Title: title, Steps: steps, Markdown: markdown, Streaming: streaming, StatusFooter: statusFooter,
+	})
+}
+
+func buildRichCardWithOptions(options core.RichCardRenderOptions) string {
+	b, err := buildRichCardJSONBytesWithOptions(options)
 	if err != nil {
 		slog.Debug("feishu: build rich card marshal failed, fallback to basic card", "error", err)
-		return buildCardJSONWithStatus(markdown, status)
+		return buildCardJSONWithRenderOptions(options.Markdown, options.Status, options.Title, options.Variant)
 	}
 	if len(b) <= maxRichCardJSONBytes {
 		return string(b)
@@ -6513,28 +6656,123 @@ func buildRichCard(status core.CardStatus, _ string, steps []core.ToolStep, mark
 		{perLane: 6, textLen: 120},
 		{perLane: 3, textLen: 80},
 	} {
-		compactSteps := compactRichStepsForCardSize(steps, limit.perLane, limit.textLen)
-		compact, err := buildRichCardJSONBytes(status, compactSteps, markdown, streaming, statusFooter)
+		compactSteps := compactRichStepsForCardSize(options.Steps, limit.perLane, limit.textLen)
+		compactOptions := options
+		compactOptions.Steps = compactSteps
+		compact, err := buildRichCardJSONBytesWithOptions(compactOptions)
 		if err == nil && len(compact) <= maxRichCardJSONBytes {
 			slog.Debug("feishu: rich card exceeded size limit, compacted panels",
 				"original_size", len(b),
 				"compacted_size", len(compact),
-				"steps", len(steps),
+				"steps", len(options.Steps),
 				"compacted_steps", len(compactSteps),
 			)
 			return string(compact)
 		}
 	}
 
-	fallbackMarkdown := markdown
+	fallbackMarkdown := options.Markdown
 	if strings.TrimSpace(fallbackMarkdown) == "" {
-		fallbackMarkdown = compactRichFallbackMarkdown(steps)
+		fallbackMarkdown = compactRichFallbackMarkdown(options.Steps)
 	}
 	slog.Debug("feishu: rich card exceeds size limit, fallback to compact markdown card", "size", len(b))
-	return buildCardJSONWithStatus(fallbackMarkdown, status)
+	fallback := buildCardJSONWithRenderOptions(fallbackMarkdown, options.Status, options.Title, options.Variant)
+	if withActions, actionErr := appendRichCardActions(fallback, options.Buttons); actionErr == nil && len(withActions) <= maxRichCardJSONBytes {
+		return withActions
+	}
+	if compact, ok := compactActionCardToLimit(options.Status, options.Title, options.Variant, fallbackMarkdown, options.Buttons); ok {
+		return compact
+	}
+	// The fixed card chrome alone is comfortably below the platform limit, so
+	// reaching this branch means a button payload is itself oversized. Keep a
+	// valid bounded card instead of returning the original oversized JSON.
+	return buildCardJSONWithRenderOptions("…", options.Status, options.Title, options.Variant)
+}
+
+func buildRichCardWithActions(status core.CardStatus, title string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string, buttons []core.CardButton) string {
+	return buildRichCardWithOptions(core.RichCardRenderOptions{
+		Status: status, Title: title, Steps: steps, Markdown: markdown, Streaming: streaming, StatusFooter: statusFooter, Buttons: buttons,
+	})
+}
+
+func compactActionCardToLimit(status core.CardStatus, title string, variant core.CardVariant, markdown string, buttons []core.CardButton) (string, bool) {
+	runes := []rune(markdown)
+	low, high := 0, len(runes)
+	best := ""
+	for low <= high {
+		mid := low + (high-low)/2
+		content := strings.TrimSpace(string(runes[:mid]))
+		if mid < len(runes) {
+			if content != "" {
+				content += "\n\n"
+			}
+			content += "…"
+		}
+		candidate, err := appendRichCardActions(buildCardJSONWithRenderOptions(content, status, title, variant), buttons)
+		if err != nil {
+			return "", false
+		}
+		if len(candidate) <= maxRichCardJSONBytes {
+			best = candidate
+			low = mid + 1
+		} else {
+			high = mid - 1
+		}
+	}
+	return best, best != ""
+}
+
+func appendRichCardActions(cardJSON string, buttons []core.CardButton) (string, error) {
+	if len(buttons) == 0 {
+		return cardJSON, nil
+	}
+	var card map[string]any
+	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
+		return "", err
+	}
+	body, ok := card["body"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("rich card body is missing")
+	}
+	elements, _ := body["elements"].([]any)
+	for _, button := range buttons {
+		buttonType := strings.TrimSpace(button.Type)
+		if buttonType == "" {
+			buttonType = "default"
+		}
+		value := map[string]string{"action": button.Value}
+		for key, extra := range button.Extra {
+			value[key] = extra
+		}
+		// Card schema 2.0 accepts button components directly in body.elements.
+		// The legacy action container is rejected by CardKit with error 200861.
+		elements = append(elements, map[string]any{
+			"tag":   "button",
+			"text":  plainText(button.Text),
+			"type":  buttonType,
+			"value": value,
+		})
+	}
+	body["elements"] = elements
+	encoded, err := json.Marshal(card)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) ([]byte, error) {
+	return buildRichCardJSONBytesWithOptions(core.RichCardRenderOptions{
+		Status: status, Steps: steps, Markdown: markdown, Streaming: streaming, StatusFooter: statusFooter,
+	})
+}
+
+func buildRichCardJSONBytesWithOptions(options core.RichCardRenderOptions) ([]byte, error) {
+	status := options.Status
+	steps := options.Steps
+	markdown := options.Markdown
+	streaming := options.Streaming
+	statusFooter := options.StatusFooter
 	reasoningSteps, toolSteps := splitRichStepsByLane(steps)
 	panelMaps := make([]map[string]any, 0, 2)
 	if len(reasoningSteps) > 0 {
@@ -6593,19 +6831,11 @@ func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markd
 		elements = append(elements, footerElements...)
 	}
 
-	// Header template color follows status.
-	headerTemplate := "blue"
-	headerTitle := pickThinkingVerb()
-	switch status {
-	case core.CardStatusDone:
-		headerTemplate = "green"
-		headerTitle = "Done"
-	case core.CardStatusError:
-		headerTemplate = "red"
-		headerTitle = "Error"
-	case core.CardStatusThinking, core.CardStatusWorking:
-		headerTemplate = "blue"
-		headerTitle = pickThinkingVerb()
+	// Terminal state owns the semantic color. The variant only changes the
+	// running-state source color.
+	headerTemplate, headerTitle := richCardHeader(status, options.Variant)
+	if strings.TrimSpace(options.Title) != "" {
+		headerTitle = strings.TrimSpace(options.Title)
 	}
 
 	card := map[string]any{
@@ -6622,7 +6852,34 @@ func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markd
 		"body": map[string]any{"elements": elements},
 	}
 
-	return json.Marshal(card)
+	b, err := json.Marshal(card)
+	if err != nil || len(options.Buttons) == 0 {
+		return b, err
+	}
+	withActions, err := appendRichCardActions(string(b), options.Buttons)
+	return []byte(withActions), err
+}
+
+func richCardHeader(status core.CardStatus, variant core.CardVariant) (template, title string) {
+	template = "blue"
+	title = pickThinkingVerb()
+	if variant == core.CardVariantMirror {
+		template = "purple"
+	}
+	switch status {
+	case core.CardStatusDone:
+		return "green", "Done"
+	case core.CardStatusError:
+		return "red", "Error"
+	case core.CardStatusInterrupted:
+		return "orange", "Interrupted"
+	case core.CardStatusPaused:
+		return "grey", "Paused"
+	case core.CardStatusThinking, core.CardStatusWorking:
+		return template, title
+	default:
+		return "grey", title
+	}
 }
 
 func compactRichStepsForCardSize(steps []core.ToolStep, perLaneLimit, textLimit int) []core.ToolStep {
@@ -6718,6 +6975,16 @@ func splitMarkdownByTables(md string, maxTables int) []string {
 // splits it back into one dim notation block per line.
 func (p *Platform) BuildRichCard(status core.CardStatus, title string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) string {
 	return buildRichCard(status, title, steps, markdown, streaming, statusFooter)
+}
+
+// BuildRichCardWithActions implements core.RichCardActionSupporter.
+func (p *Platform) BuildRichCardWithActions(status core.CardStatus, title string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string, buttons []core.CardButton) string {
+	return buildRichCardWithActions(status, title, steps, markdown, streaming, statusFooter, buttons)
+}
+
+// BuildRichCardWithOptions implements core.RichCardOptionsSupporter.
+func (p *Platform) BuildRichCardWithOptions(options core.RichCardRenderOptions) string {
+	return buildRichCardWithOptions(options)
 }
 
 // SplitMarkdownByTables implements core.MarkdownTableSplitter.

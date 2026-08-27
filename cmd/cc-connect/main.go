@@ -419,6 +419,11 @@ func main() {
 		}
 
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
+		trackCfg := config.EffectiveTrack(&proj)
+		engine.SetTrackCfg(core.TrackCfg{
+			Enabled: *trackCfg.Enabled, DefaultEnabled: *trackCfg.DefaultEnabled,
+			Notify: trackCfg.Notify, SharedWrite: trackCfg.SharedWrite,
+		})
 		// Wire display settings including show_context_indicator and reply_footer
 		// Global [display] config can be overridden by project-level settings
 		_, _, _, _, _, showCtx, showFooter, _ := config.EffectiveDisplay(cfg, &proj)
@@ -1762,6 +1767,11 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		HideAgentFooter:  hideAgentFooter,
 	})
 	result.DisplayUpdated = true
+	trackCfg := config.EffectiveTrack(proj)
+	engine.SetTrackCfg(core.TrackCfg{
+		Enabled: *trackCfg.Enabled, DefaultEnabled: *trackCfg.DefaultEnabled,
+		Notify: trackCfg.Notify, SharedWrite: trackCfg.SharedWrite,
+	})
 
 	// Wire show_context_indicator and reply_footer from display config
 	engine.SetShowContextIndicator(showCtx)

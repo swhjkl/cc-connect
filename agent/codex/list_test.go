@@ -50,6 +50,41 @@ func TestAgentListSessions_ExcludesSubagentRollouts(t *testing.T) {
 	}
 }
 
+func TestGetSessionHistory_ReadsLargeCodexJSONLRecord(t *testing.T) {
+	codexHome := t.TempDir()
+	sessionsDir := filepath.Join(codexHome, "sessions", "2026", "08", "27")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("create sessions directory: %v", err)
+	}
+	largeAnswer := strings.Repeat("x", 300*1024)
+	line, err := json.Marshal(map[string]any{
+		"timestamp": "2026-08-27T00:00:00Z",
+		"type":      "response_item",
+		"payload": map[string]any{
+			"role":    "assistant",
+			"content": []map[string]any{{"type": "output_text", "text": largeAnswer}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal large history row: %v", err)
+	}
+	path := filepath.Join(sessionsDir, "rollout-large-session.jsonl")
+	if err := os.WriteFile(path, append(line, '\n'), 0o644); err != nil {
+		t.Fatalf("write large history row: %v", err)
+	}
+
+	entries, err := getSessionHistory("large-session", codexHome, 10)
+	if err != nil {
+		t.Fatalf("getSessionHistory() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("large history entries = %d, want 1", len(entries))
+	}
+	if entries[0].Content != largeAnswer {
+		t.Fatalf("large history entry length = %d, want %d", len(entries[0].Content), len(largeAnswer))
+	}
+}
+
 func TestAgentListSessions_ExcludesSubagentRolloutWithCopiedParentMeta(t *testing.T) {
 	workDir := t.TempDir()
 	codexHome := t.TempDir()

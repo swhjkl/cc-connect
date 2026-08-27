@@ -344,6 +344,19 @@ type RateLimitCfg struct {
 	Window      time.Duration // sliding window size
 }
 
+// TrackCfg controls passive mirroring of turns started by another client in a
+// shared backend conversation.
+type TrackCfg struct {
+	Enabled        bool
+	DefaultEnabled bool
+	Notify         string // "never", "on_finish", or "on_failure"
+	SharedWrite    string // "daemon_queue" or "observer_only"
+}
+
+func DefaultTrackCfg() TrackCfg {
+	return TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "on_finish", SharedWrite: "observer_only"}
+}
+
 // Engine routes messages between platforms and the agent for a single project.
 type Engine struct {
 	name                  string
@@ -458,8 +471,14 @@ type Engine struct {
 	observeCancel     context.CancelFunc
 
 	// Interactive agent session management
-	interactiveMu     sync.Mutex
-	interactiveStates map[string]*interactiveState // key = sessionKey
+	interactiveMu       sync.Mutex
+	interactiveStates   map[string]*interactiveState // key = sessionKey
+	trackMu             sync.Mutex
+	trackers            map[string]*conversationTracker // key = interactive session key
+	trackCfg            TrackCfg
+	trackStore          *trackStateStore
+	conversationMirrors map[string]*conversationMirror // key = stable proactive destination
+	trackClientSeq      atomic.Uint64
 
 	platformLifecycleMu sync.Mutex
 	platformReady       map[Platform]bool
@@ -501,45 +520,47 @@ type workspaceInitFlow struct {
 // The message is NOT sent to agent stdin at queue time; the event loop
 // sends it after the current turn completes to avoid mid-turn interference.
 type queuedMessage struct {
-	messageID         string
-	platform          Platform
-	replyCtx          any
-	content           string
-	images            []ImageAttachment
-	files             []FileAttachment
-	fromVoice         bool
-	userID            string
-	userName          string // sender's display name for sender injection
-	msgPlatform       string // platform name for sender injection
-	msgSessionKey     string // session key for extracting chat ID
-	channelKey        string // platform-provided channel identifier (preferred over sessionKey extraction)
-	userMessageTimeMs int64  // Feishu create_time ms (optional); see Message.UserMessageTimeMs
+	messageID           string
+	clientUserMessageID string
+	platform            Platform
+	replyCtx            any
+	content             string
+	images              []ImageAttachment
+	files               []FileAttachment
+	fromVoice           bool
+	userID              string
+	userName            string // sender's display name for sender injection
+	msgPlatform         string // platform name for sender injection
+	msgSessionKey       string // session key for extracting chat ID
+	channelKey          string // platform-provided channel identifier (preferred over sessionKey extraction)
+	userMessageTimeMs   int64  // Feishu create_time ms (optional); see Message.UserMessageTimeMs
 }
 
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
-	agentSession             AgentSession
-	platform                 Platform
-	replyCtx                 any
-	currentMessageID         string
-	lastRecallProbeMessageID string
-	lastRecallProbeAt        time.Time
-	recallProbeInFlight      bool
-	workspaceDir             string
-	agent                    Agent
-	mu                       sync.Mutex
-	stopCh                   chan struct{}
-	stopped                  bool
-	pending                  *pendingPermission
-	pendingMessages          []queuedMessage // messages queued while session was busy
-	approveAll               bool            // when true, auto-approve all permission requests for this session
-	fromVoice                bool            // true if current turn originated from voice transcription
-	sideText                 string
-	deleteMode               *deleteModeState
-	modelSwitch              *modelSwitchState
-	pendingProviderAdd       *pendingProviderAddState
-	lastAutoCompressAt       time.Time
-	lastAutoCompressTokens   int
+	agentSession               AgentSession
+	platform                   Platform
+	replyCtx                   any
+	currentMessageID           string
+	currentClientUserMessageID string
+	lastRecallProbeMessageID   string
+	lastRecallProbeAt          time.Time
+	recallProbeInFlight        bool
+	workspaceDir               string
+	agent                      Agent
+	mu                         sync.Mutex
+	stopCh                     chan struct{}
+	stopped                    bool
+	pending                    *pendingPermission
+	pendingMessages            []queuedMessage // messages queued while session was busy
+	approveAll                 bool            // when true, auto-approve all permission requests for this session
+	fromVoice                  bool            // true if current turn originated from voice transcription
+	sideText                   string
+	deleteMode                 *deleteModeState
+	modelSwitch                *modelSwitchState
+	pendingProviderAdd         *pendingProviderAddState
+	lastAutoCompressAt         time.Time
+	lastAutoCompressTokens     int
 
 	// Unsolicited event reader: a background goroutine that consumes agent
 	// events between user-initiated turns (e.g. background task completions).
@@ -744,6 +765,10 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		skills:                NewSkillRegistry(),
 		aliases:               make(map[string]string),
 		interactiveStates:     make(map[string]*interactiveState),
+		trackers:              make(map[string]*conversationTracker),
+		trackCfg:              DefaultTrackCfg(),
+		trackStore:            newTrackStateStore(trackStatePath(sessionStorePath)),
+		conversationMirrors:   make(map[string]*conversationMirror),
 		sendWorkDirs:          make(map[string]string),
 		platformReady:         make(map[Platform]bool),
 		startedAt:             time.Now(),
@@ -881,6 +906,48 @@ func (e *Engine) SetTTSSaveFunc(fn func(mode string) error) {
 // SetDisplayConfig overrides the default truncation settings.
 func (e *Engine) SetDisplayConfig(cfg DisplayCfg) {
 	e.display = cfg
+}
+
+// SetTrackCfg configures shared-conversation mirroring. Destination overrides
+// remain in the separate track state store.
+func (e *Engine) SetTrackCfg(cfg TrackCfg) {
+	switch strings.ToLower(strings.TrimSpace(cfg.Notify)) {
+	case "never", "on_finish", "on_failure":
+		cfg.Notify = strings.ToLower(strings.TrimSpace(cfg.Notify))
+	default:
+		cfg.Notify = "on_finish"
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.SharedWrite)) {
+	case "observer_only", "daemon_queue":
+		cfg.SharedWrite = strings.ToLower(strings.TrimSpace(cfg.SharedWrite))
+	default:
+		cfg.SharedWrite = "observer_only"
+	}
+	e.trackMu.Lock()
+	previous := e.trackCfg
+	e.trackCfg = cfg
+	restartMirrors := previous.Enabled != cfg.Enabled || previous.DefaultEnabled != cfg.DefaultEnabled
+	if restartMirrors {
+		for key, mirror := range e.conversationMirrors {
+			delete(e.conversationMirrors, key)
+			mirror.cancel()
+		}
+	}
+	e.trackMu.Unlock()
+
+	if cfg.Enabled && restartMirrors {
+		e.platformLifecycleMu.Lock()
+		ready := make([]Platform, 0, len(e.platformReady))
+		for platform, isReady := range e.platformReady {
+			if isReady {
+				ready = append(ready, platform)
+			}
+		}
+		e.platformLifecycleMu.Unlock()
+		for _, platform := range ready {
+			go e.resumeConversationMirrors(platform)
+		}
+	}
 }
 
 // SetInstantReply configures the immediate confirmation reply.
@@ -1222,6 +1289,7 @@ var privilegedCommands = map[string]bool{
 	"upgrade": true,
 	"web":     true,
 	"diff":    true,
+	"track":   true,
 }
 
 // isPrivilegedCommandInvocation extends the privilegedCommands map to
@@ -2411,6 +2479,7 @@ func (e *Engine) onPlatformReady(p Platform) {
 	}
 	slog.Info("platform ready", "project", e.name, "platform", p.Name())
 	e.initPlatformCapabilities(p)
+	go e.resumeConversationMirrors(p)
 }
 
 func (e *Engine) markPlatformReady(p Platform) bool {
@@ -2859,6 +2928,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	// Resolve aliases on user text BEFORE merging ExtraContent, so reply
 	// quotes and platform context survive alias resolution (PR #420 fix).
 	content = e.resolveAlias(content)
+	directContent := content
 	if msg.ExtraContent != "" {
 		if content == "" {
 			msg.Content = msg.ExtraContent
@@ -3006,6 +3076,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	}
 
 	if e.discardStaleUserMessageIfNeeded(interactiveKey, msg) {
+		return
+	}
+	if e.handleTrackedConversationInput(p, msg, directContent, agent, sessions) {
 		return
 	}
 
@@ -3179,19 +3252,20 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		return true // handled: queue-full reply sent
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
-		messageID:         msg.MessageID,
-		platform:          p,
-		replyCtx:          msg.ReplyCtx,
-		content:           msg.Content,
-		images:            msg.Images,
-		files:             msg.Files,
-		fromVoice:         msg.FromVoice,
-		userID:            msg.UserID,
-		userName:          msg.UserName,
-		msgPlatform:       msg.Platform,
-		msgSessionKey:     msg.SessionKey,
-		channelKey:        msg.ChannelKey,
-		userMessageTimeMs: msg.UserMessageTimeMs,
+		messageID:           msg.MessageID,
+		clientUserMessageID: msg.ClientUserMessageID,
+		platform:            p,
+		replyCtx:            msg.ReplyCtx,
+		content:             msg.Content,
+		images:              msg.Images,
+		files:               msg.Files,
+		fromVoice:           msg.FromVoice,
+		userID:              msg.UserID,
+		userName:            msg.UserName,
+		msgPlatform:         msg.Platform,
+		msgSessionKey:       msg.SessionKey,
+		channelKey:          msg.ChannelKey,
+		userMessageTimeMs:   msg.UserMessageTimeMs,
 	})
 	runMessageAccepted(msg)
 	queueDepth := len(state.pendingMessages)
@@ -3802,8 +3876,18 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
 
 	sendStart := time.Now()
+	if err := e.prepareForegroundConversation(p, msg, session, agent, sessions); err != nil {
+		slog.Error("track: failed to reserve foreground turn", "platform", p.Name(), "error", err)
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackPersistFailed, err))
+		return
+	}
+	clientUserMessageID := strings.TrimSpace(msg.ClientUserMessageID)
+	if clientUserMessageID == "" {
+		clientUserMessageID = msg.MessageID
+	}
 	state.mu.Lock()
 	state.currentMessageID = msg.MessageID
+	state.currentClientUserMessageID = clientUserMessageID
 	state.fromVoice = msg.FromVoice
 	state.sideText = ""
 	as := state.agentSession // capture under lock to avoid race with cleanup
@@ -3818,7 +3902,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			sendDone <- fmt.Errorf("agent session became nil")
 			return
 		}
-		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
+		sendDone <- as.Send(promptContent, clientUserMessageID, msg.Images, msg.Files)
 	}()
 
 	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
@@ -4536,6 +4620,10 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 	defer cancel()
 
 	events := agentSession.Events()
+	relay := true
+	if policy, ok := agentSession.(UnsolicitedEventRelayPolicy); ok {
+		relay = policy.RelayUnsolicitedEvents()
+	}
 
 	var turnActive bool // true after first event, cleared on EventResult
 	defer func() {
@@ -4602,8 +4690,9 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 						ws.BeginTurn()
 					}
 				}
-				slog.Info("unsolicited events detected, relaying to platform",
-					"session", sessionKey)
+				slog.Info("unsolicited events detected",
+					"session", sessionKey,
+					"relay", relay)
 			}
 
 			state.mu.Lock()
@@ -4640,7 +4729,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					fullResponse = strings.Join(textParts, "")
 				}
 
-				if fullResponse != "" {
+				if relay && fullResponse != "" {
 					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
 						e.send(p, replyCtx, chunk)
 					}
@@ -4653,8 +4742,10 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				// takes event-channel ownership) blocks until this goroutine
 				// exits — so a foreground AddHistory is always ordered after
 				// any unsolicited AddHistory.
-				session.AddHistory("assistant", fullResponse)
-				sessions.Save()
+				if relay {
+					session.AddHistory("assistant", fullResponse)
+					sessions.Save()
+				}
 
 				// Reset for potential subsequent unsolicited turn.
 				textParts = nil
@@ -4716,7 +4807,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 						}
 					}
 				}()
-				if !autoApprove {
+				if relay && !autoApprove {
 					toolName := event.ToolName
 					if toolName == "" {
 						toolName = "(unknown)"
@@ -4727,7 +4818,9 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 			case EventError:
 				if event.Error != nil {
 					slog.Error("unsolicited agent error", "error", event.Error, "session", sessionKey)
-					e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
+					if relay {
+						e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
+					}
 				}
 				state.mu.Lock()
 				state.eventsNeedResync = true
@@ -4998,6 +5091,22 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 
 		switch event.Type {
+		case EventTurnStarted:
+			clientUserMessageID := strings.TrimSpace(event.ClientUserMessageID)
+			if clientUserMessageID == "" {
+				state.mu.Lock()
+				clientUserMessageID = state.currentClientUserMessageID
+				state.mu.Unlock()
+			}
+			if clientUserMessageID == "" {
+				clientUserMessageID = msgID
+			}
+			if clientUserMessageID != "" && event.ThreadID != "" && event.TurnID != "" {
+				if err := e.trackStore.confirmForegroundTurn(clientUserMessageID, event.ThreadID, event.TurnID); err != nil {
+					slog.Warn("track: confirm foreground turn failed", "platform", p.Name(), "error", err)
+				}
+			}
+
 		case EventThinking:
 			if isEllipsisOnly(event.Content) {
 				break
@@ -5893,6 +6002,21 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.fromVoice = queued.fromVoice
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 				state.mu.Unlock()
+				if err := e.prepareQueuedForegroundConversation(state, session, sessions, &queued); err != nil {
+					if pendingSend != nil {
+						if sendErr := <-pendingSend; sendErr != nil {
+							slog.Debug("async send error before rejected queued turn", "error", sendErr)
+						}
+						pendingSend = nil
+					}
+					slog.Error("track: failed to reserve queued foreground turn", "platform", queued.platform.Name(), "error", err)
+					e.send(queued.platform, queued.replyCtx, e.i18n.Tf(MsgTrackPersistFailed, err))
+					return
+				}
+				queuedClientUserMessageID := queuedAgentClientUserMessageID(queued)
+				state.mu.Lock()
+				state.currentClientUserMessageID = queuedClientUserMessageID
+				state.mu.Unlock()
 
 				// Stop the previous turn's typing indicator
 				if stopTyping != nil {
@@ -5929,7 +6053,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						nextSend <- fmt.Errorf("agent session became nil")
 						return
 					}
-					nextSend <- as.Send(queuedPrompt, queued.messageID, queued.images, queued.files)
+					nextSend <- as.Send(queuedPrompt, queuedClientUserMessageID, queued.images, queued.files)
 				}()
 				pendingSend = nextSend
 
@@ -6198,6 +6322,41 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 	}
 }
 
+func queuedAgentClientUserMessageID(queued queuedMessage) string {
+	if marker := strings.TrimSpace(queued.clientUserMessageID); marker != "" {
+		return marker
+	}
+	return queued.messageID
+}
+
+func (e *Engine) prepareQueuedForegroundConversation(state *interactiveState, session *Session, sessions *SessionManager, queued *queuedMessage) error {
+	if state == nil || queued == nil || queued.platform == nil {
+		return nil
+	}
+	state.mu.Lock()
+	agent := state.agent
+	state.mu.Unlock()
+	if agent == nil {
+		agent = e.agent
+	}
+	platformName := queued.msgPlatform
+	if strings.TrimSpace(platformName) == "" {
+		platformName = queued.platform.Name()
+	}
+	msg := &Message{
+		SessionKey:          queued.msgSessionKey,
+		Platform:            platformName,
+		MessageID:           queued.messageID,
+		ClientUserMessageID: queued.clientUserMessageID,
+		ReplyCtx:            queued.replyCtx,
+	}
+	if err := e.prepareForegroundConversation(queued.platform, msg, session, agent, sessions); err != nil {
+		return err
+	}
+	queued.clientUserMessageID = msg.ClientUserMessageID
+	return nil
+}
+
 // drainPendingMessages processes all queued messages in the state's pendingMessages
 // queue. It atomically unlocks the session when the queue is empty (while holding
 // state.mu) to close the race window between "queue empty" and "session unlocked".
@@ -6246,6 +6405,15 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent session ended"))
 			return false
 		}
+		if err := e.prepareQueuedForegroundConversation(state, session, sessions, &queued); err != nil {
+			slog.Error("track: failed to reserve queued foreground turn", "platform", queued.platform.Name(), "error", err)
+			e.send(queued.platform, queued.replyCtx, e.i18n.Tf(MsgTrackPersistFailed, err))
+			continue
+		}
+		queuedClientUserMessageID := queuedAgentClientUserMessageID(queued)
+		state.mu.Lock()
+		state.currentClientUserMessageID = queuedClientUserMessageID
+		state.mu.Unlock()
 
 		drainEvents(as.Events())
 
@@ -6257,7 +6425,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 				sendDone <- fmt.Errorf("agent session became nil")
 				return
 			}
-			sendDone <- as.Send(prompt, queued.messageID, queued.images, queued.files)
+			sendDone <- as.Send(prompt, queuedClientUserMessageID, queued.images, queued.files)
 		}()
 
 		var stopTyping func()
@@ -6288,6 +6456,7 @@ var builtinCommands = []struct {
 	{[]string{"status"}, "status"},
 	{[]string{"usage", "quota"}, "usage"},
 	{[]string{"history"}, "history"},
+	{[]string{"track"}, "track"},
 	{[]string{"allow"}, "allow"},
 	{[]string{"model"}, "model"},
 	{[]string{"reasoning", "effort"}, "reasoning"},
@@ -6495,6 +6664,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdUsage(p, msg)
 	case "history":
 		e.cmdHistory(p, msg, args)
+	case "track":
+		e.cmdTrack(p, msg, args)
 	case "allow":
 		e.cmdAllow(p, msg, args)
 	case "model":
@@ -6853,6 +7024,10 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
+	if err := e.detachConversationMirror(p, msg.SessionKey); err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackPersistFailed, err))
+		return
+	}
 
 	slog.Info("cmdNew: cleaning up old session", "session_key", msg.SessionKey)
 	e.cleanupInteractiveState(interactiveKey)
@@ -7025,6 +7200,11 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), query))
 		return
 	}
+	binding, err := e.rebindConversationMirror(p, msg.SessionKey, matched.ID, agent)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackPersistFailed, err))
+		return
+	}
 
 	slog.Info("cmdSwitch: cleaning up old session", "session_key", msg.SessionKey)
 	e.cleanupInteractiveState(interactiveKey)
@@ -7037,6 +7217,7 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	// /switch round-trip. When SwitchToAgentSession creates a fresh Session
 	// (no prior match), History is already nil, so preserving is a no-op.
 	_ = sessions.SwitchToAgentSession(msg.SessionKey, matched.ID, agent.Name(), matched.Summary)
+	e.startConversationMirror(agent, sessions, p, binding)
 
 	shortID := matched.ID
 	if len(shortID) > 12 {
@@ -9076,42 +9257,43 @@ func formatDurationI18n(d time.Duration, lang Language) string {
 }
 
 func (e *Engine) cmdHistory(p Platform, msg *Message, args []string) {
-	if len(args) == 0 && supportsCards(p) {
-		e.replyWithCard(p, msg.ReplyCtx, e.renderHistoryCard(msg.SessionKey))
-		return
-	}
-	if len(args) == 0 {
-		args = []string{"10"}
-	}
-
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
+	if _, authoritative := agent.(ConversationProvider); authoritative && !e.isAdmin(msg.UserID) {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/history"))
+		return
+	}
 	s := sessions.GetOrCreateActive(msg.SessionKey)
 	n := 10
-	if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
-		n = v
+	if len(args) > 0 {
+		if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
+			n = v
+		}
 	}
 
-	entries := s.GetHistory(n)
-	agentSID := s.GetAgentSessionID()
-	if len(entries) == 0 && agentSID != "" {
-		if hp, ok := agent.(HistoryProvider); ok {
-			if agentEntries, err := hp.GetSessionHistory(e.ctx, agentSID, n); err == nil {
-				entries = agentEntries
-			}
-		}
+	entries, err := e.historyEntries(e.ctx, agent, s, n)
+	if err != nil {
+		slog.Error("history: backend read failed", "session", s.GetAgentSessionID(), "error", err)
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgHistoryReadFailed, err))
+		return
 	}
 
 	if len(entries) == 0 {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHistoryEmpty))
 		return
 	}
+	if supportsCards(p) {
+		e.replyWithCard(p, msg.ReplyCtx, e.buildHistoryCard(entries))
+		return
+	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📜 History (last %d):\n\n", len(entries)))
+	sb.WriteString("📜 ")
+	sb.WriteString(e.i18n.Tf(MsgCardTitleHistoryLast, len(entries)))
+	sb.WriteString(":\n\n")
 	maxLen := e.historyEntryMaxLen()
 	for _, h := range entries {
 		icon := "👤"
@@ -9119,7 +9301,7 @@ func (e *Engine) cmdHistory(p Platform, msg *Message, args []string) {
 			icon = "🤖"
 		}
 		content := truncateHistoryEntry(h.Content, maxLen)
-		sb.WriteString(fmt.Sprintf("%s [%s]\n%s\n\n", icon, h.Timestamp.Format("15:04:05"), content))
+		sb.WriteString(fmt.Sprintf("%s [%s]\n%s\n\n", icon, historyTimestamp(h.Timestamp), content))
 	}
 	e.reply(p, msg.ReplyCtx, sb.String())
 }
@@ -9272,7 +9454,8 @@ func helpCardGroups() []helpCardGroup {
 				{command: "/current", action: "nav:/current"},
 				{command: "/switch", action: "nav:/list"},
 				{command: "/search", action: "cmd:/search"},
-				{command: "/history", action: "nav:/history"},
+				{command: "/history", action: "cmd:/history"},
+				{command: "/track", action: "cmd:/track"},
 				{command: "/delete", action: "cmd:/delete"},
 				{command: "/name", action: "cmd:/name"},
 			},
@@ -11943,7 +12126,9 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	case "/current":
 		return e.renderCurrentCard(sessionKey)
 	case "/history":
-		return e.renderHistoryCard(sessionKey)
+		// History may contain administrator-only backend data. It must pass
+		// through normal command authorization instead of card navigation.
+		return nil
 	case "/provider":
 		return e.renderProviderCard()
 	case "/provider/add", "/provider/add-other", "/provider/add-cancel":
@@ -13216,24 +13401,7 @@ func (e *Engine) renderCurrentCard(sessionKey string) *Card {
 		Build()
 }
 
-func (e *Engine) renderHistoryCard(sessionKey string) *Card {
-	agent, sessions := e.sessionContextForKey(sessionKey)
-	s := sessions.GetOrCreateActive(sessionKey)
-	entries := s.GetHistory(10)
-
-	agentSID := s.GetAgentSessionID()
-	if len(entries) == 0 && agentSID != "" {
-		if hp, ok := agent.(HistoryProvider); ok {
-			if agentEntries, err := hp.GetSessionHistory(e.ctx, agentSID, 10); err == nil {
-				entries = agentEntries
-			}
-		}
-	}
-
-	if len(entries) == 0 {
-		return e.simpleCard(e.i18n.T(MsgCardTitleHistory), "turquoise", e.i18n.T(MsgHistoryEmpty))
-	}
-
+func (e *Engine) buildHistoryCard(entries []HistoryEntry) *Card {
 	var sb strings.Builder
 	maxLen := e.historyEntryMaxLen()
 	for _, h := range entries {
@@ -13242,7 +13410,7 @@ func (e *Engine) renderHistoryCard(sessionKey string) *Card {
 			icon = "🤖"
 		}
 		content := truncateHistoryEntry(h.Content, maxLen)
-		sb.WriteString(fmt.Sprintf("%s [%s]\n%s\n\n", icon, h.Timestamp.Format("15:04:05"), content))
+		sb.WriteString(fmt.Sprintf("%s [%s]\n%s\n\n", icon, historyTimestamp(h.Timestamp), content))
 	}
 
 	return NewCard().

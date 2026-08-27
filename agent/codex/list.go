@@ -133,7 +133,7 @@ func parseCodexSessionFile(path, filterCwd string) *core.AgentSessionInfo {
 	userMsgSeen := 0
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	scanner.Buffer(make([]byte, 256*1024), appServerMaxMessageSize)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -260,7 +260,7 @@ func getSessionHistory(sessionID, codexHome string, limit int) ([]core.HistoryEn
 	var entries []core.HistoryEntry
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	scanner.Buffer(make([]byte, 256*1024), appServerMaxMessageSize)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -315,6 +315,9 @@ func getSessionHistory(sessionID, codexHome string, limit int) ([]core.HistoryEn
 		case item.Type == "reasoning" && item.Text != "":
 			// skip reasoning items
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan Codex history %s: %w", sessionID, err)
 	}
 
 	if limit > 0 && len(entries) > limit {

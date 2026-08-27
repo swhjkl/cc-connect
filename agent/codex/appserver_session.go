@@ -163,18 +163,19 @@ type appServerRequestUserInputAnswer struct {
 }
 
 type appServerSession struct {
-	transport      string
-	url            string
-	socketPath     string
-	workDir        string
-	model          string
-	effort         string
-	mode           string
-	baseURL        string
-	modelProvider  string
-	extraEnv       []string
-	codexHome      string
-	promptPreamble string
+	transport        string
+	url              string
+	socketPath       string
+	workDir          string
+	model            string
+	effort           string
+	mode             string
+	baseURL          string
+	modelProvider    string
+	extraEnv         []string
+	codexHome        string
+	promptPreamble   string
+	observerProgress bool
 
 	events chan core.Event
 
@@ -417,6 +418,23 @@ func expandAppServerSocketPath(path string) (string, error) {
 }
 
 func (s *appServerSession) initialize() error {
+	optOut := []string{
+		"command/exec/outputDelta",
+		"item/agentMessage/delta",
+		"item/plan/delta",
+		"item/fileChange/outputDelta",
+		"item/reasoning/summaryTextDelta",
+		"item/reasoning/textDelta",
+	}
+	if s.observerProgress {
+		// Passive observers need only identity-bearing wakeups. The handler below
+		// discards delta bodies and core re-reads sanitized Codex state.
+		optOut = []string{
+			"command/exec/outputDelta",
+			"item/reasoning/summaryTextDelta",
+			"item/reasoning/textDelta",
+		}
+	}
 	params := map[string]any{
 		"clientInfo": map[string]any{
 			"name":    "cc-connect-codex-agent",
@@ -424,15 +442,8 @@ func (s *appServerSession) initialize() error {
 			"version": "0.1.0",
 		},
 		"capabilities": map[string]any{
-			"experimentalApi": true,
-			"optOutNotificationMethods": []string{
-				"command/exec/outputDelta",
-				"item/agentMessage/delta",
-				"item/plan/delta",
-				"item/fileChange/outputDelta",
-				"item/reasoning/summaryTextDelta",
-				"item/reasoning/textDelta",
-			},
+			"experimentalApi":           true,
+			"optOutNotificationMethods": optOut,
 		},
 	}
 
@@ -576,6 +587,35 @@ func (s *appServerSession) bindThread(threadID string) error {
 	s.bindingMu.Unlock()
 
 	s.replayBufferedNotifications()
+	return nil
+}
+
+// bindReadOnlyThread scopes daemon notifications to one validated thread
+// without resuming the thread or acquiring the cc-connect writer lease. It is
+// used only by passive conversation observers; server requests remain owned by
+// whichever client started the turn.
+func (s *appServerSession) bindReadOnlyThread(threadID string) error {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return fmt.Errorf("codex app-server observer thread id is empty")
+	}
+	if s.transport != appServerTransportDaemon {
+		return fmt.Errorf("codex app-server read-only binding requires daemon transport")
+	}
+
+	s.bindingMu.Lock()
+	defer s.bindingMu.Unlock()
+	if !s.alive.Load() {
+		return fmt.Errorf("codex app-server connection closed before observing thread %q", threadID)
+	}
+	if current := s.CurrentSessionID(); current != "" && current != threadID {
+		return fmt.Errorf("codex app-server observer already bound to thread %q", current)
+	}
+	if s.writerLeaseKey != "" {
+		return fmt.Errorf("codex app-server observer unexpectedly owns a writer lease")
+	}
+	s.threadID.Store(threadID)
+	s.clearNotificationBufferLocked()
 	return nil
 }
 
@@ -809,6 +849,9 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	params := map[string]any{
 		"threadId": threadID,
 		"input":    input,
+	}
+	if clientID := strings.TrimSpace(messageID); clientID != "" {
+		params["clientUserMessageId"] = clientID
 	}
 	if model := s.GetModel(); model != "" {
 		params["model"] = model
@@ -1339,6 +1382,13 @@ func (s *appServerSession) Alive() bool {
 	return s.alive.Load()
 }
 
+// RelayUnsolicitedEvents keeps turns started by another client on a shared
+// daemon connection silent. Foreground cc-connect turns still use the normal
+// event reader and are delivered unchanged.
+func (s *appServerSession) RelayUnsolicitedEvents() bool {
+	return s.transport != appServerTransportDaemon
+}
+
 func (s *appServerSession) Close() error {
 	s.alive.Store(false)
 	if s.cancel != nil {
@@ -1602,6 +1652,11 @@ func classifyAppServerNotification(method string) appServerNotificationScope {
 	case "turn/started",
 		"item/started",
 		"item/completed",
+		"item/agentMessage/delta",
+		"item/plan/delta",
+		"item/commandExecution/outputDelta",
+		"item/fileChange/outputDelta",
+		"turn/plan/updated",
 		"turn/completed",
 		"thread/status/changed",
 		"thread/tokenUsage/updated",
@@ -1678,25 +1733,45 @@ func (s *appServerSession) dispatchNotification(method string, paramsRaw json.Ra
 			s.stateMu.Unlock()
 			if accepted {
 				s.storeContextUsage(nil)
+				s.emit(core.Event{
+					Type:      core.EventTurnStarted,
+					ThreadID:  strings.TrimSpace(notif.ThreadID),
+					TurnID:    strings.TrimSpace(notif.Turn.ID),
+					SessionID: strings.TrimSpace(notif.ThreadID),
+				})
 			}
+		}
+
+	case "item/agentMessage/delta", "item/plan/delta", "item/commandExecution/outputDelta", "item/fileChange/outputDelta", "turn/plan/updated":
+		var notif struct {
+			ThreadID string `json:"threadId"`
+			TurnID   string `json:"turnId"`
+			ItemID   string `json:"itemId"`
+		}
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+			s.emit(core.Event{
+				Type: core.EventConversationChanged, ThreadID: strings.TrimSpace(notif.ThreadID),
+				TurnID: strings.TrimSpace(notif.TurnID), ItemID: strings.TrimSpace(notif.ItemID),
+				SessionID: strings.TrimSpace(notif.ThreadID),
+			})
 		}
 
 	case "item/started":
 		var notif itemNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			s.handleItemStarted(notif.Item)
+			s.handleItemStarted(notif)
 		}
 
 	case "item/completed":
 		var notif itemNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			s.handleItemCompleted(notif.Item)
+			s.handleItemCompleted(notif)
 		}
 
 	case "turn/completed":
 		var notif turnNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			s.completeTurn(notif.Turn.ID)
+			s.completeTurn(notif.ThreadID, notif.Turn.ID, notif.Turn.Status)
 		}
 
 	case "thread/status/changed":
@@ -1708,7 +1783,7 @@ func (s *appServerSession) dispatchNotification(method string, paramsRaw json.Ra
 		}
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil && notif.Status.Type == "idle" {
 			// In codex 0.125+, thread going idle signals turn completion.
-			s.completeTurn("")
+			s.completeTurn(notif.ThreadID, "", "completed")
 		}
 
 	case "account/rateLimits/updated":
@@ -1731,13 +1806,20 @@ func (s *appServerSession) dispatchNotification(method string, paramsRaw json.Ra
 				message = strings.TrimSpace(notif.Message)
 			}
 			if message != "" {
-				s.emitError(fmt.Errorf("%s", message))
+				s.emit(core.Event{
+					Type:      core.EventError,
+					ThreadID:  strings.TrimSpace(notif.ThreadID),
+					TurnID:    strings.TrimSpace(notif.TurnID),
+					SessionID: strings.TrimSpace(notif.ThreadID),
+					Error:     fmt.Errorf("%s", message),
+				})
 			}
 		}
 	}
 }
 
-func (s *appServerSession) handleItemStarted(item map[string]any) {
+func (s *appServerSession) handleItemStarted(notif itemNotification) {
+	item := notif.Item
 	itemType, _ := item["type"].(string)
 	if itemType == "" {
 		return
@@ -1753,28 +1835,29 @@ func (s *appServerSession) handleItemStarted(item map[string]any) {
 	switch itemType {
 	case "commandExecution":
 		command, _ := item["command"].(string)
-		s.emit(core.Event{Type: core.EventToolUse, ToolName: "Bash", ToolInput: command})
+		s.emit(appServerItemEvent(notif, core.Event{Type: core.EventToolUse, ToolName: "Bash", ToolInput: command}))
 
 	case "mcpToolCall":
 		server, _ := item["server"].(string)
 		tool, _ := item["tool"].(string)
 		name := strings.Trim(strings.Join([]string{server, tool}, ":"), ":")
-		s.emit(core.Event{Type: core.EventToolUse, ToolName: "MCP", ToolInput: name + "\n" + appServerJSON(item["arguments"])})
+		s.emit(appServerItemEvent(notif, core.Event{Type: core.EventToolUse, ToolName: "MCP", ToolInput: name + "\n" + appServerJSON(item["arguments"])}))
 
 	case "webSearch":
 		query, _ := item["query"].(string)
-		s.emit(core.Event{Type: core.EventToolUse, ToolName: "WebSearch", ToolInput: query})
+		s.emit(appServerItemEvent(notif, core.Event{Type: core.EventToolUse, ToolName: "WebSearch", ToolInput: query}))
 
 	case "dynamicToolCall":
 		tool, _ := item["tool"].(string)
-		s.emit(core.Event{Type: core.EventToolUse, ToolName: tool, ToolInput: appServerJSON(item["arguments"])})
+		s.emit(appServerItemEvent(notif, core.Event{Type: core.EventToolUse, ToolName: tool, ToolInput: appServerJSON(item["arguments"])}))
 
 	case "fileChange":
-		s.emit(core.Event{Type: core.EventToolUse, ToolName: "Patch", ToolInput: appServerJSON(item["changes"])})
+		s.emit(appServerItemEvent(notif, core.Event{Type: core.EventToolUse, ToolName: "Patch", ToolInput: appServerJSON(item["changes"])}))
 	}
 }
 
-func (s *appServerSession) handleItemCompleted(item map[string]any) {
+func (s *appServerSession) handleItemCompleted(notif itemNotification) {
+	item := notif.Item
 	itemType, _ := item["type"].(string)
 	if itemType == "" {
 		return
@@ -1784,7 +1867,7 @@ func (s *appServerSession) handleItemCompleted(item map[string]any) {
 	case "reasoning":
 		text := appServerReasoningText(item)
 		if text != "" {
-			s.emit(core.Event{Type: core.EventThinking, Content: text})
+			s.emit(appServerItemEvent(notif, core.Event{Type: core.EventThinking, Content: text}))
 		}
 
 	case "agentMessage":
@@ -1805,7 +1888,7 @@ func (s *appServerSession) handleItemCompleted(item map[string]any) {
 			exitCodePtr = &exitCode
 		}
 		success := appServerToolSuccess(status, exitCodePtr)
-		s.emit(core.Event{
+		s.emit(appServerItemEvent(notif, core.Event{
 			Type:         core.EventToolResult,
 			ToolName:     "Bash",
 			ToolInput:    command,
@@ -1813,7 +1896,7 @@ func (s *appServerSession) handleItemCompleted(item map[string]any) {
 			ToolStatus:   strings.TrimSpace(status),
 			ToolExitCode: exitCodePtr,
 			ToolSuccess:  &success,
-		})
+		}))
 
 	case "mcpToolCall":
 		tool, _ := item["tool"].(string)
@@ -1823,35 +1906,46 @@ func (s *appServerSession) handleItemCompleted(item map[string]any) {
 			result = errText
 		}
 		success := appServerToolSuccess(status, nil)
-		s.emit(core.Event{
+		s.emit(appServerItemEvent(notif, core.Event{
 			Type:        core.EventToolResult,
 			ToolName:    tool,
 			ToolResult:  truncate(strings.TrimSpace(result), 500),
 			ToolStatus:  strings.TrimSpace(status),
 			ToolSuccess: &success,
-		})
+		}))
 
 	case "webSearch":
 		query, _ := item["query"].(string)
-		s.emit(core.Event{
+		s.emit(appServerItemEvent(notif, core.Event{
 			Type:       core.EventToolResult,
 			ToolName:   "WebSearch",
 			ToolResult: truncate(strings.TrimSpace(query), 500),
-		})
+		}))
 
 	case "dynamicToolCall":
 		tool, _ := item["tool"].(string)
 		status, _ := item["status"].(string)
 		result := appServerDynamicToolText(item["contentItems"])
 		success := appServerToolSuccess(status, nil)
-		s.emit(core.Event{
+		s.emit(appServerItemEvent(notif, core.Event{
 			Type:        core.EventToolResult,
 			ToolName:    tool,
 			ToolResult:  truncate(strings.TrimSpace(result), 500),
 			ToolStatus:  strings.TrimSpace(status),
 			ToolSuccess: &success,
-		})
+		}))
 	}
+}
+
+func appServerItemEvent(notif itemNotification, event core.Event) core.Event {
+	event.ThreadID = strings.TrimSpace(notif.ThreadID)
+	event.TurnID = strings.TrimSpace(notif.TurnID)
+	event.SessionID = event.ThreadID
+	event.ItemID = stringMapValue(notif.Item, "id")
+	if event.ClientUserMessageID == "" {
+		event.ClientUserMessageID = stringMapValue(notif.Item, "clientId")
+	}
+	return event
 }
 
 func appServerReasoningText(item map[string]any) string {
@@ -2099,7 +2193,8 @@ func (s *appServerSession) recordOwnedTurn(turnID string) {
 	s.pendingMsgs = s.pendingMsgs[:0]
 }
 
-func (s *appServerSession) completeTurn(turnID string) {
+func (s *appServerSession) completeTurn(threadID, turnID, status string) {
+	threadID = strings.TrimSpace(threadID)
 	turnID = strings.TrimSpace(turnID)
 	s.stateMu.Lock()
 	if s.currentTurn == "" {
@@ -2121,32 +2216,59 @@ func (s *appServerSession) completeTurn(turnID string) {
 	}
 	s.completedTurn = completedTurn
 	s.stateMu.Unlock()
-	s.flushPendingAsText()
-	s.emit(core.Event{Type: core.EventResult, SessionID: s.CurrentSessionID(), Done: true})
+	if threadID == "" {
+		threadID = s.CurrentSessionID()
+	}
+	s.flushPendingAsText(threadID, completedTurn)
+	s.emit(core.Event{
+		Type:      core.EventResult,
+		ThreadID:  threadID,
+		TurnID:    completedTurn,
+		SessionID: threadID,
+		Done:      true,
+		Metadata:  map[string]any{"turn_status": strings.TrimSpace(status)},
+	})
 }
 
 func (s *appServerSession) flushPendingAsThinking() {
 	s.stateMu.Lock()
 	msgs := append([]string(nil), s.pendingMsgs...)
 	s.pendingMsgs = s.pendingMsgs[:0]
+	turnID := s.currentTurn
 	s.stateMu.Unlock()
+	threadID := s.CurrentSessionID()
 
 	for _, text := range msgs {
 		if strings.TrimSpace(text) != "" {
-			s.emit(core.Event{Type: core.EventThinking, Content: text})
+			s.emit(core.Event{
+				Type:      core.EventThinking,
+				ThreadID:  threadID,
+				TurnID:    turnID,
+				SessionID: threadID,
+				Content:   text,
+			})
 		}
 	}
 }
 
-func (s *appServerSession) flushPendingAsText() {
+func (s *appServerSession) flushPendingAsText(threadID, turnID string) {
 	s.stateMu.Lock()
 	msgs := append([]string(nil), s.pendingMsgs...)
 	s.pendingMsgs = s.pendingMsgs[:0]
 	s.stateMu.Unlock()
+	if threadID == "" {
+		threadID = s.CurrentSessionID()
+	}
 
 	for _, text := range msgs {
 		if strings.TrimSpace(text) != "" {
-			s.emit(core.Event{Type: core.EventText, Content: text})
+			s.emit(core.Event{
+				Type:      core.EventText,
+				ThreadID:  threadID,
+				TurnID:    turnID,
+				SessionID: threadID,
+				Content:   text,
+			})
 		}
 	}
 }

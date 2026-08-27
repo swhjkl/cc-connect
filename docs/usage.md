@@ -37,7 +37,10 @@ Each user gets an independent session with full conversation context. Manage ses
 | `/list` | List all agent sessions for this project |
 | `/switch <id>` | Switch to a different session |
 | `/current` | Show current session info |
-| `/history [n]` | Show last n messages (default 10; each entry follows `[display].history_max_len`, default 1000) |
+| `/history [n]` | Show completed turns (default 10). Codex reads its backend as the sole source of truth and requires `admin_from`; entries follow `[display].history_max_len` |
+| `/track` | Refresh the latest Codex turn card without changing the persistent mirror preference (`admin_from` required) |
+| `/track on` / `/track off` | Persistently enable or disable external-turn mirroring for this destination; it defaults to on |
+| `/track status` | Show the effective preference, binding/recovery state, and exact steer/interrupt/queue capabilities |
 | `/usage` | Show account/model quota usage (if supported) |
 | `/provider [...]` | Manage API providers |
 | `/model [switch <alias>]` | List available models or switch by alias |
@@ -49,6 +52,16 @@ Each user gets an independent session with full conversation context. Manage ses
 | `/help` | Show available commands |
 
 During a session, the agent may request tool permissions. Reply **allow** / **deny** / **allow all**.
+
+With a shared Codex app-server daemon, turns started from another TUI are mirrored to the bound chat by default. A running external card is purple; completion, failure, and interruption use semantic terminal colors. Updates patch the same card, and the default `on_finish` policy sends one short notification only after the turn ends. Replying directly to the running card exact-steers that turn; because Codex CLI 0.150.1 has no client queue request, an independent message is explicitly not sent while an external turn is active.
+
+```toml
+[projects.track]
+enabled = true
+default_enabled = true
+notify = "on_finish"       # never | on_finish | on_failure
+shared_write = "observer_only"
+```
 
 cc-connect rotates to a fresh session automatically after long inactivity:
 

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -477,7 +478,9 @@ func TestAppServerSession_InterleavedNotificationsStayWithBoundThread(t *testing
 
 	assertThreadEvents := func(t *testing.T, session *appServerSession, own, other string) {
 		t.Helper()
-		for i := 0; i < 400; i++ {
+		// Each iteration emits turn-started, tool-use, tool-result, agent text,
+		// and one terminal result for the session's bound thread.
+		for i := 0; i < 500; i++ {
 			select {
 			case event := <-session.events:
 				joined := strings.Join([]string{event.Content, event.ToolInput, event.ToolResult, event.SessionID}, "\n")
@@ -488,7 +491,7 @@ func TestAppServerSession_InterleavedNotificationsStayWithBoundThread(t *testing
 					t.Fatalf("result session id = %q, want %q", event.SessionID, own)
 				}
 			case <-time.After(time.Second):
-				t.Fatalf("received fewer than 400 events for %s", own)
+				t.Fatalf("received fewer than 500 events for %s", own)
 			}
 		}
 		assertNoAppServerEvent(t, session.events)
@@ -646,6 +649,9 @@ func TestAppServerSession_TurnStartResponseClaimsImmediateServerRequest(t *testi
 	done := make(chan error, 1)
 	go func() { done <- s.Send("hello", "message-A", nil, nil) }()
 	request := waitForAppServerClientRequest(t, stdin, "turn/start")
+	if got := stringMapValue(request.Params, "clientUserMessageId"); got != "message-A" {
+		t.Fatalf("turn/start clientUserMessageId = %q, want message-A", got)
+	}
 	s.handleResponse(rpcResponseEnvelope{
 		ID:     request.ID,
 		Result: mustMarshalAppServerTest(t, map[string]any{"turn": map[string]any{"id": "turn-A"}}),
@@ -836,6 +842,27 @@ func TestAppServerSession_DaemonWriterLeaseAllowsOnlyOneOwner(t *testing.T) {
 		t.Fatalf("live probe bindThread() after dead connection error: %v", err)
 	}
 	probe.releaseWriterLease()
+}
+
+func TestAppServerSession_ReadOnlyBindingDoesNotHoldWriterLease(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "daemon.sock")
+	reader := newIsolatedAppServerTestSession("", "", 1)
+	reader.transport = appServerTransportDaemon
+	reader.socketPath = socketPath
+	writer := newIsolatedAppServerTestSession("", "", 1)
+	writer.transport = appServerTransportDaemon
+	writer.socketPath = socketPath
+
+	if err := reader.bindReadOnlyThread("thread-A"); err != nil {
+		t.Fatalf("bindReadOnlyThread() error: %v", err)
+	}
+	if reader.ownsWriterLease() {
+		t.Fatal("read-only observer unexpectedly owns the writer lease")
+	}
+	if err := writer.bindThread("thread-A"); err != nil {
+		t.Fatalf("writer bindThread() blocked by observer: %v", err)
+	}
+	writer.releaseWriterLease()
 }
 
 func TestAppServerSession_FakeSharedDaemonRoutesNotificationsAndServerRequestsToOwner(t *testing.T) {
@@ -1083,8 +1110,16 @@ type fakeSharedAppServerClient struct {
 	daemon *fakeSharedAppServerDaemon
 	conn   *websocket.Conn
 
-	writeMu  sync.Mutex
-	threadID string
+	writeMu     sync.Mutex
+	threadID    string
+	resumeCalls int
+}
+
+type fakeSharedAppServerSteer struct {
+	ThreadID            string           `json:"threadId"`
+	ExpectedTurnID      string           `json:"expectedTurnId"`
+	Input               []map[string]any `json:"input"`
+	ClientUserMessageID string           `json:"clientUserMessageId"`
 }
 
 type fakeSharedAppServerDaemon struct {
@@ -1095,6 +1130,13 @@ type fakeSharedAppServerDaemon struct {
 	mu      sync.Mutex
 	clients []*fakeSharedAppServerClient
 
+	conversationCwd    string
+	conversationStatus string
+	conversationFlags  []string
+	conversationTurns  map[string][]map[string]any
+	interrupts         chan appServerThreadIdentity
+	steers             chan fakeSharedAppServerSteer
+
 	responses chan fakeSharedAppServerResponse
 	errors    chan error
 	done      chan struct{}
@@ -1102,17 +1144,31 @@ type fakeSharedAppServerDaemon struct {
 
 func newFakeSharedAppServerDaemon(t *testing.T) *fakeSharedAppServerDaemon {
 	t.Helper()
-	socketPath := filepath.Join(t.TempDir(), "shared-app-server.sock")
+	socketFile, err := os.CreateTemp("", "cc-shared-*.sock")
+	if err != nil {
+		t.Fatalf("reserve fake app-server socket path: %v", err)
+	}
+	socketPath := socketFile.Name()
+	if err := socketFile.Close(); err != nil {
+		t.Fatalf("close fake app-server socket file: %v", err)
+	}
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatalf("remove fake app-server socket file: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		t.Fatalf("listen on fake app-server socket: %v", err)
 	}
 	d := &fakeSharedAppServerDaemon{
-		socketPath: socketPath,
-		listener:   listener,
-		responses:  make(chan fakeSharedAppServerResponse, 32),
-		errors:     make(chan error, 16),
-		done:       make(chan struct{}),
+		socketPath:        socketPath,
+		listener:          listener,
+		responses:         make(chan fakeSharedAppServerResponse, 32),
+		errors:            make(chan error, 16),
+		done:              make(chan struct{}),
+		conversationTurns: make(map[string][]map[string]any),
+		interrupts:        make(chan appServerThreadIdentity, 8),
+		steers:            make(chan fakeSharedAppServerSteer, 8),
 	}
 	d.server = &http.Server{Handler: http.HandlerFunc(d.serveHTTP)}
 	go func() {
@@ -1197,6 +1253,7 @@ func (c *fakeSharedAppServerClient) readLoop() {
 			}
 			c.daemon.mu.Lock()
 			c.threadID = params.ThreadID
+			c.resumeCalls++
 			c.daemon.mu.Unlock()
 			c.writeResponse(rawID, map[string]any{
 				"thread": map[string]any{"id": params.ThreadID},
@@ -1221,10 +1278,92 @@ func (c *fakeSharedAppServerClient) readLoop() {
 			})
 		case "account/rateLimits/read":
 			c.writeResponse(rawID, map[string]any{"rateLimitsByLimitId": map[string]any{}})
+		case "thread/read":
+			var params struct {
+				ThreadID     string `json:"threadId"`
+				IncludeTurns bool   `json:"includeTurns"`
+			}
+			if err := json.Unmarshal(message["params"], &params); err != nil || params.ThreadID == "" {
+				c.daemon.reportError(fmt.Errorf("decode thread/read params: %v", err))
+				continue
+			}
+			c.daemon.mu.Lock()
+			cwd := c.daemon.conversationCwd
+			status := c.daemon.conversationStatus
+			flags := append([]string(nil), c.daemon.conversationFlags...)
+			turns := append([]map[string]any(nil), c.daemon.conversationTurns[params.ThreadID]...)
+			c.daemon.mu.Unlock()
+			if status == "" {
+				status = "idle"
+			}
+			statusValue := map[string]any{"type": status}
+			if status == "active" {
+				statusValue["activeFlags"] = flags
+			}
+			if !params.IncludeTurns {
+				turns = nil
+			}
+			c.writeResponse(rawID, map[string]any{"thread": map[string]any{
+				"id": params.ThreadID, "cwd": cwd, "status": statusValue, "turns": turns,
+			}})
+		case "thread/turns/list":
+			var params struct {
+				ThreadID string `json:"threadId"`
+				Limit    int    `json:"limit"`
+				Cursor   string `json:"cursor"`
+			}
+			if err := json.Unmarshal(message["params"], &params); err != nil || params.ThreadID == "" {
+				c.daemon.reportError(fmt.Errorf("decode thread/turns/list params: %v", err))
+				continue
+			}
+			c.daemon.mu.Lock()
+			turns := append([]map[string]any(nil), c.daemon.conversationTurns[params.ThreadID]...)
+			c.daemon.mu.Unlock()
+			start := 0
+			if params.Cursor != "" {
+				start, _ = strconv.Atoi(params.Cursor)
+			}
+			if start > len(turns) {
+				start = len(turns)
+			}
+			end := len(turns)
+			if params.Limit > 0 && start+params.Limit < end {
+				end = start + params.Limit
+			}
+			var nextCursor any
+			if end < len(turns) {
+				nextCursor = strconv.Itoa(end)
+			}
+			c.writeResponse(rawID, map[string]any{"data": turns[start:end], "nextCursor": nextCursor, "backwardsCursor": nil})
+		case "turn/steer":
+			var params fakeSharedAppServerSteer
+			if err := json.Unmarshal(message["params"], &params); err != nil || params.ThreadID == "" || params.ExpectedTurnID == "" {
+				c.daemon.reportError(fmt.Errorf("decode turn/steer params: %v", err))
+				continue
+			}
+			c.daemon.steers <- params
+			c.writeResponse(rawID, map[string]any{"turnId": params.ExpectedTurnID})
+		case "turn/interrupt":
+			var params appServerThreadIdentity
+			if err := json.Unmarshal(message["params"], &params); err != nil || params.ThreadID == "" || params.TurnID == "" {
+				c.daemon.reportError(fmt.Errorf("decode turn/interrupt params: %v", err))
+				continue
+			}
+			c.daemon.interrupts <- params
+			c.writeResponse(rawID, map[string]any{})
 		default:
 			c.daemon.reportError(fmt.Errorf("unexpected fake app-server client method %q", method))
 		}
 	}
+}
+
+func (d *fakeSharedAppServerDaemon) setConversation(cwd, threadID, status string, flags []string, turnsDescending []map[string]any) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.conversationCwd = cwd
+	d.conversationStatus = status
+	d.conversationFlags = append([]string(nil), flags...)
+	d.conversationTurns[threadID] = append([]map[string]any(nil), turnsDescending...)
 }
 
 func (c *fakeSharedAppServerClient) writeResponse(id json.RawMessage, result any) {
@@ -1368,7 +1507,7 @@ func (d *fakeSharedAppServerDaemon) assertHealthy(t *testing.T) {
 
 func assertFakeDaemonSessionEvents(t *testing.T, session *appServerSession, ownThread, otherThread string) {
 	t.Helper()
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		event := waitForAppServerEvent(t, session.Events())
 		joined := strings.Join([]string{event.Content, event.ToolInput, event.ToolResult, event.SessionID}, "\n")
 		if strings.Contains(joined, otherThread) {
@@ -1727,8 +1866,9 @@ func serverRequestProbe(t *testing.T, idJSON, method string, params any) map[str
 }
 
 type appServerTestClientRequest struct {
-	ID     int64  `json:"id"`
-	Method string `json:"method"`
+	ID     int64          `json:"id"`
+	Method string         `json:"method"`
+	Params map[string]any `json:"params"`
 }
 
 func waitForAppServerClientRequest(t *testing.T, w *lockedWriteCloser, wantMethod string) appServerTestClientRequest {

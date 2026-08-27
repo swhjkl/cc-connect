@@ -90,6 +90,41 @@ type RichCardSupporter interface {
 	BuildRichCard(status CardStatus, title string, steps []ToolStep, markdown string, streaming bool, statusFooter string) string
 }
 
+// RichCardActionSupporter extends rich cards with interactive buttons. The
+// engine uses this only for explicitly user-triggered controls such as
+// interrupting the exact turn shown by a tracking card.
+type RichCardActionSupporter interface {
+	BuildRichCardWithActions(status CardStatus, title string, steps []ToolStep, markdown string, streaming bool, statusFooter string, buttons []CardButton) string
+}
+
+// CardVariant is a platform-independent visual variant. Platforms decide how
+// a variant maps to native colors and badges.
+type CardVariant string
+
+const (
+	CardVariantDefault CardVariant = "default"
+	CardVariantMirror  CardVariant = "mirror"
+)
+
+// RichCardRenderOptions describes one complete rich-card frame. It keeps
+// source styling separate from CardStatus so terminal colors remain semantic.
+type RichCardRenderOptions struct {
+	Status       CardStatus
+	Title        string
+	Variant      CardVariant
+	Steps        []ToolStep
+	Markdown     string
+	Streaming    bool
+	StatusFooter string
+	Buttons      []CardButton
+}
+
+// RichCardOptionsSupporter lets a platform render source variants while
+// retaining the legacy RichCardSupporter interfaces as a fallback.
+type RichCardOptionsSupporter interface {
+	BuildRichCardWithOptions(options RichCardRenderOptions) string
+}
+
 // RichCardMarkdownResolver is an optional interface for platforms that need to
 // pre-process rich-card markdown before it is rendered or streamed.
 //
@@ -130,6 +165,27 @@ type PreviewStarter interface {
 	// that can be passed to UpdateMessage for edits. Returns nil handle if
 	// preview is not supported for this context.
 	SendPreviewStart(ctx context.Context, replyCtx any, content string) (previewHandle any, err error)
+}
+
+// IdempotentPreviewStarter is the crash-safe form of PreviewStarter. Reusing
+// idempotencyKey must not create a second message within the platform's native
+// deduplication window.
+type IdempotentPreviewStarter interface {
+	SendPreviewStartIdempotent(ctx context.Context, replyCtx any, content, idempotencyKey string) (previewHandle any, err error)
+}
+
+// PreviewHandleCodec persists only opaque platform message/card identity and
+// update sequence metadata. Conversation content remains backend-authoritative.
+type PreviewHandleCodec interface {
+	EncodePreviewHandle(previewHandle any) (string, error)
+	RestorePreviewHandle(encoded string) (previewHandle any, err error)
+}
+
+// PreviewHandleIdentifier exposes the stable platform message identity carried
+// by an opaque preview handle. This lets a reply target the exact persisted
+// delivery without core decoding platform-specific handle JSON.
+type PreviewHandleIdentifier interface {
+	PreviewMessageID(previewHandle any) (string, error)
 }
 
 // PreviewCleaner is an optional interface for platforms that need to clean up

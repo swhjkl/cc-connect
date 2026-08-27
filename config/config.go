@@ -458,6 +458,15 @@ type ObserveConfig struct {
 	Channel string `toml:"channel"`
 }
 
+// TrackConfig controls mirroring of turns started by another client in a
+// shared agent conversation.
+type TrackConfig struct {
+	Enabled        *bool  `toml:"enabled,omitempty"`
+	DefaultEnabled *bool  `toml:"default_enabled,omitempty"`
+	Notify         string `toml:"notify,omitempty"`       // never | on_finish | on_failure
+	SharedWrite    string `toml:"shared_write,omitempty"` // daemon_queue | observer_only
+}
+
 // ReferenceConfig controls local file reference normalization and rendering.
 type ReferenceConfig struct {
 	NormalizeAgents []string `toml:"normalize_agents,omitempty"`
@@ -543,6 +552,7 @@ type ProjectConfig struct {
 	//   tool_messages = false
 	Display    *DisplayConfig  `toml:"display,omitempty"`
 	Observe    *ObserveConfig  `toml:"observe,omitempty"`
+	Track      *TrackConfig    `toml:"track,omitempty"`
 	References ReferenceConfig `toml:"references,omitempty"`
 	// FilterExternalSessions: when true, /list only shows sessions created by
 	// cc-connect, hiding sessions created by direct CLI usage in the same work_dir.
@@ -992,6 +1002,33 @@ func EffectiveCardMode(cfg *Config, proj *ProjectConfig) string {
 	return "legacy"
 }
 
+// EffectiveTrack applies the built-in default-on mirror policy and then the
+// optional project overrides.
+func EffectiveTrack(proj *ProjectConfig) TrackConfig {
+	enabled := true
+	defaultEnabled := true
+	result := TrackConfig{
+		Enabled: &enabled, DefaultEnabled: &defaultEnabled,
+		Notify: "on_finish", SharedWrite: "observer_only",
+	}
+	if proj == nil || proj.Track == nil {
+		return result
+	}
+	if proj.Track.Enabled != nil {
+		result.Enabled = proj.Track.Enabled
+	}
+	if proj.Track.DefaultEnabled != nil {
+		result.DefaultEnabled = proj.Track.DefaultEnabled
+	}
+	if value := strings.ToLower(strings.TrimSpace(proj.Track.Notify)); value != "" {
+		result.Notify = value
+	}
+	if value := strings.ToLower(strings.TrimSpace(proj.Track.SharedWrite)); value != "" {
+		result.SharedWrite = value
+	}
+	return result
+}
+
 // validatePermissive is like validate but skips the "at least one platform"
 // requirement so that commands like `cc-connect web` can operate on agent-only
 // configs before platforms have been set up.
@@ -1068,6 +1105,26 @@ func (c *Config) validateInternal(permissive bool) error {
 		if err := validateDisplayConfig(prefix+".display", proj.Display); err != nil {
 			return err
 		}
+		if err := validateTrackConfig(prefix+".track", proj.Track); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateTrackConfig(prefix string, track *TrackConfig) error {
+	if track == nil {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(track.Notify)) {
+	case "", "never", "on_finish", "on_failure":
+	default:
+		return fmt.Errorf("config: %s.notify must be \"never\", \"on_finish\", or \"on_failure\"", prefix)
+	}
+	switch strings.ToLower(strings.TrimSpace(track.SharedWrite)) {
+	case "", "daemon_queue", "observer_only":
+	default:
+		return fmt.Errorf("config: %s.shared_write must be \"daemon_queue\" or \"observer_only\"", prefix)
 	}
 	return nil
 }

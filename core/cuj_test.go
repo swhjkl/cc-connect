@@ -1454,6 +1454,384 @@ func TestCUJ_B8_HistoryShowsConversation(t *testing.T) {
 	if !env.sentContains("unique-keyword-fluffy-zebra") {
 		t.Fatalf("/history did NOT surface the prior user message. Sent: %v", env.plat.getSent())
 	}
+
+	t.Run("authoritative Codex history ignores local mirror", func(t *testing.T) {
+		agent := &authoritativeConversationAgent{snapshots: []*ConversationSnapshot{
+			{
+				SessionID: "thread-codex",
+				Turns: []ConversationTurn{{
+					ID: "turn-1", Status: ConversationTurnCompleted,
+					Messages: []ConversationMessage{
+						{Role: "user", Content: "Codex prompt one"},
+						{Role: "assistant", Content: "Codex answer one", Phase: "final_answer"},
+					},
+				}},
+			},
+			{
+				SessionID: "thread-codex",
+				Turns: []ConversationTurn{{
+					ID: "turn-2", Status: ConversationTurnCompleted,
+					Messages: []ConversationMessage{
+						{Role: "user", Content: "Codex prompt two"},
+						{Role: "assistant", Content: "Codex answer two", Phase: "final_answer"},
+					},
+				}},
+			},
+		}}
+		p := &stubPlatformEngine{n: "feishu"}
+		e := NewEngine("test", agent, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+		e.SetAdminFrom("admin")
+		key := "feishu:group"
+		session := e.sessions.GetOrCreateActive(key)
+		session.SetAgentSessionID("thread-codex", "codex")
+		session.AddHistory("assistant", "stale local mirror")
+
+		// Action 1: a non-admin in the same group cannot export Codex history.
+		e.ReceiveMessage(p, &Message{SessionKey: key, Platform: "feishu", MessageID: "b8-1", UserID: "member", Content: "/history", ReplyCtx: "ctx"})
+		if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "requires admin") {
+			t.Fatalf("non-admin history reply = %q", got)
+		}
+
+		// Action 2: an admin sees only Codex's first authoritative snapshot.
+		p.clearSent()
+		e.ReceiveMessage(p, &Message{SessionKey: key, Platform: "feishu", MessageID: "b8-2", UserID: "admin", Content: "/history", ReplyCtx: "ctx"})
+		got := strings.Join(p.getSent(), "\n")
+		if !strings.Contains(got, "Codex answer one") || strings.Contains(got, "stale local mirror") {
+			t.Fatalf("first authoritative history reply = %q", got)
+		}
+
+		// Action 3: a later read follows Codex's changed snapshot, not cc-connect storage.
+		p.clearSent()
+		e.ReceiveMessage(p, &Message{SessionKey: key, Platform: "feishu", MessageID: "b8-3", UserID: "admin", Content: "/history", ReplyCtx: "ctx"})
+		got = strings.Join(p.getSent(), "\n")
+		if !strings.Contains(got, "Codex answer two") || strings.Contains(got, "stale local mirror") {
+			t.Fatalf("second authoritative history reply = %q", got)
+		}
+	})
+}
+
+// CUJ-I5 · /track remains an observer: users can keep chatting in Feishu and
+// start a new tracker after the normal turn completes.
+func TestCUJ_I5_TrackDoesNotBlockFeishuConversation(t *testing.T) {
+	firstSnapshot := &ConversationSnapshot{
+		SessionID: "thread-1",
+		Turns: []ConversationTurn{{
+			ID: "turn-old", Status: ConversationTurnCompleted,
+			Messages: []ConversationMessage{
+				{Role: "user", Content: "old prompt"},
+				{Role: "assistant", Content: "old answer", Phase: "final_answer"},
+			},
+		}},
+	}
+	agent := &trackChatAgent{snapshot: firstSnapshot, session: newResultAgentSession("normal Feishu answer")}
+	p := newTrackPreviewPlatform()
+	e := NewEngine("test", agent, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	defer e.Stop()
+	e.SetAdminFrom("admin")
+	key := "feishu:group:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", "codex")
+
+	// Action 1: observe the latest Codex turn.
+	e.ReceiveMessage(p, &Message{SessionKey: key, Platform: "feishu", MessageID: "i5-1", UserID: "admin", Content: "/track", ReplyCtx: "ctx"})
+	select {
+	case card := <-p.starts:
+		if !strings.Contains(card, "old answer") {
+			t.Fatalf("first track card = %q", card)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first /track did not create a card")
+	}
+
+	// Action 2: normal chat still runs through the writable AgentSession.
+	e.ReceiveMessage(p, &Message{SessionKey: key, Platform: "feishu", MessageID: "i5-2", UserID: "admin", Content: "continue from Feishu", ReplyCtx: "ctx"})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(strings.Join(p.getSent(), "\n"), "normal Feishu answer") {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "normal Feishu answer") {
+		t.Fatalf("normal Feishu response missing after /track: %q", got)
+	}
+
+	// Action 3: the user can explicitly track the newly completed turn.
+	agent.snapshot = &ConversationSnapshot{
+		SessionID: "result-session",
+		Turns: []ConversationTurn{{
+			ID: "turn-new", Status: ConversationTurnCompleted,
+			Messages: []ConversationMessage{
+				{Role: "user", Content: "continue from Feishu"},
+				{Role: "assistant", Content: "normal Feishu answer", Phase: "final_answer"},
+			},
+		}},
+	}
+	e.ReceiveMessage(p, &Message{SessionKey: key, Platform: "feishu", MessageID: "i5-3", UserID: "admin", Content: "/track", ReplyCtx: "ctx"})
+	select {
+	case card := <-p.starts:
+		if !strings.Contains(card, "normal Feishu answer") {
+			t.Fatalf("second track card = %q", card)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second /track did not create a card")
+	}
+
+	t.Run("interrupt action stays bound to the observed turn", func(t *testing.T) {
+		runningTurn := func(id string) *ConversationSnapshot {
+			return &ConversationSnapshot{
+				SessionID: "thread-interrupt",
+				Turns: []ConversationTurn{{
+					ID: id, Status: ConversationTurnInProgress,
+					Messages: []ConversationMessage{{Role: "user", Content: "long-running task"}},
+				}},
+			}
+		}
+		interruptAgent := &authoritativeConversationAgent{snapshots: []*ConversationSnapshot{
+			runningTurn("turn-observed"),
+			runningTurn("turn-observed"),
+		}}
+		interruptPlatform := &trackActionPlatform{trackPreviewPlatform: newTrackPreviewPlatform()}
+		interruptEngine := NewEngine("test", interruptAgent, []Platform{interruptPlatform}, t.TempDir()+"/sessions.json", LangEnglish)
+		defer interruptEngine.Stop()
+		interruptEngine.SetAdminFrom("admin")
+		interruptKey := "feishu:group:interrupt"
+		interruptEngine.sessions.GetOrCreateActive(interruptKey).SetAgentSessionID("thread-interrupt", "codex")
+
+		// Action 1: start tracking and obtain the exact command generated by the card.
+		interruptEngine.ReceiveMessage(interruptPlatform, &Message{
+			SessionKey: interruptKey, Platform: "feishu", MessageID: "i5-stop-1",
+			UserID: "admin", Content: "/track", ReplyCtx: "ctx",
+		})
+		select {
+		case <-interruptPlatform.starts:
+		case <-time.After(time.Second):
+			t.Fatal("running /track did not create a card")
+		}
+		interruptPlatform.mu.Lock()
+		buttons := append([]CardButton(nil), interruptPlatform.buttons...)
+		interruptPlatform.mu.Unlock()
+		if len(buttons) != 1 {
+			t.Fatalf("running track buttons = %#v", buttons)
+		}
+		stopCommand := strings.TrimPrefix(buttons[0].Value, "cmd:")
+
+		// Action 2: clicking the button interrupts only its bound turn.
+		interruptEngine.ReceiveMessage(interruptPlatform, &Message{
+			SessionKey: interruptKey, Platform: "feishu", MessageID: "i5-stop-2",
+			UserID: "admin", Content: stopCommand, ReplyCtx: "ctx",
+		})
+		interruptAgent.mu.Lock()
+		interrupts := append([][2]string(nil), interruptAgent.interrupts...)
+		interruptAgent.mu.Unlock()
+		if len(interrupts) != 1 || interrupts[0] != [2]string{"thread-interrupt", "turn-observed"} {
+			t.Fatalf("interrupt requests = %#v", interrupts)
+		}
+
+		// Action 3: after Codex advances, clicking the old card cannot stop the new turn.
+		interruptAgent.mu.Lock()
+		interruptAgent.snapshots = []*ConversationSnapshot{runningTurn("turn-new")}
+		interruptAgent.calls = 0
+		interruptAgent.mu.Unlock()
+		interruptEngine.ReceiveMessage(interruptPlatform, &Message{
+			SessionKey: interruptKey, Platform: "feishu", MessageID: "i5-stop-3",
+			UserID: "admin", Content: stopCommand, ReplyCtx: "ctx",
+		})
+		interruptAgent.mu.Lock()
+		interruptCount := len(interruptAgent.interrupts)
+		interruptAgent.mu.Unlock()
+		if interruptCount != 1 {
+			t.Fatalf("stale card interrupted a newer turn: %#v", interruptAgent.interrupts)
+		}
+	})
+}
+
+// CUJ-I6 · A turn started outside cc-connect is mirrored by default. While it
+// is active, independent Feishu input is never silently steered into it, but a
+// direct reply to the mirrored card can steer that exact turn.
+func TestCUJ_I6_DefaultMirrorCardReplyLifecycle(t *testing.T) {
+	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+	p := newMirrorTestPlatform()
+	e := NewEngine("test", agent, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	e.SetAdminFrom("admin")
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	e.sessions.Save()
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer e.Stop()
+
+	waitMirrorTest(t, "default-on mirror reconciliation", func() bool { return agent.readCount() > 0 })
+	p.trackMu.Lock()
+	initialCards := len(p.starts)
+	p.trackMu.Unlock()
+	if initialCards != 0 {
+		t.Fatalf("default-on baseline replayed completed history: %d cards", initialCards)
+	}
+
+	running := ConversationTurn{
+		ID: "turn-external", Status: ConversationTurnInProgress, StartedAt: time.Now(),
+		Messages: []ConversationMessage{{Role: "user", Content: "external long-running task"}},
+	}
+	agent.setSnapshot(mirrorTestSnapshot("thread-1", running))
+	agent.events <- Event{Type: EventTurnStarted, ThreadID: "thread-1", TurnID: running.ID}
+	waitMirrorTest(t, "default external turn card", func() bool {
+		p.trackMu.Lock()
+		defer p.trackMu.Unlock()
+		return len(p.starts) == 1 && strings.Contains(p.starts[0], "external long-running task")
+	})
+
+	// Action 1: status confirms that the default-on mirror is effective.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i6-1",
+		UserID: "admin", Content: "/track status", ReplyCtx: "ctx",
+	})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "Effective: `on`") {
+		t.Fatalf("track status = %q", got)
+	}
+
+	// Action 2: an independent message is held back instead of becoming an
+	// accidental turn/start steer while the external turn is active.
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i6-2",
+		UserID: "admin", Content: "start an unrelated task", ReplyCtx: "ctx",
+	})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "already running") || !strings.Contains(got, "not sent") {
+		t.Fatalf("independent message reply = %q", got)
+	}
+
+	// Action 3: replying to the mirrored card steers only the exact live turn.
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i6-3", ReferencedMessageID: "card-1",
+		UserID: "admin", Content: "also inspect the logs", ReplyCtx: "ctx",
+	})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "exact active turn") {
+		t.Fatalf("card reply = %q", got)
+	}
+	agent.mu.Lock()
+	steers := append([][4]string(nil), agent.steers...)
+	agent.mu.Unlock()
+	if len(steers) != 1 || steers[0] != [4]string{"thread-1", "turn-external", "also inspect the logs", "i6-3"} {
+		t.Fatalf("exact steer requests = %#v", steers)
+	}
+
+	// Action 4: Codex finishes; the original card reaches a semantic terminal
+	// state and exactly one finish notification becomes visible.
+	completed := running
+	completed.Status = ConversationTurnCompleted
+	completed.CompletedAt = time.Now()
+	completed.Messages = append(completed.Messages, ConversationMessage{
+		Role: "assistant", Content: "external task result", Phase: "final_answer",
+	})
+	agent.setSnapshot(mirrorTestSnapshot("thread-1", completed))
+	agent.events <- Event{Type: EventConversationChanged, ThreadID: "thread-1", TurnID: completed.ID}
+	waitMirrorTest(t, "terminal card and finish notification", func() bool {
+		p.trackMu.Lock()
+		updates := append([]string(nil), p.updates...)
+		p.trackMu.Unlock()
+		return len(updates) > 0 && strings.Contains(updates[len(updates)-1], "external task result") &&
+			strings.Contains(strings.Join(p.getSent(), "\n"), "task finished")
+	})
+	p.trackMu.Lock()
+	cardCount := len(p.starts)
+	notificationCount := len(p.notificationKey)
+	p.trackMu.Unlock()
+	if cardCount != 1 || notificationCount != 1 {
+		t.Fatalf("terminal delivery created duplicates: cards=%d notifications=%d", cardCount, notificationCount)
+	}
+}
+
+// CUJ-I7 · Session lifecycle commands move the mirror binding atomically. An
+// old shared thread must not continue posting after /switch or /new.
+func TestCUJ_I7_SessionCommandsRebindMirror(t *testing.T) {
+	baseAgent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+	agent := &mirrorSessionAgent{
+		mirrorTestAgent: baseAgent,
+		listed:          []AgentSessionInfo{{ID: "thread-2", Summary: "second shared thread"}},
+	}
+	p := newMirrorTestPlatform()
+	e := NewEngine("test", agent, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	e.SetAdminFrom("admin")
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	e.sessions.Save()
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer e.Stop()
+	waitMirrorTest(t, "initial thread binding", func() bool {
+		binding := e.trackStore.binding("mirror:chat")
+		return binding != nil && binding.ThreadID == "thread-1"
+	})
+
+	// Action 1: the user confirms the initial default-on binding.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i7-1",
+		UserID: "admin", Content: "/track status", ReplyCtx: "ctx",
+	})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "thread-1") {
+		t.Fatalf("initial track status = %q", got)
+	}
+
+	// Action 2: /switch persists a new generation and starts observing the new
+	// authoritative thread before any of its external turns are delivered.
+	baseAgent.setSnapshot(mirrorTestSnapshot("thread-2", ConversationTurn{}))
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i7-2",
+		UserID: "admin", Content: "/switch thread-2", ReplyCtx: "ctx",
+	})
+	waitMirrorTest(t, "switched mirror binding", func() bool {
+		binding := e.trackStore.binding("mirror:chat")
+		return binding != nil && binding.ThreadID == "thread-2" && binding.Generation >= 2
+	})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "thread-2") {
+		t.Fatalf("switch reply = %q", got)
+	}
+	running := ConversationTurn{
+		ID: "turn-thread-2", Status: ConversationTurnInProgress, StartedAt: time.Now(),
+		Messages: []ConversationMessage{{Role: "user", Content: "new thread task"}},
+	}
+	baseAgent.setSnapshot(mirrorTestSnapshot("thread-2", running))
+	baseAgent.events <- Event{Type: EventTurnStarted, ThreadID: "thread-2", TurnID: running.ID}
+	waitMirrorTest(t, "new thread external card", func() bool {
+		p.trackMu.Lock()
+		defer p.trackMu.Unlock()
+		return len(p.starts) == 1 && strings.Contains(p.starts[0], "new thread task")
+	})
+
+	// Action 3: /new detaches the mirror without interrupting Codex. Later
+	// updates from the old thread can no longer mutate or create a chat card.
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i7-3",
+		UserID: "admin", Content: "/new", ReplyCtx: "ctx",
+	})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(strings.ToLower(got), "new session") {
+		t.Fatalf("new-session reply = %q", got)
+	}
+	waitMirrorTest(t, "detached mirror", func() bool {
+		binding := e.trackStore.binding("mirror:chat")
+		e.trackMu.Lock()
+		mirrors := len(e.conversationMirrors)
+		e.trackMu.Unlock()
+		return binding != nil && binding.ThreadID == "" && binding.Generation >= 3 && mirrors == 0
+	})
+	p.trackMu.Lock()
+	startsBefore := len(p.starts)
+	updatesBefore := len(p.updates)
+	p.trackMu.Unlock()
+	completed := running
+	completed.Status = ConversationTurnCompleted
+	baseAgent.setSnapshot(mirrorTestSnapshot("thread-2", completed))
+	baseAgent.events <- Event{Type: EventConversationChanged, ThreadID: "thread-2", TurnID: completed.ID}
+	time.Sleep(100 * time.Millisecond)
+	p.trackMu.Lock()
+	startsAfter := len(p.starts)
+	updatesAfter := len(p.updates)
+	p.trackMu.Unlock()
+	if startsAfter != startsBefore || updatesAfter != updatesBefore {
+		t.Fatalf("detached thread still changed cards: starts %d->%d updates %d->%d", startsBefore, startsAfter, updatesBefore, updatesAfter)
+	}
 }
 
 // CUJ-B10 · reset_on_idle: after staleness threshold, next message starts

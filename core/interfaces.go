@@ -60,6 +60,26 @@ type ReplyContextReconstructor interface {
 	ReconstructReplyCtx(sessionKey string) (any, error)
 }
 
+// ConversationMirrorDestination normalizes a participant-scoped session key
+// to the stable proactive destination used for external-turn mirrors. The
+// returned key must remain reconstructable by ReplyContextReconstructor.
+type ConversationMirrorDestination interface {
+	MirrorDestinationKey(sessionKey string) (string, error)
+}
+
+// ConversationMirrorSupporter reports whether the platform's current runtime
+// configuration can render and recover continuous mirror cards. A platform
+// may implement all card interfaces while disabling them in configuration.
+type ConversationMirrorSupporter interface {
+	SupportsConversationMirror() bool
+}
+
+// IdempotentSender sends a platform message with a stable request key. The
+// platform may bound deduplication to its native retention window.
+type IdempotentSender interface {
+	SendIdempotent(ctx context.Context, replyCtx any, content, idempotencyKey string) error
+}
+
 // RelayGroupVisibilityTarget is an optional interface for platforms that
 // want to customise the session key used when echoing relay request /
 // response messages into the group chat for visibility.  Platforms that
@@ -401,6 +421,116 @@ type HistoryProvider interface {
 	GetSessionHistory(ctx context.Context, sessionID string, limit int) ([]HistoryEntry, error)
 }
 
+// ConversationTurnStatus is the backend-reported lifecycle state of one turn.
+type ConversationTurnStatus string
+
+const (
+	ConversationTurnInProgress  ConversationTurnStatus = "in_progress"
+	ConversationTurnCompleted   ConversationTurnStatus = "completed"
+	ConversationTurnFailed      ConversationTurnStatus = "failed"
+	ConversationTurnInterrupted ConversationTurnStatus = "interrupted"
+	ConversationTurnUnknown     ConversationTurnStatus = "unknown"
+)
+
+// ConversationMessage is one user- or assistant-authored item returned by
+// the agent backend. Phase is optional and distinguishes commentary from a
+// final answer when the backend exposes that distinction.
+type ConversationMessage struct {
+	ID       string
+	ClientID string
+	Role     string
+	Content  string
+	Phase    string
+}
+
+// ConversationActivity is a bounded activity summary suitable for the same
+// user-visible progress card used by foreground turns. Implementations must
+// omit secrets and private reasoning and truncate verbose input/output.
+type ConversationActivity struct {
+	ID       string
+	Kind     string
+	Name     string
+	Summary  string
+	Result   string
+	Status   string
+	ExitCode *int
+	Success  *bool
+}
+
+// ConversationTurn is one authoritative backend turn.
+type ConversationTurn struct {
+	ID          string
+	Status      ConversationTurnStatus
+	StartedAt   time.Time
+	CompletedAt time.Time
+	Messages    []ConversationMessage
+	Activities  []ConversationActivity
+}
+
+// ConversationSnapshot is an authoritative, read-only view of an agent
+// conversation. Turns are ordered oldest to newest.
+type ConversationSnapshot struct {
+	SessionID   string
+	ThreadState string
+	ActiveFlags []string
+	Turns       []ConversationTurn
+	RetrievedAt time.Time
+}
+
+// ConversationProvider exposes an agent backend as the sole source of truth
+// for history and live turn tracking.
+type ConversationProvider interface {
+	GetConversation(ctx context.Context, sessionID string, limit int) (*ConversationSnapshot, error)
+}
+
+// ConversationWindowProvider reads the ordered turn window from watermark to
+// the newest turn. covered is false when the backend cannot prove continuity
+// (for example, pagination was exhausted before watermark was found).
+type ConversationWindowProvider interface {
+	GetConversationWindow(ctx context.Context, sessionID, watermark string, maxTurns int) (snapshot *ConversationSnapshot, covered bool, err error)
+}
+
+// ConversationEventSource opens a passive stream of identified events for one
+// backend conversation. The source must not resume/start the conversation or
+// claim ownership of backend approval requests merely to observe it.
+type ConversationEventSource interface {
+	WatchConversation(ctx context.Context, sessionID string) (<-chan Event, error)
+}
+
+// ConversationClientMarkerSupport reports whether clientUserMessageID is
+// persisted by the backend and returned on authoritative user-message items.
+type ConversationClientMarkerSupport interface {
+	SupportsConversationClientMarker() bool
+}
+
+// ConversationTurnController exposes explicit, narrowly scoped control over
+// an authoritative backend turn. Implementations must verify both IDs and
+// must not reinterpret this as a request to stop whichever turn is newest.
+type ConversationTurnController interface {
+	InterruptConversationTurn(ctx context.Context, sessionID, turnID string) error
+}
+
+// ConversationTurnSteerer appends explicit user input only when expectedTurnID
+// is still the active turn. Implementations must never fall back to starting a
+// new turn when the precondition fails.
+type ConversationTurnSteerer interface {
+	SteerConversationTurn(ctx context.Context, sessionID, expectedTurnID, input, clientUserMessageID string, images []ImageAttachment, files []FileAttachment) error
+}
+
+// ConversationInputQueue is reserved for backends with an authoritative,
+// crash-safe next-turn queue. Implementations own the queued input; core must
+// not claim this capability for an in-memory prompt buffer.
+type ConversationInputQueue interface {
+	QueueConversationInput(ctx context.Context, sessionID, input, clientUserMessageID string, images []ImageAttachment, files []FileAttachment) (queueID string, err error)
+}
+
+// UnsolicitedEventRelayPolicy lets an agent session opt out of relaying turns
+// that were not initiated by the current platform request. Events are still
+// consumed so the session remains synchronized.
+type UnsolicitedEventRelayPolicy interface {
+	RelayUnsolicitedEvents() bool
+}
+
 // ProviderConfig holds API provider settings for an agent.
 type ProviderConfig struct {
 	Name     string
@@ -670,10 +800,12 @@ type StreamingCardPlatform interface {
 type CardStatus string
 
 const (
-	CardStatusThinking CardStatus = "thinking" // grey
-	CardStatusWorking  CardStatus = "working"  // blue
-	CardStatusDone     CardStatus = "done"     // green
-	CardStatusError    CardStatus = "error"    // red
+	CardStatusThinking    CardStatus = "thinking"    // grey
+	CardStatusWorking     CardStatus = "working"     // blue
+	CardStatusDone        CardStatus = "done"        // green
+	CardStatusError       CardStatus = "error"       // red
+	CardStatusPaused      CardStatus = "paused"      // grey
+	CardStatusInterrupted CardStatus = "interrupted" // orange/warning
 )
 
 // PreviewStatusUpdater is an optional interface for platforms that support

@@ -3474,3 +3474,32 @@ func TestRemoveGlobalProvider_CleansUpProviderRefs(t *testing.T) {
 		t.Errorf("proj2 provider_refs: want [], got %v", refs2)
 	}
 }
+
+func TestEffectiveTrack_DefaultOnAndObserverOnly(t *testing.T) {
+	got := EffectiveTrack(nil)
+	if got.Enabled == nil || !*got.Enabled || got.DefaultEnabled == nil || !*got.DefaultEnabled {
+		t.Fatalf("default track switches = %#v", got)
+	}
+	if got.Notify != "on_finish" || got.SharedWrite != "observer_only" {
+		t.Fatalf("default track policy = %#v", got)
+	}
+
+	disabled := false
+	defaultDisabled := false
+	got = EffectiveTrack(&ProjectConfig{Track: &TrackConfig{
+		Enabled: &disabled, DefaultEnabled: &defaultDisabled,
+		Notify: "on_failure", SharedWrite: "daemon_queue",
+	}})
+	if *got.Enabled || *got.DefaultEnabled || got.Notify != "on_failure" || got.SharedWrite != "daemon_queue" {
+		t.Fatalf("project track override = %#v", got)
+	}
+}
+
+func TestValidateTrackConfig_RejectsUnknownPolicy(t *testing.T) {
+	if err := validateTrackConfig("projects[0].track", &TrackConfig{Notify: "sometimes"}); err == nil {
+		t.Fatal("unknown track notify policy was accepted")
+	}
+	if err := validateTrackConfig("projects[0].track", &TrackConfig{SharedWrite: "memory_queue"}); err == nil {
+		t.Fatal("unsafe track shared_write policy was accepted")
+	}
+}

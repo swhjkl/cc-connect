@@ -716,6 +716,16 @@ level = "info" # debug, info, warn, error
 
 [[projects]]
 name = "my-backend"
+# Shared Codex daemon turns started from a TUI are mirrored to this project's
+# bound chat by default. /track on|off stores a per-destination override.
+# 共享 Codex daemon 中由 TUI 发起的任务默认镜像到本项目绑定的群聊；
+# /track on|off 会持久保存当前投递目标的覆盖设置。
+# [projects.track]
+# enabled = true            # operator master switch / 运维总开关
+# default_enabled = true    # used when no /track override exists / 无手动覆盖时默认开启
+# notify = "on_finish"      # never | on_finish | on_failure
+# shared_write = "observer_only" # codex-cli 0.150.1 has exact steer but no authoritative queue request
+#                                # 0.150.1 支持精确 steer，但没有权威队列请求
 # reply_footer = false             # Master toggle for the per-turn reply footer (default: true / show)
 #                                   # 每条助手回复底部状态 footer 总开关（默认 true 显示）
 # show_context_indicator = false   # Hide the footer's first line: model · [effort ·] out/in/cw/cr · ctx % (default: true)

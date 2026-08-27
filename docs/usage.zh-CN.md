@@ -38,7 +38,10 @@ cc-connect 完整功能使用指南。
 | `/list` | 列出当前项目的会话 |
 | `/switch <id>` | 切换到指定会话 |
 | `/current` | 查看当前会话 |
-| `/history [n]` | 查看最近 n 条消息；单条长度受 `[display].history_max_len` 控制，默认 1000 |
+| `/history [n]` | 查看最近 n 个已结束 turn；Codex 以自身后端为唯一真值且要求 `admin_from`，单条长度受 `[display].history_max_len` 控制 |
+| `/track` | 刷新最新 Codex turn 卡片，但不改变持久镜像开关（要求 `admin_from`） |
+| `/track on` / `/track off` | 持久开启或关闭当前投递目标的外部 turn 镜像；默认开启 |
+| `/track status` | 查看有效开关、绑定/恢复状态以及精确 steer、中止和 queue 能力 |
 | `/usage` | 查看账号/模型限额使用情况 |
 | `/provider [...]` | 管理 API Provider |
 | `/model [switch <alias>]` | 列出可用模型或按别名切换 |
@@ -51,6 +54,16 @@ cc-connect 完整功能使用指南。
 | `/help` | 显示可用命令 |
 
 会话中 Agent 请求工具权限时，回复 **允许** / **拒绝** / **允许所有**。
+
+使用共享 Codex app-server daemon 时，其他 TUI 发起的 turn 默认会镜像到已绑定群聊。外部任务运行中使用紫色卡片，完成、失败和中止仍使用对应终态色；执行期间只原地更新同一张卡，默认 `on_finish` 只在结束后发送一次短通知。直接回复运行卡片会精确 steer 该 turn；由于 Codex CLI 0.150.1 没有客户端 queue 请求，external turn 活跃时的独立普通消息会明确提示未发送。
+
+```toml
+[projects.track]
+enabled = true
+default_enabled = true
+notify = "on_finish"       # never | on_finish | on_failure
+shared_write = "observer_only"
+```
 
 也可以为项目开启“空闲后自动切换新会话”：
 

@@ -1,11 +1,27 @@
 # `/process` 按需查看 Codex 长任务进展设计
 
 **日期：** 2026-08-26
-**状态：** Draft
+**状态：** Superseded
 **目标后端：** Codex app-server daemon
 **目标命令：** `/process`
 **目标基线：** `origin/ws/feat/codex-app-server-daemon`
 **已验证 Codex CLI：** `0.149.1`
+
+> [!WARNING]
+> 当前 shared daemon adapter 已确认存在跨 thread notification 串流问题；本设计的 live
+> tracker 必须在该问题修复后才能启用。详见
+> [Codex shared daemon 跨 session 串消息问题记录](./2026-08-26-codex-shared-daemon-cross-session-leak.md)。
+
+> [!NOTE]
+> 本文保留为早期 `/process` 方案记录。最终命令、自动更新卡片、精确中止和
+> `/history` 权威数据源以
+> [`/track` 与 Codex 权威历史实现设计](./2026-08-27-codex-track-history-design.md)
+> 为准；不会注册 `/process` 兼容别名。持续 mirror 和正常对话方案见
+> [`Codex 外部 turn 统一飞书镜像设计与评审`](./2026-08-27-codex-continuous-track-mirror-design.md)。
+> 后者已用本地 Codex `0.150.1` schema 重新验证：`turn/steer(expectedTurnId)` 已进入
+> stable schema；schema 只有 queue 相关通知，没有可由客户端调用的
+> `thread/queue/add` / `thread/queue/start` 请求。因此本文基于 `0.149.1` 得出的“没有精确
+> steer”已过时，但“没有权威 queue 请求”仍成立。
 
 ## 背景
 

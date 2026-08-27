@@ -53,6 +53,8 @@ type Agent struct {
 	configEnv          []string // env vars from [projects.agent.options.env] — persists across SetSessionEnv calls
 	sessionEnv         []string
 	mu                 sync.RWMutex
+	conversationMu     sync.Mutex
+	conversationClient *appServerSession
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -571,7 +573,16 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	return os.Remove(path)
 }
 
-func (a *Agent) Stop() error { return nil }
+func (a *Agent) Stop() error {
+	a.conversationMu.Lock()
+	client := a.conversationClient
+	a.conversationClient = nil
+	a.conversationMu.Unlock()
+	if client != nil {
+		return client.Close()
+	}
+	return nil
+}
 
 // SetMode changes the approval mode for future sessions.
 func (a *Agent) SetMode(mode string) {

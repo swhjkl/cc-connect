@@ -20,6 +20,13 @@ Codex app-server daemon
 服务器必须从该分支编译，不能用 npm/Homebrew 中尚未包含此功能的 cc-connect
 正式版替代。
 
+> [!WARNING]
+> 当前分支已确认存在 shared daemon 跨 Codex thread 串消息问题。在 thread 过滤、
+> server-request owner routing 和单 writer 约束完成修复及回归验证前，不应在生产环境
+> 使用 daemon transport 承载多个 session；请改用 `app_server_transport = "process"`。
+> 根因、规避方式和验收标准见
+> [Codex shared daemon 跨 session 串消息问题记录](./plans/2026-08-26-codex-shared-daemon-cross-session-leak.md)。
+
 该方案连接的是 Codex 的实验性 app-server 本地控制 Socket。首周测试期间应固定
 已验证的 Codex CLI 版本；升级 Codex 后先做本页第 7 节的前台冒烟测试，再重启
 后台服务。
@@ -459,4 +466,6 @@ backend = "exec"
 - [飞书开放平台](https://open.feishu.cn/)
 - [飞书事件订阅文档](https://open.feishu.cn/document/ukTMukTMukTM/uUTNz4SN1MjL1UzM)
 - [cc-connect 飞书接入指南](./feishu.md)
-- [`/process` 按需查看 Codex 长任务进展设计](./plans/2026-08-26-codex-process-command-design.md)
+- [`/track` 与 Codex 权威历史实现设计](./plans/2026-08-27-codex-track-history-design.md)
+- [Codex 外部 turn 统一飞书镜像设计与评审](./plans/2026-08-27-codex-continuous-track-mirror-design.md)
+- [早期 `/process` 方案记录（已废弃）](./plans/2026-08-26-codex-process-command-design.md)

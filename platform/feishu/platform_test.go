@@ -1140,6 +1140,172 @@ func TestBuildRichCard_UsesCodexRuntimeToolDescriptors(t *testing.T) {
 	}
 }
 
+func TestBuildRichCardWithActions_IncludesTrackInterruptButton(t *testing.T) {
+	p := &Platform{}
+	card := p.BuildRichCardWithActions(
+		core.CardStatusWorking,
+		"Latest Codex Turn",
+		nil,
+		"**Prompt**\nfix it",
+		true,
+		"Running",
+		[]core.CardButton{{
+			Text: "Stop this turn", Type: "danger", Value: "cmd:/track stop thread-1 turn-1",
+			Extra: map[string]string{"session_key": "feishu:chat:root:message"},
+		}},
+	)
+	for _, want := range []string{
+		`"type":"danger"`,
+		`"content":"Stop this turn"`,
+		`"action":"cmd:/track stop thread-1 turn-1"`,
+		`"session_key":"feishu:chat:root:message"`,
+	} {
+		if !strings.Contains(card, want) {
+			t.Fatalf("rich action card does not contain %q: %s", want, card)
+		}
+	}
+}
+
+func TestBuildRichCardWithActions_CardV2UsesDirectButtonElement(t *testing.T) {
+	p := &Platform{}
+	cardJSON := p.BuildRichCardWithActions(
+		core.CardStatusWorking,
+		"Latest Codex Turn",
+		nil,
+		"**Prompt**\nfix it",
+		true,
+		"Running",
+		[]core.CardButton{{
+			Text: "Stop this turn", Type: "danger", Value: "cmd:/track stop thread-1 turn-1",
+		}},
+	)
+
+	var card struct {
+		Schema string `json:"schema"`
+		Body   struct {
+			Elements []map[string]any `json:"elements"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
+		t.Fatalf("decode rich action card: %v", err)
+	}
+	if card.Schema != "2.0" {
+		t.Fatalf("schema = %q, want 2.0", card.Schema)
+	}
+	if len(card.Body.Elements) == 0 {
+		t.Fatal("rich action card has no body elements")
+	}
+	button := card.Body.Elements[len(card.Body.Elements)-1]
+	if tag := button["tag"]; tag != "button" {
+		t.Fatalf("last body element tag = %#v, want direct button; Card 2.0 rejects action containers", tag)
+	}
+	value, ok := button["value"].(map[string]any)
+	if !ok || value["action"] != "cmd:/track stop thread-1 turn-1" {
+		t.Fatalf("button value = %#v", button["value"])
+	}
+}
+
+func TestBuildRichCardWithActions_KeepsInterruptButtonWithinPayloadLimit(t *testing.T) {
+	p := &Platform{}
+	card := p.BuildRichCardWithActions(
+		core.CardStatusWorking,
+		"Latest Codex Turn",
+		nil,
+		"**Prompt**\n"+strings.Repeat("\\\"\n", 20_000),
+		true,
+		"Running",
+		[]core.CardButton{{
+			Text: "Stop this turn", Type: "danger", Value: "cmd:/track stop thread-1 turn-1",
+			Extra: map[string]string{"session_key": "feishu:chat:root:message"},
+		}},
+	)
+	if !json.Valid([]byte(card)) {
+		t.Fatalf("compacted action card is invalid JSON: %s", card)
+	}
+	if len(card) > maxRichCardJSONBytes {
+		t.Fatalf("action card size = %d, limit = %d", len(card), maxRichCardJSONBytes)
+	}
+	if !strings.Contains(card, `"action":"cmd:/track stop thread-1 turn-1"`) {
+		t.Fatalf("compacted card lost interrupt action: %s", card)
+	}
+}
+
+func TestBuildRichCardWithOptions_MirrorUsesPurpleOnlyWhileRunning(t *testing.T) {
+	p := &Platform{}
+	decodeHeader := func(cardJSON string) (template, title string) {
+		t.Helper()
+		var card struct {
+			Header struct {
+				Template string `json:"template"`
+				Title    struct {
+					Content string `json:"content"`
+				} `json:"title"`
+			} `json:"header"`
+		}
+		if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
+			t.Fatalf("decode card: %v", err)
+		}
+		return card.Header.Template, card.Header.Title.Content
+	}
+	running := p.BuildRichCardWithOptions(core.RichCardRenderOptions{
+		Status: core.CardStatusWorking, Variant: core.CardVariantMirror,
+		Title: "Codex · Shared external session", Markdown: "working", Streaming: true,
+	})
+	if template, title := decodeHeader(running); template != "purple" || title != "Codex · Shared external session" {
+		t.Fatalf("running mirror header = %q %q", template, title)
+	}
+	completed := p.BuildRichCardWithOptions(core.RichCardRenderOptions{
+		Status: core.CardStatusDone, Variant: core.CardVariantMirror,
+		Title: "Codex · Shared external session", Markdown: "done",
+	})
+	if template, _ := decodeHeader(completed); template != "green" {
+		t.Fatalf("completed mirror template = %q, want semantic green", template)
+	}
+}
+
+func TestPreviewHandleCodec_PersistsIdentityWithoutConversationContent(t *testing.T) {
+	p := &Platform{platformName: "feishu"}
+	handle := &feishuPreviewHandle{
+		messageID: "om_card", chatID: "oc_chat", cardID: "card_entity", sequence: 7,
+		status: core.CardStatusWorking, lastContent: "prompt and response must not persist",
+	}
+	encoded, err := p.EncodePreviewHandle(handle)
+	if err != nil {
+		t.Fatalf("EncodePreviewHandle() error = %v", err)
+	}
+	if strings.Contains(encoded, "prompt and response") {
+		t.Fatalf("persisted handle leaked conversation content: %s", encoded)
+	}
+	restored, err := p.RestorePreviewHandle(encoded)
+	if err != nil {
+		t.Fatalf("RestorePreviewHandle() error = %v", err)
+	}
+	messageID, err := p.PreviewMessageID(restored)
+	if err != nil || messageID != "om_card" {
+		t.Fatalf("PreviewMessageID() = %q, %v", messageID, err)
+	}
+	got := restored.(*feishuPreviewHandle)
+	if got.cardID != "card_entity" || got.sequence != 7 || got.status != core.CardStatusWorking || got.lastContent != "" {
+		t.Fatalf("restored handle = %#v", got)
+	}
+}
+
+func TestMirrorDestinationKey_DropsParticipantButRetainsTopic(t *testing.T) {
+	p := &Platform{platformName: "feishu"}
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{input: "feishu:oc_chat:ou_user", want: "feishu:oc_chat"},
+		{input: "feishu:oc_chat:root:om_root", want: "feishu:oc_chat:root:om_root"},
+	} {
+		got, err := p.MirrorDestinationKey(test.input)
+		if err != nil || got != test.want {
+			t.Fatalf("MirrorDestinationKey(%q) = %q, %v; want %q", test.input, got, err, test.want)
+		}
+	}
+}
+
 func TestBuildRichCard_RendersThinkingAndToolResultRows(t *testing.T) {
 	code := 0
 	success := true

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -261,6 +262,7 @@ func TestAppServerSession_HandleRateLimitsUpdatedCachesUsage(t *testing.T) {
 
 func TestAppServerSession_HandleThreadTokenUsageUpdatedCachesContextUsage(t *testing.T) {
 	s := &appServerSession{}
+	s.threadID.Store("thread-1")
 	raw, err := json.Marshal(appServerThreadTokenUsageNotification{
 		ThreadID: "thread-1",
 		TurnID:   "turn-1",
@@ -314,6 +316,1107 @@ func TestAppServerSession_HandleThreadTokenUsageUpdatedCachesContextUsage(t *tes
 	if usage.InputTokens != 40849 {
 		t.Fatalf("input tokens = %d, want 40849", usage.InputTokens)
 	}
+}
+
+func TestAppServerSession_FiltersEveryThreadScopedNotification(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		params any
+	}{
+		{
+			name:   "turn started",
+			method: "turn/started",
+			params: map[string]any{"threadId": "thread-B", "turn": map[string]any{"id": "turn-B", "status": "inProgress"}},
+		},
+		{
+			name:   "item started",
+			method: "item/started",
+			params: map[string]any{"threadId": "thread-B", "turnId": "turn-B", "item": map[string]any{"type": "commandExecution", "command": "echo leaked"}},
+		},
+		{
+			name:   "item completed",
+			method: "item/completed",
+			params: map[string]any{"threadId": "thread-B", "turnId": "turn-B", "item": map[string]any{"type": "agentMessage", "text": "leaked text"}},
+		},
+		{
+			name:   "turn completed",
+			method: "turn/completed",
+			params: map[string]any{"threadId": "thread-B", "turn": map[string]any{"id": "turn-B", "status": "completed"}},
+		},
+		{
+			name:   "thread idle",
+			method: "thread/status/changed",
+			params: map[string]any{"threadId": "thread-B", "status": map[string]any{"type": "idle"}},
+		},
+		{
+			name:   "token usage",
+			method: "thread/tokenUsage/updated",
+			params: map[string]any{
+				"threadId": "thread-B",
+				"turnId":   "turn-B",
+				"tokenUsage": map[string]any{
+					"last":               map[string]any{"totalTokens": 999},
+					"modelContextWindow": 1000,
+				},
+			},
+		},
+		{
+			name:   "turn error",
+			method: "error",
+			params: map[string]any{"threadId": "thread-B", "turnId": "turn-B", "error": map[string]any{"message": "leaked error"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newIsolatedAppServerTestSession("thread-A", "turn-A", 16)
+			s.pendingMsgs = []string{"keep me"}
+			s.storeContextUsage(&core.ContextUsage{UsedTokens: 7, TotalTokens: 7, ContextWindow: 100})
+
+			s.handleNotification(tt.method, mustMarshalAppServerTest(t, tt.params))
+
+			assertAppServerStateUnchanged(t, s, "turn-A", []string{"keep me"}, 7)
+			assertNoAppServerEvent(t, s.events)
+		})
+	}
+}
+
+func TestAppServerSession_ThreadScopedNotificationsFailClosedWithoutValidThreadID(t *testing.T) {
+	methods := []string{
+		"turn/started",
+		"item/started",
+		"item/completed",
+		"turn/completed",
+		"thread/status/changed",
+		"thread/tokenUsage/updated",
+		"error",
+	}
+	payloads := []json.RawMessage{
+		mustMarshalAppServerTest(t, map[string]any{}),
+		mustMarshalAppServerTest(t, map[string]any{"threadId": ""}),
+		json.RawMessage(`{"threadId":42}`),
+		json.RawMessage(`{"threadId":`),
+	}
+
+	for _, method := range methods {
+		for i, payload := range payloads {
+			t.Run(fmt.Sprintf("%s/payload-%d", method, i), func(t *testing.T) {
+				s := newIsolatedAppServerTestSession("thread-A", "turn-A", 4)
+				s.pendingMsgs = []string{"keep me"}
+				s.storeContextUsage(&core.ContextUsage{UsedTokens: 7, TotalTokens: 7, ContextWindow: 100})
+
+				s.handleNotification(method, payload)
+
+				assertAppServerStateUnchanged(t, s, "turn-A", []string{"keep me"}, 7)
+				assertNoAppServerEvent(t, s.events)
+			})
+		}
+	}
+}
+
+func TestAppServerSession_InterleavedNotificationsStayWithBoundThread(t *testing.T) {
+	sessionA := newIsolatedAppServerTestSession("thread-A", "", 512)
+	sessionB := newIsolatedAppServerTestSession("thread-B", "", 512)
+	sessions := []*appServerSession{sessionA, sessionB}
+
+	broadcast := func(method string, params any) {
+		raw := mustMarshalAppServerTest(t, params)
+		for _, session := range sessions {
+			session.handleNotification(method, raw)
+		}
+	}
+
+	for i := 0; i < 100; i++ {
+		for threadIndex, threadID := range []string{"thread-A", "thread-B"} {
+			turnID := fmt.Sprintf("%s-turn-%d", threadID, i)
+			usedTokens := i*10 + threadIndex + 1
+			broadcast("turn/started", map[string]any{
+				"threadId": threadID,
+				"turn":     map[string]any{"id": turnID, "status": "inProgress"},
+			})
+			broadcast("item/started", map[string]any{
+				"threadId": threadID,
+				"turnId":   turnID,
+				"item":     map[string]any{"type": "commandExecution", "command": "tool-" + threadID},
+			})
+			broadcast("item/completed", map[string]any{
+				"threadId": threadID,
+				"turnId":   turnID,
+				"item": map[string]any{
+					"type": "commandExecution", "command": "tool-" + threadID,
+					"status": "completed", "aggregatedOutput": "output-" + threadID, "exitCode": 0,
+				},
+			})
+			broadcast("item/completed", map[string]any{
+				"threadId": threadID,
+				"turnId":   turnID,
+				"item":     map[string]any{"type": "agentMessage", "text": "reply-" + threadID},
+			})
+			broadcast("thread/tokenUsage/updated", map[string]any{
+				"threadId": threadID,
+				"turnId":   turnID,
+				"tokenUsage": map[string]any{
+					"last":               map[string]any{"totalTokens": usedTokens},
+					"modelContextWindow": 1000,
+				},
+			})
+			if i%2 == 0 {
+				broadcast("turn/completed", map[string]any{
+					"threadId": threadID,
+					"turn":     map[string]any{"id": turnID, "status": "completed"},
+				})
+			} else {
+				broadcast("thread/status/changed", map[string]any{
+					"threadId": threadID,
+					"status":   map[string]any{"type": "idle"},
+				})
+			}
+		}
+	}
+
+	assertThreadEvents := func(t *testing.T, session *appServerSession, own, other string) {
+		t.Helper()
+		for i := 0; i < 400; i++ {
+			select {
+			case event := <-session.events:
+				joined := strings.Join([]string{event.Content, event.ToolInput, event.ToolResult, event.SessionID}, "\n")
+				if strings.Contains(joined, other) {
+					t.Fatalf("event %d leaked %s into %s: %#v", i, other, own, event)
+				}
+				if event.Type == core.EventResult && event.SessionID != own {
+					t.Fatalf("result session id = %q, want %q", event.SessionID, own)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("received fewer than 400 events for %s", own)
+			}
+		}
+		assertNoAppServerEvent(t, session.events)
+	}
+
+	assertThreadEvents(t, sessionA, "thread-A", "thread-B")
+	assertThreadEvents(t, sessionB, "thread-B", "thread-A")
+	if usage := sessionA.cachedContextUsage(); usage == nil || usage.UsedTokens != 991 {
+		t.Fatalf("thread-A context usage = %#v, want 991 tokens", usage)
+	}
+	if usage := sessionB.cachedContextUsage(); usage == nil || usage.UsedTokens != 992 {
+		t.Fatalf("thread-B context usage = %#v, want 992 tokens", usage)
+	}
+}
+
+func TestAppServerSession_NewThreadBuffersNotificationsUntilBound(t *testing.T) {
+	s := newIsolatedAppServerTestSession("", "", 8)
+	s.beginNotificationBuffer()
+	s.handleNotification("turn/started", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-B", "turn": map[string]any{"id": "turn-B", "status": "inProgress"},
+	}))
+	s.handleNotification("turn/started", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-A", "turn": map[string]any{"id": "turn-A", "status": "inProgress"},
+	}))
+	s.handleNotification("item/completed", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-A", "turnId": "turn-A", "item": map[string]any{"type": "agentMessage", "text": "reply-A"},
+	}))
+
+	assertAppServerStateUnchanged(t, s, "", nil, 0)
+	if got := len(s.bufferedNotifications); got != 3 {
+		t.Fatalf("buffered notifications = %d, want 3 before binding", got)
+	}
+	if err := s.bindThread("thread-A"); err != nil {
+		t.Fatalf("bindThread() error: %v", err)
+	}
+
+	s.stateMu.Lock()
+	turnID := s.currentTurn
+	pending := append([]string(nil), s.pendingMsgs...)
+	s.stateMu.Unlock()
+	if turnID != "turn-A" || len(pending) != 1 || pending[0] != "reply-A" {
+		t.Fatalf("replayed state = turn %q pending %#v, want only thread-A", turnID, pending)
+	}
+	if got := len(s.bufferedNotifications); got != 0 {
+		t.Fatalf("buffered notifications = %d, want drained", got)
+	}
+}
+
+func TestAppServerSession_ThreadStartResponseMayFollowNotifications(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdin := &lockedWriteCloser{}
+	s := &appServerSession{
+		transport:        appServerTransportProcess,
+		events:           make(chan core.Event, 4),
+		ctx:              ctx,
+		cancel:           cancel,
+		stdin:            stdin,
+		pending:          make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- s.ensureThread("") }()
+	request := waitForAppServerClientRequest(t, stdin, "thread/start")
+
+	s.handleNotification("turn/started", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-B", "turn": map[string]any{"id": "turn-B"},
+	}))
+	s.handleNotification("turn/started", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-A", "turn": map[string]any{"id": "turn-A"},
+	}))
+	s.handleNotification("item/completed", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-A", "turnId": "turn-A", "item": map[string]any{"type": "agentMessage", "text": "only A"},
+	}))
+	s.handleResponse(rpcResponseEnvelope{
+		ID:     request.ID,
+		Result: mustMarshalAppServerTest(t, map[string]any{"thread": map[string]any{"id": "thread-A"}}),
+	})
+
+	if err := <-done; err != nil {
+		t.Fatalf("ensureThread() error: %v", err)
+	}
+	if got := s.CurrentSessionID(); got != "thread-A" {
+		t.Fatalf("CurrentSessionID() = %q, want thread-A", got)
+	}
+	s.stateMu.Lock()
+	turnID := s.currentTurn
+	pending := append([]string(nil), s.pendingMsgs...)
+	s.stateMu.Unlock()
+	if turnID != "turn-A" || len(pending) != 1 || pending[0] != "only A" {
+		t.Fatalf("post-bind state = turn %q pending %#v, want only thread-A notifications", turnID, pending)
+	}
+}
+
+func TestAppServerSession_ThreadResumePrebindsBeforeResponse(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdin := &lockedWriteCloser{}
+	s := &appServerSession{
+		transport:        appServerTransportProcess,
+		events:           make(chan core.Event, 4),
+		ctx:              ctx,
+		cancel:           cancel,
+		stdin:            stdin,
+		pending:          make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- s.ensureThread("thread-A") }()
+	request := waitForAppServerClientRequest(t, stdin, "thread/resume")
+	if got := s.CurrentSessionID(); got != "thread-A" {
+		t.Fatalf("CurrentSessionID() before response = %q, want expected thread-A", got)
+	}
+
+	s.handleNotification("turn/started", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-B", "turn": map[string]any{"id": "turn-B"},
+	}))
+	s.handleNotification("turn/started", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-A", "turn": map[string]any{"id": "turn-A"},
+	}))
+	s.handleResponse(rpcResponseEnvelope{
+		ID:     request.ID,
+		Result: mustMarshalAppServerTest(t, map[string]any{"thread": map[string]any{"id": "thread-A"}}),
+	})
+
+	if err := <-done; err != nil {
+		t.Fatalf("ensureThread() error: %v", err)
+	}
+	s.stateMu.Lock()
+	turnID := s.currentTurn
+	s.stateMu.Unlock()
+	if turnID != "turn-A" {
+		t.Fatalf("current turn = %q, want only matching pre-response notification", turnID)
+	}
+}
+
+func TestAppServerSession_TurnStartResponseClaimsImmediateServerRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdin := &lockedWriteCloser{}
+	s := &appServerSession{
+		transport:        appServerTransportProcess,
+		events:           make(chan core.Event, 4),
+		ctx:              ctx,
+		cancel:           cancel,
+		stdin:            stdin,
+		pending:          make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+	}
+	s.alive.Store(true)
+	s.threadID.Store("thread-A")
+
+	done := make(chan error, 1)
+	go func() { done <- s.Send("hello", "message-A", nil, nil) }()
+	request := waitForAppServerClientRequest(t, stdin, "turn/start")
+	s.handleResponse(rpcResponseEnvelope{
+		ID:     request.ID,
+		Result: mustMarshalAppServerTest(t, map[string]any{"turn": map[string]any{"id": "turn-A"}}),
+	})
+	s.stateMu.Lock()
+	ownedTurn := s.ownedTurn
+	s.stateMu.Unlock()
+	if ownedTurn != "turn-A" {
+		t.Fatalf("owned turn immediately after response = %q, want turn-A", ownedTurn)
+	}
+	// The reader can receive this request before the Send goroutine wakes up.
+	// Ownership must therefore be established synchronously in handleResponse.
+	s.handleServerRequest(serverRequestProbe(t, `"approval-1"`, "item/commandExecution/requestApproval", map[string]any{
+		"threadId": "thread-A",
+		"turnId":   "turn-A",
+		"itemId":   "command-A",
+		"command":  "pwd",
+	}))
+
+	event := waitForAppServerEvent(t, s.events)
+	if event.Type != core.EventPermissionRequest || event.RequestID != `"approval-1"` {
+		t.Fatalf("immediate server request event = %#v", event)
+	}
+	if err := s.RespondPermission(event.RequestID, core.PermissionResult{Behavior: "deny"}); err != nil {
+		t.Fatalf("RespondPermission() error: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Send() error: %v", err)
+	}
+}
+
+func TestAppServerSession_TurnStartResponseDoesNotResurrectCompletedTurn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdin := &lockedWriteCloser{}
+	s := &appServerSession{
+		transport:        appServerTransportProcess,
+		events:           make(chan core.Event, 4),
+		ctx:              ctx,
+		cancel:           cancel,
+		stdin:            stdin,
+		pending:          make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+	}
+	s.alive.Store(true)
+	s.threadID.Store("thread-A")
+
+	done := make(chan error, 1)
+	go func() { done <- s.Send("hello", "message-A", nil, nil) }()
+	request := waitForAppServerClientRequest(t, stdin, "turn/start")
+	s.handleNotification("turn/started", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-A",
+		"turn":     map[string]any{"id": "turn-A", "status": "inProgress"},
+	}))
+	s.handleNotification("turn/completed", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-A",
+		"turn":     map[string]any{"id": "turn-A", "status": "completed"},
+	}))
+	s.handleResponse(rpcResponseEnvelope{
+		ID:     request.ID,
+		Result: mustMarshalAppServerTest(t, map[string]any{"turn": map[string]any{"id": "turn-A"}}),
+	})
+
+	if err := <-done; err != nil {
+		t.Fatalf("Send() error: %v", err)
+	}
+	s.stateMu.Lock()
+	currentTurn := s.currentTurn
+	ownedTurn := s.ownedTurn
+	s.stateMu.Unlock()
+	if currentTurn != "" || ownedTurn != "" {
+		t.Fatalf("completed turn resurrected: current=%q owned=%q", currentTurn, ownedTurn)
+	}
+}
+
+func TestAppServerSession_NewThreadNotificationBufferIsBoundedAndExpires(t *testing.T) {
+	s := newIsolatedAppServerTestSession("", "", 1)
+	s.beginNotificationBuffer()
+	for i := 0; i < appServerNotificationBufferMax+10; i++ {
+		s.handleNotification("turn/started", mustMarshalAppServerTest(t, map[string]any{
+			"threadId": fmt.Sprintf("thread-%d", i),
+			"turn":     map[string]any{"id": fmt.Sprintf("turn-%d", i)},
+		}))
+	}
+	if got := len(s.bufferedNotifications); got != appServerNotificationBufferMax {
+		t.Fatalf("buffered notifications = %d, want cap %d", got, appServerNotificationBufferMax)
+	}
+
+	s.bindingMu.Lock()
+	s.bufferNotificationsTo = time.Now().Add(-time.Millisecond)
+	s.bindingMu.Unlock()
+	s.handleNotification("turn/started", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-expired", "turn": map[string]any{"id": "turn-expired"},
+	}))
+	if got := len(s.bufferedNotifications); got != 0 {
+		t.Fatalf("expired buffer retained %d notifications", got)
+	}
+}
+
+func TestAppServerSession_ServerRequestsRequireThreadTurnOwner(t *testing.T) {
+	methods := []string{
+		"item/commandExecution/requestApproval",
+		"item/fileChange/requestApproval",
+		"item/permissions/requestApproval",
+		"item/tool/requestUserInput",
+		"item/tool/call",
+		"mcpServer/elicitation/request",
+	}
+
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stdin := &lockedWriteCloser{}
+			s := &appServerSession{
+				events:           make(chan core.Event, 4),
+				ctx:              ctx,
+				pendingApprovals: make(map[string]chan core.PermissionResult),
+				stdin:            stdin,
+			}
+			s.threadID.Store("thread-A")
+			s.currentTurn = "turn-A"
+			s.ownedTurn = "turn-A"
+
+			badParams := []map[string]any{
+				{"threadId": "thread-B", "turnId": "turn-B"},
+				{"threadId": "thread-A", "turnId": "turn-B"},
+				{"turnId": "turn-A"},
+				{"threadId": 42, "turnId": "turn-A"},
+			}
+			for i, params := range badParams {
+				s.handleServerRequest(serverRequestProbe(t, fmt.Sprintf("%d", i+1), method, params))
+			}
+			s.stateMu.Lock()
+			s.ownedTurn = ""
+			s.stateMu.Unlock()
+			s.handleServerRequest(serverRequestProbe(t, "99", method, map[string]any{
+				"threadId": "thread-A",
+				"turnId":   "turn-A",
+			}))
+
+			assertNoAppServerEvent(t, s.events)
+			if got := stdin.String(); got != "" {
+				t.Fatalf("unowned requests wrote responses: %q", got)
+			}
+			s.approvalsMu.Lock()
+			pending := len(s.pendingApprovals)
+			s.approvalsMu.Unlock()
+			if pending != 0 {
+				t.Fatalf("unowned requests created %d pending approvals", pending)
+			}
+		})
+	}
+}
+
+func TestAppServerSession_DaemonWriterLeaseAllowsOnlyOneOwner(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "daemon.sock")
+	s1 := newIsolatedAppServerTestSession("", "", 1)
+	s1.transport = appServerTransportDaemon
+	s1.socketPath = socketPath
+	s2 := newIsolatedAppServerTestSession("", "", 1)
+	s2.transport = appServerTransportDaemon
+	s2.socketPath = socketPath
+
+	if err := s1.bindThread("thread-A"); err != nil {
+		t.Fatalf("first bindThread() error: %v", err)
+	}
+	if err := s2.bindThread("thread-A"); !errors.Is(err, core.ErrAgentSessionWriterBusy) {
+		t.Fatalf("second bindThread() error = %v, want ErrAgentSessionWriterBusy", err)
+	}
+	s1.releaseWriterLease()
+	if err := s2.bindThread("thread-A"); err != nil {
+		t.Fatalf("bindThread() after release error: %v", err)
+	}
+	s2.releaseWriterLease()
+
+	dead := newIsolatedAppServerTestSession("", "", 1)
+	dead.transport = appServerTransportDaemon
+	dead.socketPath = socketPath
+	dead.alive.Store(false)
+	if err := dead.bindThread("thread-A"); err == nil {
+		t.Fatal("dead daemon connection unexpectedly acquired a writer lease")
+	}
+	probe := newIsolatedAppServerTestSession("", "", 1)
+	probe.transport = appServerTransportDaemon
+	probe.socketPath = socketPath
+	if err := probe.bindThread("thread-A"); err != nil {
+		t.Fatalf("live probe bindThread() after dead connection error: %v", err)
+	}
+	probe.releaseWriterLease()
+}
+
+func TestAppServerSession_FakeSharedDaemonRoutesNotificationsAndServerRequestsToOwner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets are not available on Windows")
+	}
+	daemon := newFakeSharedAppServerDaemon(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startSession := func(threadID string) *appServerSession {
+		t.Helper()
+		s, err := newAppServerSession(
+			ctx,
+			appServerTransportDaemon,
+			"",
+			daemon.socketPath,
+			t.TempDir(),
+			"",
+			"",
+			"suggest",
+			threadID,
+			"",
+			"",
+			nil,
+			"",
+			"",
+			"",
+		)
+		if err != nil {
+			t.Fatalf("start %s session: %v", threadID, err)
+		}
+		return s
+	}
+
+	sessionA := startSession("thread-A")
+	defer sessionA.Close()
+	sessionB := startSession("thread-B")
+	defer sessionB.Close()
+	daemon.waitForClients(t, 2)
+
+	for _, threadID := range []string{"thread-A", "thread-B"} {
+		turnID := "notification-turn-" + threadID
+		daemon.broadcast(t, "turn/started", map[string]any{
+			"threadId": threadID,
+			"turn":     map[string]any{"id": turnID, "status": "inProgress"},
+		})
+		daemon.broadcast(t, "item/started", map[string]any{
+			"threadId": threadID,
+			"turnId":   turnID,
+			"item":     map[string]any{"type": "commandExecution", "command": "tool-" + threadID},
+		})
+		daemon.broadcast(t, "item/completed", map[string]any{
+			"threadId": threadID,
+			"turnId":   turnID,
+			"item":     map[string]any{"type": "agentMessage", "text": "reply-" + threadID},
+		})
+		daemon.broadcast(t, "turn/completed", map[string]any{
+			"threadId": threadID,
+			"turn":     map[string]any{"id": turnID, "status": "completed"},
+		})
+	}
+
+	assertFakeDaemonSessionEvents(t, sessionA, "thread-A", "thread-B")
+	assertFakeDaemonSessionEvents(t, sessionB, "thread-B", "thread-A")
+
+	if err := sessionA.Send("owner A", "message-A", nil, nil); err != nil {
+		t.Fatalf("start owned turn A: %v", err)
+	}
+	if err := sessionB.Send("owner B", "message-B", nil, nil); err != nil {
+		t.Fatalf("start owned turn B: %v", err)
+	}
+	waitForAppServerTurn(t, sessionA, "server-turn-thread-A")
+	waitForAppServerTurn(t, sessionB, "server-turn-thread-B")
+
+	requests := []struct {
+		method       string
+		params       map[string]any
+		expectsEvent bool
+	}{
+		{
+			method:       "item/commandExecution/requestApproval",
+			params:       map[string]any{"itemId": "command-1", "startedAtMs": 1, "command": "pwd"},
+			expectsEvent: true,
+		},
+		{
+			method:       "item/fileChange/requestApproval",
+			params:       map[string]any{"itemId": "patch-1", "startedAtMs": 1, "reason": "update file"},
+			expectsEvent: true,
+		},
+		{
+			method:       "item/permissions/requestApproval",
+			params:       map[string]any{"itemId": "permissions-1", "startedAtMs": 1, "cwd": "/tmp", "permissions": map[string]any{}},
+			expectsEvent: true,
+		},
+		{
+			method: "item/tool/requestUserInput",
+			params: map[string]any{
+				"itemId": "question-1", "isBlocking": true,
+				"questions": []any{map[string]any{
+					"id": "choice", "header": "Choice", "question": "Choose one",
+					"options": []any{map[string]any{"label": "A", "description": "Option A"}},
+				}},
+			},
+			expectsEvent: true,
+		},
+		{
+			method: "item/tool/call",
+			params: map[string]any{"callId": "dynamic-1", "tool": "missing_tool", "arguments": map[string]any{}},
+		},
+		{
+			method: "mcpServer/elicitation/request",
+			params: map[string]any{"serverName": "test-mcp"},
+		},
+	}
+
+	requestID := 100
+	for _, threadID := range []string{"thread-A", "thread-B"} {
+		owner := sessionA
+		nonOwner := sessionB
+		if threadID == "thread-B" {
+			owner, nonOwner = sessionB, sessionA
+		}
+		for _, request := range requests {
+			requestID++
+			params := make(map[string]any, len(request.params)+2)
+			for key, value := range request.params {
+				params[key] = value
+			}
+			params["threadId"] = threadID
+			params["turnId"] = "server-turn-" + threadID
+			daemon.broadcastRequest(t, requestID, request.method, params)
+
+			if request.expectsEvent {
+				event := waitForAppServerEvent(t, owner.Events())
+				if event.Type != core.EventPermissionRequest || event.RequestID != fmt.Sprintf("%d", requestID) {
+					t.Fatalf("%s owner event = %#v", request.method, event)
+				}
+				if err := owner.RespondPermission(event.RequestID, core.PermissionResult{Behavior: "deny"}); err != nil {
+					t.Fatalf("respond to %s: %v", request.method, err)
+				}
+			}
+			assertNoAppServerEvent(t, nonOwner.Events())
+
+			response := daemon.waitForResponse(t, requestID)
+			if response.threadID != threadID {
+				t.Fatalf("%s response came from %q, want owner %q", request.method, response.threadID, threadID)
+			}
+			daemon.assertNoResponse(t, 30*time.Millisecond)
+		}
+	}
+
+	disconnectedThread := sessionA.CurrentSessionID()
+	daemon.disconnectThread(t, disconnectedThread)
+	waitForAppServerSessionDead(t, sessionA)
+	disconnectEvent := waitForAppServerEvent(t, sessionA.Events())
+	if disconnectEvent.Type != core.EventError {
+		t.Fatalf("daemon disconnect event = %#v, want EventError", disconnectEvent)
+	}
+	replacement := startSession(disconnectedThread)
+	defer replacement.Close()
+	if got := replacement.CurrentSessionID(); got != disconnectedThread {
+		t.Fatalf("replacement session ID = %q, want %q", got, disconnectedThread)
+	}
+
+	daemon.assertHealthy(t)
+}
+
+func newIsolatedAppServerTestSession(threadID, turnID string, eventBuffer int) *appServerSession {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &appServerSession{
+		events:           make(chan core.Event, eventBuffer),
+		ctx:              ctx,
+		cancel:           cancel,
+		pending:          make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+	}
+	s.alive.Store(true)
+	if threadID != "" {
+		s.threadID.Store(threadID)
+	}
+	s.currentTurn = turnID
+	s.ownedTurn = turnID
+	return s
+}
+
+func mustMarshalAppServerTest(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal app-server test payload: %v", err)
+	}
+	return raw
+}
+
+func assertAppServerStateUnchanged(t *testing.T, s *appServerSession, wantTurn string, wantPending []string, wantUsedTokens int) {
+	t.Helper()
+	s.stateMu.Lock()
+	gotTurn := s.currentTurn
+	gotOwnedTurn := s.ownedTurn
+	gotPending := append([]string(nil), s.pendingMsgs...)
+	s.stateMu.Unlock()
+	if gotTurn != wantTurn {
+		t.Fatalf("current turn = %q, want %q", gotTurn, wantTurn)
+	}
+	if gotOwnedTurn != wantTurn {
+		t.Fatalf("owned turn = %q, want %q", gotOwnedTurn, wantTurn)
+	}
+	if len(gotPending) != len(wantPending) {
+		t.Fatalf("pending messages = %#v, want %#v", gotPending, wantPending)
+	}
+	for i := range wantPending {
+		if gotPending[i] != wantPending[i] {
+			t.Fatalf("pending messages = %#v, want %#v", gotPending, wantPending)
+		}
+	}
+	usage := s.cachedContextUsage()
+	if wantUsedTokens == 0 {
+		if usage != nil {
+			t.Fatalf("context usage = %#v, want nil", usage)
+		}
+		return
+	}
+	if usage == nil || usage.UsedTokens != wantUsedTokens {
+		t.Fatalf("context usage = %#v, want used tokens %d", usage, wantUsedTokens)
+	}
+}
+
+func assertNoAppServerEvent(t *testing.T, events <-chan core.Event) {
+	t.Helper()
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected app-server event: %#v", event)
+	default:
+	}
+}
+
+type fakeSharedAppServerResponse struct {
+	threadID string
+	id       int
+	payload  map[string]json.RawMessage
+}
+
+type fakeSharedAppServerClient struct {
+	daemon *fakeSharedAppServerDaemon
+	conn   *websocket.Conn
+
+	writeMu  sync.Mutex
+	threadID string
+}
+
+type fakeSharedAppServerDaemon struct {
+	socketPath string
+	server     *http.Server
+	listener   net.Listener
+
+	mu      sync.Mutex
+	clients []*fakeSharedAppServerClient
+
+	responses chan fakeSharedAppServerResponse
+	errors    chan error
+	done      chan struct{}
+}
+
+func newFakeSharedAppServerDaemon(t *testing.T) *fakeSharedAppServerDaemon {
+	t.Helper()
+	socketPath := filepath.Join(t.TempDir(), "shared-app-server.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen on fake app-server socket: %v", err)
+	}
+	d := &fakeSharedAppServerDaemon{
+		socketPath: socketPath,
+		listener:   listener,
+		responses:  make(chan fakeSharedAppServerResponse, 32),
+		errors:     make(chan error, 16),
+		done:       make(chan struct{}),
+	}
+	d.server = &http.Server{Handler: http.HandlerFunc(d.serveHTTP)}
+	go func() {
+		if err := d.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			d.reportError(fmt.Errorf("fake app-server serve: %w", err))
+		}
+	}()
+	t.Cleanup(func() {
+		close(d.done)
+		_ = d.server.Close()
+		_ = d.listener.Close()
+	})
+	return d
+}
+
+func (d *fakeSharedAppServerDaemon) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+	if err != nil {
+		d.reportError(fmt.Errorf("fake app-server upgrade: %w", err))
+		return
+	}
+	client := &fakeSharedAppServerClient{daemon: d, conn: conn}
+	d.mu.Lock()
+	d.clients = append(d.clients, client)
+	d.mu.Unlock()
+	client.readLoop()
+}
+
+func (c *fakeSharedAppServerClient) readLoop() {
+	defer c.conn.Close()
+	for {
+		var message map[string]json.RawMessage
+		if err := c.conn.ReadJSON(&message); err != nil {
+			select {
+			case <-c.daemon.done:
+				return
+			default:
+			}
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				return
+			}
+			c.daemon.reportError(fmt.Errorf("fake app-server read: %w", err))
+			return
+		}
+
+		rawID, hasID := message["id"]
+		rawMethod, hasMethod := message["method"]
+		if hasID && !hasMethod {
+			var id int
+			if err := json.Unmarshal(rawID, &id); err != nil {
+				c.daemon.reportError(fmt.Errorf("decode client response id: %w", err))
+				continue
+			}
+			c.daemon.mu.Lock()
+			threadID := c.threadID
+			c.daemon.mu.Unlock()
+			c.daemon.responses <- fakeSharedAppServerResponse{threadID: threadID, id: id, payload: message}
+			continue
+		}
+		if !hasMethod {
+			continue
+		}
+
+		var method string
+		if err := json.Unmarshal(rawMethod, &method); err != nil {
+			c.daemon.reportError(fmt.Errorf("decode client method: %w", err))
+			continue
+		}
+		if !hasID {
+			continue
+		}
+		switch method {
+		case "initialize":
+			c.writeResponse(rawID, map[string]any{"protocolVersion": "2"})
+		case "thread/resume":
+			var params struct {
+				ThreadID string `json:"threadId"`
+			}
+			if err := json.Unmarshal(message["params"], &params); err != nil || params.ThreadID == "" {
+				c.daemon.reportError(fmt.Errorf("decode thread/resume params: %v", err))
+				continue
+			}
+			c.daemon.mu.Lock()
+			c.threadID = params.ThreadID
+			c.daemon.mu.Unlock()
+			c.writeResponse(rawID, map[string]any{
+				"thread": map[string]any{"id": params.ThreadID},
+			})
+		case "turn/start":
+			var params struct {
+				ThreadID string `json:"threadId"`
+			}
+			if err := json.Unmarshal(message["params"], &params); err != nil || params.ThreadID == "" {
+				c.daemon.reportError(fmt.Errorf("decode turn/start params: %v", err))
+				continue
+			}
+			c.daemon.mu.Lock()
+			boundThread := c.threadID
+			c.daemon.mu.Unlock()
+			if params.ThreadID != boundThread {
+				c.daemon.reportError(fmt.Errorf("turn/start thread = %q, client bound to %q", params.ThreadID, boundThread))
+				continue
+			}
+			c.writeResponse(rawID, map[string]any{
+				"turn": map[string]any{"id": "server-turn-" + params.ThreadID},
+			})
+		case "account/rateLimits/read":
+			c.writeResponse(rawID, map[string]any{"rateLimitsByLimitId": map[string]any{}})
+		default:
+			c.daemon.reportError(fmt.Errorf("unexpected fake app-server client method %q", method))
+		}
+	}
+}
+
+func (c *fakeSharedAppServerClient) writeResponse(id json.RawMessage, result any) {
+	if err := c.writeJSON(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}); err != nil {
+		c.daemon.reportError(err)
+	}
+}
+
+func (c *fakeSharedAppServerClient) writeJSON(value any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := c.conn.WriteJSON(value); err != nil {
+		return fmt.Errorf("fake app-server write: %w", err)
+	}
+	return nil
+}
+
+func (d *fakeSharedAppServerDaemon) reportError(err error) {
+	if err == nil {
+		return
+	}
+	select {
+	case <-d.done:
+		return
+	default:
+	}
+	select {
+	case d.errors <- err:
+	default:
+	}
+}
+
+func (d *fakeSharedAppServerDaemon) waitForClients(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		d.mu.Lock()
+		got := len(d.clients)
+		d.mu.Unlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("fake daemon did not receive %d clients", want)
+}
+
+func (d *fakeSharedAppServerDaemon) snapshotClients(t *testing.T) []*fakeSharedAppServerClient {
+	t.Helper()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.clients) == 0 {
+		t.Fatal("fake daemon has no connected clients")
+	}
+	return append([]*fakeSharedAppServerClient(nil), d.clients...)
+}
+
+func (d *fakeSharedAppServerDaemon) broadcast(t *testing.T, method string, params any) {
+	t.Helper()
+	message := map[string]any{"jsonrpc": "2.0", "method": method, "params": params}
+	for _, client := range d.snapshotClients(t) {
+		if err := client.writeJSON(message); err != nil {
+			t.Fatalf("broadcast %s: %v", method, err)
+		}
+	}
+}
+
+func (d *fakeSharedAppServerDaemon) broadcastRequest(t *testing.T, id int, method string, params any) {
+	t.Helper()
+	message := map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}
+	for _, client := range d.snapshotClients(t) {
+		if err := client.writeJSON(message); err != nil {
+			t.Fatalf("broadcast request %s: %v", method, err)
+		}
+	}
+}
+
+func (d *fakeSharedAppServerDaemon) disconnectThread(t *testing.T, threadID string) {
+	t.Helper()
+	var target *fakeSharedAppServerClient
+	d.mu.Lock()
+	for _, client := range d.clients {
+		if client.threadID == threadID {
+			target = client
+			break
+		}
+	}
+	d.mu.Unlock()
+	if target == nil {
+		t.Fatalf("fake daemon has no client for thread %q", threadID)
+	}
+
+	target.writeMu.Lock()
+	err := target.conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "test disconnect"),
+		time.Now().Add(time.Second),
+	)
+	target.writeMu.Unlock()
+	if err != nil {
+		t.Fatalf("disconnect thread %q: %v", threadID, err)
+	}
+}
+
+func (d *fakeSharedAppServerDaemon) waitForResponse(t *testing.T, id int) fakeSharedAppServerResponse {
+	t.Helper()
+	for {
+		select {
+		case response := <-d.responses:
+			if response.id != id {
+				t.Fatalf("fake daemon response id = %d, want %d", response.id, id)
+			}
+			return response
+		case err := <-d.errors:
+			t.Fatal(err)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for response %d", id)
+		}
+	}
+}
+
+func (d *fakeSharedAppServerDaemon) assertNoResponse(t *testing.T, duration time.Duration) {
+	t.Helper()
+	select {
+	case response := <-d.responses:
+		t.Fatalf("unexpected duplicate/unowned response: id=%d thread=%q payload=%v", response.id, response.threadID, response.payload)
+	case err := <-d.errors:
+		t.Fatal(err)
+	case <-time.After(duration):
+	}
+}
+
+func (d *fakeSharedAppServerDaemon) assertHealthy(t *testing.T) {
+	t.Helper()
+	select {
+	case err := <-d.errors:
+		t.Fatal(err)
+	default:
+	}
+}
+
+func assertFakeDaemonSessionEvents(t *testing.T, session *appServerSession, ownThread, otherThread string) {
+	t.Helper()
+	for i := 0; i < 3; i++ {
+		event := waitForAppServerEvent(t, session.Events())
+		joined := strings.Join([]string{event.Content, event.ToolInput, event.ToolResult, event.SessionID}, "\n")
+		if strings.Contains(joined, otherThread) {
+			t.Fatalf("fake daemon leaked %s into %s: %#v", otherThread, ownThread, event)
+		}
+		if event.Type == core.EventResult && event.SessionID != ownThread {
+			t.Fatalf("result SessionID = %q, want %q", event.SessionID, ownThread)
+		}
+	}
+	assertNoAppServerEvent(t, session.Events())
+}
+
+func waitForAppServerEvent(t *testing.T, events <-chan core.Event) core.Event {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for app-server event")
+		return core.Event{}
+	}
+}
+
+func waitForAppServerTurn(t *testing.T, session *appServerSession, want string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		session.stateMu.Lock()
+		got := session.currentTurn
+		session.stateMu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("current turn did not become %q", want)
+}
+
+func waitForAppServerSessionDead(t *testing.T, session *appServerSession) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if !session.Alive() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("app-server session remained alive after daemon disconnect")
 }
 
 func TestAppServerSession_RequestTimeoutIncludesBlockedStdinWrite(t *testing.T) {
@@ -409,6 +1512,9 @@ func TestAppServerSession_HandleRequestUserInputEmitsAskQuestion(t *testing.T) {
 		pendingApprovals: make(map[string]chan core.PermissionResult),
 		stdin:            stdin,
 	}
+	s.threadID.Store("thread-1")
+	s.currentTurn = "turn-1"
+	s.ownedTurn = "turn-1"
 
 	s.handleServerRequest(serverRequestProbe(t, `"rui-1"`, "item/tool/requestUserInput", map[string]any{
 		"threadId": "thread-1",
@@ -470,6 +1576,9 @@ func TestAppServerSession_HandleRequestUserInputWritesCodexResponse(t *testing.T
 		pendingApprovals: make(map[string]chan core.PermissionResult),
 		stdin:            stdin,
 	}
+	s.threadID.Store("thread-1")
+	s.currentTurn = "turn-1"
+	s.ownedTurn = "turn-1"
 
 	s.handleServerRequest(serverRequestProbe(t, `"rui-2"`, "item/tool/requestUserInput", map[string]any{
 		"threadId": "thread-1",
@@ -615,6 +1724,24 @@ func serverRequestProbe(t *testing.T, idJSON, method string, params any) map[str
 		"method": methodJSON,
 		"params": paramsJSON,
 	}
+}
+
+type appServerTestClientRequest struct {
+	ID     int64  `json:"id"`
+	Method string `json:"method"`
+}
+
+func waitForAppServerClientRequest(t *testing.T, w *lockedWriteCloser, wantMethod string) appServerTestClientRequest {
+	t.Helper()
+	line := waitForWrittenJSONLine(t, w)
+	var request appServerTestClientRequest
+	if err := json.Unmarshal([]byte(line), &request); err != nil {
+		t.Fatalf("unmarshal client request %q: %v", line, err)
+	}
+	if request.Method != wantMethod {
+		t.Fatalf("client request method = %q, want %q", request.Method, wantMethod)
+	}
+	return request
 }
 
 func waitForWrittenJSONLine(t *testing.T, w *lockedWriteCloser) string {

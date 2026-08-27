@@ -47,6 +47,12 @@ type Platform interface {
 // ErrNotSupported indicates a platform doesn't support a particular operation.
 var ErrNotSupported = errors.New("operation not supported by this platform")
 
+// ErrAgentSessionWriterBusy indicates that another live client already owns
+// the write side of an agent-managed session. Callers must preserve the saved
+// session ID and surface the conflict instead of falling back to a fresh
+// session, which would silently detach the user from the requested session.
+var ErrAgentSessionWriterBusy = errors.New("agent session already has an active writer")
+
 // ReplyContextReconstructor is an optional interface for platforms that can
 // recreate a reply context from a session key. This is needed for cron jobs
 // to send messages to users without an incoming message.

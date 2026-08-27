@@ -211,6 +211,98 @@ func (s *cujAgentSession) getSentPrompts() []string {
 	return out
 }
 
+// cujSingleWriterAgent models a shared backend that allows exactly one live
+// writer per agent session ID. It lets the Core CUJ verify that a writer
+// conflict is surfaced without silently falling back to a fresh session.
+type cujSingleWriterAgent struct {
+	mu     sync.Mutex
+	owners map[string]*cujSingleWriterSession
+	calls  []string
+}
+
+func (a *cujSingleWriterAgent) Name() string { return "cuj-single-writer" }
+
+func (a *cujSingleWriterAgent) StartSession(_ context.Context, sessionID string) (AgentSession, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls = append(a.calls, sessionID)
+	if sessionID == "" {
+		return nil, errors.New("unexpected fresh-session fallback")
+	}
+	if a.owners == nil {
+		a.owners = make(map[string]*cujSingleWriterSession)
+	}
+	if a.owners[sessionID] != nil {
+		return nil, fmt.Errorf("%w: %s", ErrAgentSessionWriterBusy, sessionID)
+	}
+	s := &cujSingleWriterSession{
+		agent:    a,
+		threadID: sessionID,
+		events:   make(chan Event, 8),
+	}
+	a.owners[sessionID] = s
+	return s, nil
+}
+
+func (a *cujSingleWriterAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+
+func (a *cujSingleWriterAgent) Stop() error { return nil }
+
+func (a *cujSingleWriterAgent) snapshotCalls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.calls...)
+}
+
+type cujSingleWriterSession struct {
+	agent    *cujSingleWriterAgent
+	threadID string
+	events   chan Event
+
+	mu     sync.Mutex
+	closed bool
+}
+
+func (s *cujSingleWriterSession) Send(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return errors.New("single-writer session is closed")
+	}
+	s.events <- Event{Type: EventResult, Content: "reply: " + prompt, SessionID: s.threadID, Done: true}
+	return nil
+}
+
+func (s *cujSingleWriterSession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *cujSingleWriterSession) Events() <-chan Event                             { return s.events }
+func (s *cujSingleWriterSession) CurrentSessionID() string                         { return s.threadID }
+
+func (s *cujSingleWriterSession) Alive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.closed
+}
+
+func (s *cujSingleWriterSession) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	s.mu.Unlock()
+
+	s.agent.mu.Lock()
+	if s.agent.owners[s.threadID] == s {
+		delete(s.agent.owners, s.threadID)
+	}
+	s.agent.mu.Unlock()
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // cujEnv bundles the engine + platform stub + agent for a single CUJ run.
 // ---------------------------------------------------------------------------
@@ -2048,6 +2140,71 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 	if len(pB.getSent()) == 0 {
 		t.Fatal("platB received no replies")
 	}
+
+	t.Run("same backend thread keeps one writer", func(t *testing.T) {
+		pOwner := &stubPlatformEngine{n: "feishu-owner"}
+		pContender := &stubPlatformEngine{n: "feishu-contender"}
+		writerAgent := &cujSingleWriterAgent{}
+		engine := NewEngine("test", writerAgent, []Platform{pOwner, pContender}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+		defer engine.cancel()
+
+		const (
+			ownerKey     = "feishu:group-owner"
+			contenderKey = "feishu:group-contender"
+			threadID     = "shared-codex-thread"
+		)
+		engine.sessions.GetOrCreateActive(ownerKey).SetAgentSessionID(threadID, writerAgent.Name())
+		engine.sessions.GetOrCreateActive(contenderKey).SetAgentSessionID(threadID, writerAgent.Name())
+
+		// Action 1: the first group acquires the backend writer and completes a turn.
+		engine.ReceiveMessage(pOwner, &Message{
+			SessionKey: ownerKey, Platform: pOwner.Name(), MessageID: "owner-1",
+			UserID: "owner", Content: "owner first", ReplyCtx: "owner-ctx",
+		})
+		waitForCUJSentCount(t, pOwner, 1)
+
+		// Action 2: a second group bound to the same backend thread is rejected.
+		engine.ReceiveMessage(pContender, &Message{
+			SessionKey: contenderKey, Platform: pContender.Name(), MessageID: "contender-1",
+			UserID: "contender", Content: "contender text", ReplyCtx: "contender-ctx",
+		})
+		waitForCUJSentCount(t, pContender, 1)
+		if got := strings.Join(pContender.getSent(), "\n"); !strings.Contains(got, "failed to start agent session") {
+			t.Fatalf("contender saw %q, want writer-conflict start failure", got)
+		}
+
+		// Action 3: the original group remains attached and can continue safely.
+		engine.ReceiveMessage(pOwner, &Message{
+			SessionKey: ownerKey, Platform: pOwner.Name(), MessageID: "owner-2",
+			UserID: "owner", Content: "owner second", ReplyCtx: "owner-ctx",
+		})
+		waitForCUJSentCount(t, pOwner, 2)
+		ownerVisible := strings.Join(pOwner.getSent(), "\n")
+		if strings.Contains(ownerVisible, "contender text") {
+			t.Fatalf("owner group received contender content: %q", ownerVisible)
+		}
+		if !strings.Contains(ownerVisible, "owner first") || !strings.Contains(ownerVisible, "owner second") {
+			t.Fatalf("owner group did not see both own replies: %q", ownerVisible)
+		}
+		if got := engine.sessions.GetOrCreateActive(contenderKey).GetAgentSessionID(); got != threadID {
+			t.Fatalf("contender AgentSessionID = %q, want original thread preserved", got)
+		}
+		if calls := writerAgent.snapshotCalls(); len(calls) != 2 || calls[0] != threadID || calls[1] != threadID {
+			t.Fatalf("StartSession calls = %#v, want two exact resumes and no fresh fallback", calls)
+		}
+	})
+}
+
+func waitForCUJSentCount(t *testing.T, p *stubPlatformEngine, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(p.getSent()) >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d platform messages; got %v", want, p.getSent())
 }
 
 // ---------------------------------------------------------------------------

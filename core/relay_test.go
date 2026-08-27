@@ -495,6 +495,46 @@ func TestHandleRelay_ResumeFailureFallsBackToFreshSession(t *testing.T) {
 	}
 }
 
+type relayWriterBusyAgent struct {
+	calls []string
+}
+
+func (a *relayWriterBusyAgent) Name() string { return "writer-busy" }
+func (a *relayWriterBusyAgent) StartSession(_ context.Context, sessionID string) (AgentSession, error) {
+	a.calls = append(a.calls, sessionID)
+	return nil, fmt.Errorf("%w: %s", ErrAgentSessionWriterBusy, sessionID)
+}
+func (a *relayWriterBusyAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *relayWriterBusyAgent) Stop() error { return nil }
+
+func TestHandleRelay_WriterBusyDoesNotFallbackOrClearSessionID(t *testing.T) {
+	e := newTestEngine()
+	agent := &relayWriterBusyAgent{}
+	e.agent = agent
+
+	const (
+		sourceSessionKey = "test:chat-1:user"
+		relaySessionKey  = "relay:source:test:chat-1"
+		threadID         = "shared-thread"
+	)
+	session := e.sessions.GetOrCreateActive(relaySessionKey)
+	session.SetAgentSessionID(threadID, agent.Name())
+	e.sessions.Save()
+
+	_, err := e.HandleRelay(context.Background(), "source", sourceSessionKey, "hello")
+	if !errors.Is(err, ErrAgentSessionWriterBusy) {
+		t.Fatalf("HandleRelay() error = %v, want ErrAgentSessionWriterBusy", err)
+	}
+	if len(agent.calls) != 1 || agent.calls[0] != threadID {
+		t.Fatalf("StartSession calls = %#v, want one exact resume", agent.calls)
+	}
+	if got := session.GetAgentSessionID(); got != threadID {
+		t.Fatalf("AgentSessionID = %q, want %q preserved", got, threadID)
+	}
+}
+
 func TestHandleRelay_SingleWorkspaceUsesGlobalAgentAndSourceSessionKey(t *testing.T) {
 	e := newTestEngine()
 	agent := &sessionEnvRecordingAgent{session: newResultAgentSession("global")}

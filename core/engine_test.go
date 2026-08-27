@@ -8401,6 +8401,41 @@ func TestResumeFailureFallbackToFreshSession(t *testing.T) {
 	}
 }
 
+func TestResumeWriterBusyDoesNotFallbackOrClearSessionID(t *testing.T) {
+	agent := &stubStartSessionAgent{
+		failIDs: map[string]error{
+			"shared-thread": fmt.Errorf("%w: shared-thread", ErrAgentSessionWriterBusy),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := &Engine{
+		agent:             agent,
+		sessions:          NewSessionManager(filepath.Join(t.TempDir(), "sessions.json")),
+		ctx:               ctx,
+		i18n:              NewI18n("en"),
+		interactiveStates: make(map[string]*interactiveState),
+		display:           DisplayCfg{},
+	}
+	session := e.sessions.GetOrCreateActive("test:second-group")
+	session.SetAgentSessionID("shared-thread", "stub")
+
+	state := e.getOrCreateInteractiveStateWith("test:second-group", &stubPlatformEngine{n: "test"}, "ctx", session, e.sessions, nil, "")
+	if state.agentSession != nil {
+		t.Fatal("writer conflict unexpectedly created an agent session")
+	}
+	agent.mu.Lock()
+	calls := append([]string(nil), agent.calls...)
+	agent.mu.Unlock()
+	if len(calls) != 1 || calls[0] != "shared-thread" {
+		t.Fatalf("StartSession calls = %#v, want only shared-thread (no fresh fallback)", calls)
+	}
+	if got := session.GetAgentSessionID(); got != "shared-thread" {
+		t.Fatalf("AgentSessionID = %q, want shared-thread preserved", got)
+	}
+}
+
 func TestFreshSessionWithoutSavedSessionIDStartsFresh(t *testing.T) {
 	agent := &stubStartSessionAgent{}
 

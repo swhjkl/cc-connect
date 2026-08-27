@@ -84,7 +84,27 @@ type itemNotification struct {
 }
 
 type errorNotification struct {
-	Message string `json:"message"`
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
+	Message  string `json:"message"`
+	Error    struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+type appServerThreadIdentity struct {
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
+}
+
+type appServerBufferedNotification struct {
+	method string
+	params json.RawMessage
+}
+
+type appServerDaemonWriterRegistry struct {
+	mu     sync.Mutex
+	owners map[string]*appServerSession
 }
 
 type appServerRateLimitsResponse struct {
@@ -171,6 +191,10 @@ type appServerSession struct {
 
 	pendingMu sync.Mutex
 	pending   map[int64]chan rpcResponseEnvelope
+	// pendingMethods lets response handling establish turn ownership before
+	// the reader advances to a server request that immediately follows the
+	// turn/start response on the same connection.
+	pendingMethods map[int64]string
 
 	approvalsMu      sync.Mutex
 	pendingApprovals map[string]chan core.PermissionResult
@@ -178,13 +202,22 @@ type appServerSession struct {
 	threadID atomic.Value
 	alive    atomic.Bool
 
+	bindingMu              sync.Mutex
+	bufferNotifications    bool
+	bufferNotificationsTo  time.Time
+	replayingNotifications bool
+	bufferedNotifications  []appServerBufferedNotification
+	writerLeaseKey         string
+
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	stateMu      sync.Mutex
-	pendingMsgs  []string
-	currentTurn  string
-	preambleSent bool
+	stateMu       sync.Mutex
+	pendingMsgs   []string
+	currentTurn   string
+	ownedTurn     string
+	completedTurn string
+	preambleSent  bool
 
 	runtimeMu sync.RWMutex
 	usage     *core.UsageReport
@@ -192,13 +225,19 @@ type appServerSession struct {
 }
 
 const (
-	appServerTransportProcess    = "process"
-	appServerTransportDaemon     = "daemon"
-	appServerRequestTimeout      = 120 * time.Second
-	appServerInitializeTimeout   = 15 * time.Second
-	appServerUsageRefreshTimeout = 1500 * time.Millisecond
-	appServerMaxMessageSize      = 10 * 1024 * 1024
+	appServerTransportProcess      = "process"
+	appServerTransportDaemon       = "daemon"
+	appServerRequestTimeout        = 120 * time.Second
+	appServerInitializeTimeout     = 15 * time.Second
+	appServerUsageRefreshTimeout   = 1500 * time.Millisecond
+	appServerMaxMessageSize        = 10 * 1024 * 1024
+	appServerNotificationBufferTTL = 5 * time.Second
+	appServerNotificationBufferMax = 64
 )
+
+var appServerDaemonWriters = appServerDaemonWriterRegistry{
+	owners: make(map[string]*appServerSession),
+}
 
 func newAppServerSession(ctx context.Context, transport, url, socketPath, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string) (*appServerSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
@@ -415,34 +454,209 @@ func (s *appServerSession) initialize() error {
 
 func (s *appServerSession) ensureThread(resumeID string) error {
 	if resumeID != "" && resumeID != core.ContinueSession {
+		resumeID = strings.TrimSpace(resumeID)
+		if err := s.bindThread(resumeID); err != nil {
+			return err
+		}
+
 		params := s.threadRequestParams()
 		params["threadId"] = resumeID
 		params["persistExtendedHistory"] = true
 
 		var resp threadResumeResponse
 		if err := s.request("thread/resume", params, &resp); err != nil {
+			s.unbindThread()
 			return err
 		}
 		if resp.Thread.ID == "" {
+			s.unbindThread()
 			return fmt.Errorf("codex app-server resume returned empty thread id")
 		}
+		if resp.Thread.ID != resumeID {
+			s.unbindThread()
+			return fmt.Errorf("codex app-server resume returned thread %q, want %q", resp.Thread.ID, resumeID)
+		}
 		s.applyThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
-		s.threadID.Store(resp.Thread.ID)
 		slog.Info("codex app-server thread resumed", "thread_id", resp.Thread.ID)
 		return nil
 	}
 
+	s.beginNotificationBuffer()
 	var resp threadStartResponse
 	if err := s.request("thread/start", s.threadStartRequestParams(), &resp); err != nil {
+		s.discardNotificationBuffer()
 		return err
 	}
 	if resp.Thread.ID == "" {
+		s.discardNotificationBuffer()
 		return fmt.Errorf("codex app-server start returned empty thread id")
 	}
 	s.applyThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
-	s.threadID.Store(resp.Thread.ID)
+	if err := s.bindThread(resp.Thread.ID); err != nil {
+		return err
+	}
 	slog.Info("codex app-server thread started", "thread_id", resp.Thread.ID)
 	return nil
+}
+
+func (s *appServerSession) beginNotificationBuffer() {
+	s.bindingMu.Lock()
+	s.bufferNotifications = true
+	s.bufferNotificationsTo = time.Now().Add(appServerNotificationBufferTTL)
+	s.replayingNotifications = false
+	s.bufferedNotifications = nil
+	s.bindingMu.Unlock()
+}
+
+func (s *appServerSession) discardNotificationBuffer() {
+	s.bindingMu.Lock()
+	s.clearNotificationBufferLocked()
+	s.bindingMu.Unlock()
+}
+
+func (s *appServerSession) clearNotificationBufferLocked() {
+	s.bufferNotifications = false
+	s.bufferNotificationsTo = time.Time{}
+	s.replayingNotifications = false
+	s.bufferedNotifications = nil
+}
+
+func (s *appServerSession) bindThread(threadID string) error {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		s.discardNotificationBuffer()
+		return fmt.Errorf("codex app-server thread id is empty")
+	}
+
+	s.bindingMu.Lock()
+	current := s.CurrentSessionID()
+	if current != "" && current != threadID {
+		s.bindingMu.Unlock()
+		return fmt.Errorf("codex app-server thread already bound to %q", current)
+	}
+	if s.transport == appServerTransportDaemon && s.writerLeaseKey == "" {
+		if !s.alive.Load() {
+			s.clearNotificationBufferLocked()
+			s.bindingMu.Unlock()
+			return fmt.Errorf("codex app-server connection closed before binding thread %q", threadID)
+		}
+		leaseKey := appServerDaemonWriterKey(s.socketPath, threadID)
+		if err := appServerDaemonWriters.acquire(leaseKey, s); err != nil {
+			s.clearNotificationBufferLocked()
+			s.bindingMu.Unlock()
+			return err
+		}
+		s.writerLeaseKey = leaseKey
+		if !s.alive.Load() {
+			appServerDaemonWriters.release(leaseKey, s)
+			s.writerLeaseKey = ""
+			s.clearNotificationBufferLocked()
+			s.bindingMu.Unlock()
+			return fmt.Errorf("codex app-server connection closed while binding thread %q", threadID)
+		}
+	}
+	s.threadID.Store(threadID)
+
+	now := time.Now()
+	if !s.bufferNotificationsTo.IsZero() && now.After(s.bufferNotificationsTo) {
+		s.bufferedNotifications = nil
+	} else if len(s.bufferedNotifications) > 0 {
+		matched := s.bufferedNotifications[:0]
+		for _, notification := range s.bufferedNotifications {
+			identity, ok := appServerMessageThreadIdentity(notification.params)
+			if ok && identity.ThreadID == threadID {
+				matched = append(matched, notification)
+			}
+		}
+		s.bufferedNotifications = matched
+	}
+	s.bufferNotifications = false
+	s.bufferNotificationsTo = time.Time{}
+	s.replayingNotifications = len(s.bufferedNotifications) > 0
+	s.bindingMu.Unlock()
+
+	s.replayBufferedNotifications()
+	return nil
+}
+
+func (s *appServerSession) unbindThread() {
+	s.bindingMu.Lock()
+	if s.writerLeaseKey != "" {
+		appServerDaemonWriters.release(s.writerLeaseKey, s)
+		s.writerLeaseKey = ""
+	}
+	s.threadID.Store("")
+	s.clearNotificationBufferLocked()
+	s.bindingMu.Unlock()
+}
+
+func (s *appServerSession) releaseWriterLease() {
+	s.bindingMu.Lock()
+	if s.writerLeaseKey != "" {
+		appServerDaemonWriters.release(s.writerLeaseKey, s)
+		s.writerLeaseKey = ""
+	}
+	s.bindingMu.Unlock()
+}
+
+func appServerDaemonWriterKey(socketPath, threadID string) string {
+	endpoint := strings.TrimSpace(socketPath)
+	if abs, err := filepath.Abs(endpoint); err == nil {
+		endpoint = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(endpoint); err == nil {
+		endpoint = resolved
+	}
+	return filepath.Clean(endpoint) + "\x00" + strings.TrimSpace(threadID)
+}
+
+func (r *appServerDaemonWriterRegistry) acquire(key string, owner *appServerSession) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if current := r.owners[key]; current != nil && current != owner {
+		return fmt.Errorf("%w: Codex thread %q", core.ErrAgentSessionWriterBusy, appServerWriterThreadID(key))
+	}
+	r.owners[key] = owner
+	return nil
+}
+
+func (r *appServerDaemonWriterRegistry) release(key string, owner *appServerSession) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.owners[key] == owner {
+		delete(r.owners, key)
+	}
+}
+
+func (r *appServerDaemonWriterRegistry) owns(key string, owner *appServerSession) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return key != "" && r.owners[key] == owner
+}
+
+func appServerWriterThreadID(key string) string {
+	if i := strings.LastIndexByte(key, 0); i >= 0 {
+		return key[i+1:]
+	}
+	return ""
+}
+
+func (s *appServerSession) replayBufferedNotifications() {
+	for {
+		s.bindingMu.Lock()
+		if len(s.bufferedNotifications) == 0 {
+			s.replayingNotifications = false
+			s.bindingMu.Unlock()
+			return
+		}
+		buffered := append([]appServerBufferedNotification(nil), s.bufferedNotifications...)
+		s.bufferedNotifications = nil
+		s.bindingMu.Unlock()
+
+		for _, notification := range buffered {
+			s.dispatchNotification(notification.method, notification.params)
+		}
+	}
 }
 
 func (s *appServerSession) threadStartRequestParams() map[string]any {
@@ -575,6 +789,9 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	if threadID == "" {
 		return fmt.Errorf("codex app-server thread id is empty")
 	}
+	if !s.ownsWriterLease() {
+		return fmt.Errorf("%w: Codex thread %q", core.ErrAgentSessionWriterBusy, threadID)
+	}
 
 	input := make([]map[string]any, 0, 1+len(imagePaths))
 	input = append(input, map[string]any{
@@ -610,11 +827,6 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	if resp.Turn.ID == "" {
 		return fmt.Errorf("codex app-server turn/start returned empty turn id")
 	}
-
-	s.stateMu.Lock()
-	s.currentTurn = resp.Turn.ID
-	s.pendingMsgs = s.pendingMsgs[:0]
-	s.stateMu.Unlock()
 
 	return nil
 }
@@ -668,6 +880,17 @@ func (s *appServerSession) handleServerRequest(probe map[string]json.RawMessage)
 		return
 	}
 	params := probe["params"]
+	if appServerThreadScopedServerRequest(method) {
+		if !s.ownsServerRequest(method, params) {
+			return
+		}
+	} else if s.transport == appServerTransportDaemon {
+		// A shared connection must never answer an unclassified server request:
+		// another daemon client may be its real owner. Known global requests are
+		// intentionally left to a dedicated daemon controller.
+		slog.Debug("codex app-server: ignoring unowned daemon server request", "method", method)
+		return
+	}
 
 	switch method {
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
@@ -684,6 +907,77 @@ func (s *appServerSession) handleServerRequest(probe map[string]json.RawMessage)
 			"error": map[string]any{"code": -32601, "message": "method not found"},
 		})
 	}
+}
+
+func appServerThreadScopedServerRequest(method string) bool {
+	switch method {
+	case "item/commandExecution/requestApproval",
+		"item/fileChange/requestApproval",
+		"item/permissions/requestApproval",
+		"item/tool/requestUserInput",
+		"item/tool/call",
+		"mcpServer/elicitation/request":
+		return true
+	default:
+		return false
+	}
+}
+
+func appServerServerRequestRequiresTurn(method string) bool {
+	// MCP elicitation allows a null turnId in the upstream schema, but this
+	// adapter has no safe owner correlation for that case. Treat it like every
+	// other passive server request and fail closed unless it matches the active
+	// turn exactly.
+	return appServerThreadScopedServerRequest(method)
+}
+
+func (s *appServerSession) ownsServerRequest(method string, paramsRaw json.RawMessage) bool {
+	identity, ok := appServerMessageThreadIdentity(paramsRaw)
+	if !ok {
+		slog.Warn("codex app-server: dropping server request without valid thread identity", "method", method)
+		return false
+	}
+
+	currentThread := s.CurrentSessionID()
+	if currentThread == "" || identity.ThreadID != currentThread {
+		slog.Debug("codex app-server: dropping server request for another thread",
+			"method", method,
+			"notification_thread", identity.ThreadID,
+			"session_thread", currentThread,
+		)
+		return false
+	}
+	if !s.ownsWriterLease() {
+		slog.Warn("codex app-server: dropping server request without writer lease", "method", method, "thread_id", currentThread)
+		return false
+	}
+	if !appServerServerRequestRequiresTurn(method) {
+		return true
+	}
+
+	s.stateMu.Lock()
+	ownedTurn := s.ownedTurn
+	s.stateMu.Unlock()
+	if identity.TurnID == "" || identity.TurnID != ownedTurn {
+		slog.Debug("codex app-server: dropping server request for inactive turn",
+			"method", method,
+			"request_turn", identity.TurnID,
+			"owned_turn", ownedTurn,
+			"thread_id", currentThread,
+		)
+		return false
+	}
+	return true
+}
+
+func appServerMessageThreadIdentity(paramsRaw json.RawMessage) (appServerThreadIdentity, bool) {
+	var identity appServerThreadIdentity
+	if len(paramsRaw) == 0 || json.Unmarshal(paramsRaw, &identity) != nil {
+		return appServerThreadIdentity{}, false
+	}
+	identity.ThreadID = strings.TrimSpace(identity.ThreadID)
+	identity.TurnID = strings.TrimSpace(identity.TurnID)
+	return identity, identity.ThreadID != ""
 }
 
 func (s *appServerSession) handleApprovalRequest(rawID json.RawMessage, method string, paramsRaw json.RawMessage) {
@@ -1078,11 +1372,22 @@ func (s *appServerSession) Close() error {
 	case <-done:
 	case <-time.After(2 * time.Second):
 	}
+	s.releaseWriterLease()
 
 	s.closeOnce.Do(func() {
 		close(s.events)
 	})
 	return nil
+}
+
+func (s *appServerSession) ownsWriterLease() bool {
+	if s.transport != appServerTransportDaemon {
+		return true
+	}
+	s.bindingMu.Lock()
+	key := s.writerLeaseKey
+	s.bindingMu.Unlock()
+	return appServerDaemonWriters.owns(key, s)
 }
 
 func (s *appServerSession) readLoop(r io.Reader) {
@@ -1162,7 +1467,14 @@ func (s *appServerSession) waitLoop() {
 }
 
 func (s *appServerSession) readWebSocketLoop(conn *websocket.Conn) {
-	defer s.wg.Done()
+	defer func() {
+		// A disconnected daemon client can no longer own the write side. Release
+		// its lease here as well as in Close so a replacement connection can
+		// resume the same thread without waiting for Engine cleanup.
+		s.releaseWriterLease()
+		s.alive.Store(false)
+		s.wg.Done()
+	}()
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -1173,11 +1485,17 @@ func (s *appServerSession) readWebSocketLoop(conn *websocket.Conn) {
 		messageType, data, err := conn.ReadMessage()
 		if err != nil {
 			if s.ctx.Err() == nil {
+				// Publish the dead state before EventError so Core cannot observe the
+				// failure and immediately retry while the stale lease is still held.
+				s.releaseWriterLease()
+				s.alive.Store(false)
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					slog.Warn("codex app-server websocket read failed", "error", err)
-					s.emitError(fmt.Errorf("codex app-server connection closed: %w", err))
 				}
-				s.alive.Store(false)
+				// Even a peer-initiated normal close ends this AgentSession. Surface
+				// it so a foreground/unsolicited reader does not wait forever on an
+				// event channel that intentionally stays open until Close.
+				s.emitError(fmt.Errorf("codex app-server connection closed: %w", err))
 				s.rejectPending(err)
 				s.rejectPendingApprovals(err)
 			}
@@ -1229,11 +1547,19 @@ func (s *appServerSession) handleResponse(resp rpcResponseEnvelope) {
 
 	s.pendingMu.Lock()
 	ch := s.pending[id]
+	method := s.pendingMethods[id]
 	delete(s.pending, id)
+	delete(s.pendingMethods, id)
 	s.pendingMu.Unlock()
 
 	if ch == nil {
 		return
+	}
+	if method == "turn/start" && resp.Error == nil {
+		var turnResp turnStartResponse
+		if json.Unmarshal(resp.Result, &turnResp) == nil && turnResp.Turn.ID != "" {
+			s.recordOwnedTurn(turnResp.Turn.ID)
+		}
 	}
 
 	select {
@@ -1243,15 +1569,116 @@ func (s *appServerSession) handleResponse(resp rpcResponseEnvelope) {
 }
 
 func (s *appServerSession) handleNotification(method string, paramsRaw json.RawMessage) {
+	switch classifyAppServerNotification(method) {
+	case appServerNotificationThread:
+		identity, ok := appServerMessageThreadIdentity(paramsRaw)
+		if !ok {
+			slog.Warn("codex app-server: dropping notification without valid thread identity", "method", method)
+			return
+		}
+		if !s.acceptThreadNotification(method, paramsRaw, identity.ThreadID) {
+			return
+		}
+	case appServerNotificationGlobal:
+		// Explicitly global notifications are safe to process on every daemon
+		// connection. All other handled notifications must pass the thread gate.
+	default:
+		return
+	}
+
+	s.dispatchNotification(method, paramsRaw)
+}
+
+type appServerNotificationScope uint8
+
+const (
+	appServerNotificationIgnored appServerNotificationScope = iota
+	appServerNotificationThread
+	appServerNotificationGlobal
+)
+
+func classifyAppServerNotification(method string) appServerNotificationScope {
+	switch method {
+	case "turn/started",
+		"item/started",
+		"item/completed",
+		"turn/completed",
+		"thread/status/changed",
+		"thread/tokenUsage/updated",
+		"error":
+		return appServerNotificationThread
+	case "account/rateLimits/updated":
+		return appServerNotificationGlobal
+	default:
+		return appServerNotificationIgnored
+	}
+}
+
+func (s *appServerSession) acceptThreadNotification(method string, paramsRaw json.RawMessage, threadID string) bool {
+	s.bindingMu.Lock()
+	currentThread := s.CurrentSessionID()
+	if currentThread != "" {
+		if threadID != currentThread {
+			s.bindingMu.Unlock()
+			slog.Debug("codex app-server: dropping notification for another thread",
+				"method", method,
+				"notification_thread", threadID,
+				"session_thread", currentThread,
+			)
+			return false
+		}
+		if s.replayingNotifications {
+			s.bufferNotificationLocked(method, paramsRaw)
+			s.bindingMu.Unlock()
+			return false
+		}
+		s.bindingMu.Unlock()
+		return true
+	}
+
+	if s.bufferNotifications && time.Now().Before(s.bufferNotificationsTo) {
+		s.bufferNotificationLocked(method, paramsRaw)
+		s.bindingMu.Unlock()
+		return false
+	}
+	if s.bufferNotifications {
+		s.clearNotificationBufferLocked()
+	}
+	s.bindingMu.Unlock()
+	slog.Debug("codex app-server: dropping notification before thread binding", "method", method, "notification_thread", threadID)
+	return false
+}
+
+func (s *appServerSession) bufferNotificationLocked(method string, paramsRaw json.RawMessage) {
+	if len(s.bufferedNotifications) >= appServerNotificationBufferMax {
+		slog.Warn("codex app-server: notification buffer full, dropping notification",
+			"method", method,
+			"max_notifications", appServerNotificationBufferMax,
+		)
+		return
+	}
+	s.bufferedNotifications = append(s.bufferedNotifications, appServerBufferedNotification{
+		method: method,
+		params: append(json.RawMessage(nil), paramsRaw...),
+	})
+}
+
+func (s *appServerSession) dispatchNotification(method string, paramsRaw json.RawMessage) {
 	switch method {
 	case "turn/started":
 		var notif turnNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+			accepted := false
 			s.stateMu.Lock()
-			s.currentTurn = notif.Turn.ID
-			s.pendingMsgs = s.pendingMsgs[:0]
+			if notif.Turn.ID != "" && notif.Turn.ID != s.completedTurn {
+				s.currentTurn = notif.Turn.ID
+				s.pendingMsgs = s.pendingMsgs[:0]
+				accepted = true
+			}
 			s.stateMu.Unlock()
-			s.storeContextUsage(nil)
+			if accepted {
+				s.storeContextUsage(nil)
+			}
 		}
 
 	case "item/started":
@@ -1269,7 +1696,7 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 	case "turn/completed":
 		var notif turnNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			s.completeTurn()
+			s.completeTurn(notif.Turn.ID)
 		}
 
 	case "thread/status/changed":
@@ -1281,7 +1708,7 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 		}
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil && notif.Status.Type == "idle" {
 			// In codex 0.125+, thread going idle signals turn completion.
-			s.completeTurn()
+			s.completeTurn("")
 		}
 
 	case "account/rateLimits/updated":
@@ -1298,8 +1725,14 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 
 	case "error":
 		var notif errorNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil && strings.TrimSpace(notif.Message) != "" {
-			s.emitError(fmt.Errorf("%s", notif.Message))
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+			message := strings.TrimSpace(notif.Error.Message)
+			if message == "" {
+				message = strings.TrimSpace(notif.Message)
+			}
+			if message != "" {
+				s.emitError(fmt.Errorf("%s", message))
+			}
 		}
 	}
 }
@@ -1651,13 +2084,42 @@ func rpcIDToInt64(v any) (int64, bool) {
 	return 0, false
 }
 
-func (s *appServerSession) completeTurn() {
+func (s *appServerSession) recordOwnedTurn(turnID string) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return
+	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.completedTurn == turnID {
+		return
+	}
+	s.currentTurn = turnID
+	s.ownedTurn = turnID
+	s.pendingMsgs = s.pendingMsgs[:0]
+}
+
+func (s *appServerSession) completeTurn(turnID string) {
+	turnID = strings.TrimSpace(turnID)
 	s.stateMu.Lock()
 	if s.currentTurn == "" {
+		if turnID != "" {
+			s.completedTurn = turnID
+		}
 		s.stateMu.Unlock()
 		return
 	}
+	if turnID != "" && turnID != s.currentTurn {
+		s.completedTurn = turnID
+		s.stateMu.Unlock()
+		return
+	}
+	completedTurn := s.currentTurn
 	s.currentTurn = ""
+	if s.ownedTurn == completedTurn {
+		s.ownedTurn = ""
+	}
+	s.completedTurn = completedTurn
 	s.stateMu.Unlock()
 	s.flushPendingAsText()
 	s.emit(core.Event{Type: core.EventResult, SessionID: s.CurrentSessionID(), Done: true})
@@ -1709,6 +2171,7 @@ func (s *appServerSession) rejectPending(err error) {
 	defer s.pendingMu.Unlock()
 	for id, ch := range s.pending {
 		delete(s.pending, id)
+		delete(s.pendingMethods, id)
 		select {
 		case ch <- rpcResponseEnvelope{ID: id, Error: &rpcError{Message: err.Error()}}:
 		default:
@@ -1728,7 +2191,11 @@ func (s *appServerSession) requestWithTimeout(method string, params any, out any
 	if s.pending == nil {
 		s.pending = make(map[int64]chan rpcResponseEnvelope)
 	}
+	if s.pendingMethods == nil {
+		s.pendingMethods = make(map[int64]string)
+	}
 	s.pending[id] = ch
+	s.pendingMethods[id] = method
 	s.pendingMu.Unlock()
 
 	payload := map[string]any{
@@ -1740,16 +2207,12 @@ func (s *appServerSession) requestWithTimeout(method string, params any, out any
 
 	deadline := time.Now().Add(timeout)
 	if err := s.writeJSONWithTimeout(method, payload, timeout); err != nil {
-		s.pendingMu.Lock()
-		delete(s.pending, id)
-		s.pendingMu.Unlock()
+		s.removePendingRequest(id)
 		return err
 	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		s.pendingMu.Lock()
-		delete(s.pending, id)
-		s.pendingMu.Unlock()
+		s.removePendingRequest(id)
 		return fmt.Errorf("%s timed out", method)
 	}
 
@@ -1768,13 +2231,19 @@ func (s *appServerSession) requestWithTimeout(method string, params any, out any
 		}
 		return nil
 	case <-ctxDone:
+		s.removePendingRequest(id)
 		return s.contextErr()
 	case <-timer.C:
-		s.pendingMu.Lock()
-		delete(s.pending, id)
-		s.pendingMu.Unlock()
+		s.removePendingRequest(id)
 		return fmt.Errorf("%s timed out", method)
 	}
+}
+
+func (s *appServerSession) removePendingRequest(id int64) {
+	s.pendingMu.Lock()
+	delete(s.pending, id)
+	delete(s.pendingMethods, id)
+	s.pendingMu.Unlock()
 }
 
 func (s *appServerSession) writeJSONWithTimeout(method string, v any, timeout time.Duration) error {

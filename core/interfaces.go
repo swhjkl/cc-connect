@@ -465,6 +465,10 @@ type ConversationTurn struct {
 	CompletedAt time.Time
 	Messages    []ConversationMessage
 	Activities  []ConversationActivity
+	// PresentationEvents uses the same sanitized event vocabulary as a live
+	// foreground turn. Providers should populate it when exact card parity is
+	// available; core derives a conservative fallback from Messages/Activities.
+	PresentationEvents []Event
 }
 
 // ConversationSnapshot is an authoritative, read-only view of an agent

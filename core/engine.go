@@ -4853,11 +4853,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	toolCount := 0
 	waitStart := time.Now()
 	firstEventLogged := false
-	var toolSteps []ToolStep
+	var richPresentation richTurnPresentation
 	var lastRichCardUpdate time.Time
 	var lastRichCardLen int
 	var cardMessageID any
-	var partialText string
 	triggerAutoCompress := false
 	pendingSend := sendDone
 
@@ -5073,7 +5072,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		// main codebase has no per-session quiet flag; pr309 referenced
 		// sessionQuiet which we drop. e.display.ThinkingMessages /
 		// ToolMessages handle user-level quiet in the fallback branches.
-		richCardSupporter, hasRichCard := p.(RichCardSupporter)
+		_, hasRichCard := p.(RichCardSupporter)
 		// Card 2.0 rich-card path is opt-in via [display] mode = "rich".
 		// Default "legacy" keeps upstream behavior for all platforms.
 		if e.display.CardMode != "rich" {
@@ -5087,7 +5086,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			return richMarkdownResolver.ResolveRichCardMarkdown(e.ctx, markdown, final)
 		}
 		buildResolvedRichCard := func(status CardStatus, title string, steps []ToolStep, markdown string, streaming bool, statusFooter string) string {
-			return richCardSupporter.BuildRichCard(status, title, steps, resolveRichCardMarkdown(markdown, !streaming), streaming, statusFooter)
+			card, _ := buildRichCardFrame(p, RichCardRenderOptions{
+				Status: status, Title: title, Steps: steps,
+				Markdown:  resolveRichCardMarkdown(markdown, !streaming),
+				Streaming: streaming, StatusFooter: statusFooter,
+			})
+			return card
 		}
 
 		switch event.Type {
@@ -5116,16 +5120,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if !e.display.ThinkingMessages {
 					break
 				}
-				if thinking := strings.TrimSpace(truncateIf(event.Content, e.display.ThinkingMaxLen)); thinking != "" {
-					toolSteps = append(toolSteps, ToolStep{
-						Kind:    ToolStepKindThinking,
-						Name:    "Thinking",
-						Summary: thinking,
-						Done:    true,
-					})
-				}
+				richPresentation.Apply(event, e.display)
 				if cardMessageID == nil {
-					card := buildResolvedRichCard(CardStatusThinking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+					card := buildResolvedRichCard(CardStatusThinking, "", richPresentation.Steps, richPresentation.Markdown, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 					if starter, ok := p.(PreviewStarter); ok {
 						handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 						if err != nil {
@@ -5135,7 +5132,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						}
 					}
 				} else if updater, ok := p.(MessageUpdater); ok {
-					card := buildResolvedRichCard(CardStatusThinking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+					card := buildResolvedRichCard(CardStatusThinking, "", richPresentation.Steps, richPresentation.Markdown, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 					if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 						slog.Debug("rich card: failed to update thinking card", "platform", p.Name(), "error", err)
 					}
@@ -5206,13 +5203,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if !e.display.ToolMessages {
 					break
 				}
-				toolSteps = append(toolSteps, ToolStep{
-					Kind:    ToolStepKindTool,
-					Name:    event.ToolName,
-					Summary: truncateIf(event.ToolInput, e.display.ToolMaxLen),
-				})
+				richPresentation.Apply(event, e.display)
 				if cardMessageID == nil {
-					card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+					card := buildResolvedRichCard(CardStatusWorking, "", richPresentation.Steps, richPresentation.Markdown, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 					if starter, ok := p.(PreviewStarter); ok {
 						handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 						if err != nil {
@@ -5222,7 +5215,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						}
 					}
 				} else if updater, ok := p.(MessageUpdater); ok {
-					card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+					card := buildResolvedRichCard(CardStatusWorking, "", richPresentation.Steps, richPresentation.Markdown, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 					if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 						slog.Debug("rich card: failed to update tool card", "platform", p.Name(), "error", err)
 					}
@@ -5340,9 +5333,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				if result != "" || event.ToolStatus != "" || event.ToolExitCode != nil || event.ToolSuccess != nil {
 					if hasRichCard {
-						toolSteps = mergeRichToolResult(toolSteps, event, result, e.display.ToolMaxLen)
+						richPresentation.Apply(event, e.display)
 						if cardMessageID == nil {
-							card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+							card := buildResolvedRichCard(CardStatusWorking, "", richPresentation.Steps, richPresentation.Markdown, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 							if starter, ok := p.(PreviewStarter); ok {
 								handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 								if err != nil {
@@ -5352,7 +5345,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 								}
 							}
 						} else if updater, ok := p.(MessageUpdater); ok {
-							card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+							card := buildResolvedRichCard(CardStatusWorking, "", richPresentation.Steps, richPresentation.Markdown, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 							if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 								slog.Debug("rich card: failed to update tool-result card", "platform", p.Name(), "error", err)
 							}
@@ -5411,7 +5404,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					if len(textParts) == 0 {
 						if hasRichCard {
 							if cardMessageID == nil && !silentHold {
-								card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+								card := buildResolvedRichCard(CardStatusWorking, "", richPresentation.Steps, richPresentation.Markdown, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 								if starter, ok := p.(PreviewStarter); ok {
 									handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 									if err != nil {
@@ -5426,16 +5419,18 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						}
 					}
 					textParts = append(textParts, content)
-					partialText += content
+					presentationEvent := event
+					presentationEvent.Content = content
+					richPresentation.Apply(presentationEvent, e.display)
 					if hasRichCard {
 						if !silentHold {
 							// Lazy creation: if we held during the first text events and
 							// only released this chunk, the initial-create branch above
 							// won't fire (textParts is non-empty by now). Build the card
-							// here using the accumulated partialText so the card emerges
+							// here using the accumulated presentation body so the card emerges
 							// with the post-prefix content already in body.
 							if cardMessageID == nil {
-								card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+								card := buildResolvedRichCard(CardStatusWorking, "", richPresentation.Steps, richPresentation.Markdown, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 								if starter, ok := p.(PreviewStarter); ok {
 									handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 									if err != nil {
@@ -5454,27 +5449,27 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 								throttleDur = 200 * time.Millisecond
 								throttleChars = 20
 							}
-							if cardMessageID != nil && (time.Since(lastRichCardUpdate) > throttleDur || len(partialText)-lastRichCardLen > throttleChars) {
+							if cardMessageID != nil && (time.Since(lastRichCardUpdate) > throttleDur || len(richPresentation.Markdown)-lastRichCardLen > throttleChars) {
 								// Prefer per-element streaming text update (cardkit-v1) when available;
 								// it engages Lark's native typewriter rendering. Falls back to
 								// full-card Patch on ErrNotSupported (handle without cardID) or any error.
 								streamed := false
 								if hasStreamer {
-									streamBody := resolveRichCardMarkdown(partialText, false)
+									streamBody := resolveRichCardMarkdown(richPresentation.Markdown, false)
 									if err := streamer.StreamRichCardText(e.ctx, cardMessageID, streamBody); err == nil {
 										lastRichCardUpdate = time.Now()
-										lastRichCardLen = len(partialText)
+										lastRichCardLen = len(richPresentation.Markdown)
 										streamed = true
 									} else if !errors.Is(err, ErrNotSupported) {
 										slog.Debug("rich card: streaming text update failed, falling back to full Patch", "platform", p.Name(), "error", err)
 									}
 								}
 								if !streamed {
-									card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+									card := buildResolvedRichCard(CardStatusWorking, "", richPresentation.Steps, richPresentation.Markdown, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 									if updater, ok := p.(MessageUpdater); ok {
 										if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err == nil {
 											lastRichCardUpdate = time.Now()
-											lastRichCardLen = len(partialText)
+											lastRichCardLen = len(richPresentation.Markdown)
 										} else {
 											slog.Debug("rich card: failed to update text card", "platform", p.Name(), "error", err)
 										}
@@ -5825,7 +5820,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// card would stay frozen in "Working" / "Thinking" header state forever
 				// (no Done flip, no Patch).
 				//
-				// Determine the visible body to finalize the card with. partialText
+				// Determine the visible body to finalize the card with. The presentation
 				// accumulates every EventText chunk this turn, so it captures any
 				// pre-NO_REPLY content the user already saw streaming (e.g. when the
 				// agent wrote "Hello\nNO_REPLY"). Strip the trailing NO_REPLY marker
@@ -5834,12 +5829,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// orphaned shell. Finalizing-in-place avoids the "撤回了一条消息"
 				// gray bar that DeletePreviewMessage would leave in Lark.
 				if hasRichCard && cardMessageID != nil {
-					silentBody := partialText
-					if stripped, ok := stripTrailingSilent(partialText); ok {
+					silentBody := richPresentation.Markdown
+					if stripped, ok := stripTrailingSilent(richPresentation.Markdown); ok {
 						silentBody = strings.TrimRight(stripped, " \t\r\n")
 					}
-					if silentBody != "" || len(toolSteps) > 0 {
-						card := buildResolvedRichCard(CardStatusDone, "", toolSteps, silentBody, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
+					if silentBody != "" || len(richPresentation.Steps) > 0 {
+						card := buildResolvedRichCard(CardStatusDone, "", richPresentation.Steps, silentBody, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
 						if updater, ok := p.(MessageUpdater); ok {
 							if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 								slog.Debug("rich card: failed to finalize card on silent reply", "platform", p.Name(), "error", err)
@@ -5865,7 +5860,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					richStatusFooter = formatElapsed(time.Since(turnStart), false, e.i18n.currentLang()) + "\n" + legacyStatusFooter
 				}
 				finalBody := resolveRichCardMarkdown(parts[0], true)
-				finalCard := richCardSupporter.BuildRichCard(CardStatusDone, "", toolSteps, finalBody, false, richStatusFooter)
+				finalCard, _ := buildRichCardFrame(p, RichCardRenderOptions{
+					Status: CardStatusDone, Steps: richPresentation.Steps,
+					Markdown: finalBody, StatusFooter: richStatusFooter,
+				})
 				if cardMessageID != nil {
 					// Forced final flush via cardkit-v1 streaming text update before
 					// flipping status to Done via full-card Patch. The throttle in the
@@ -5895,7 +5893,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				for _, overflow := range parts[1:] {
 					overflowBody := resolveRichCardMarkdown(overflow, true)
-					overflowCard := richCardSupporter.BuildRichCard(CardStatusDone, "", nil, overflowBody, false, richStatusFooter)
+					overflowCard, _ := buildRichCardFrame(p, RichCardRenderOptions{
+						Status: CardStatusDone, Markdown: overflowBody, StatusFooter: richStatusFooter,
+					})
 					if err := p.Send(e.ctx, replyCtx, overflowCard); err != nil {
 						slog.Error("failed to send overflow rich card", "error", err)
 						return
@@ -6079,10 +6079,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// Rich-mode per-turn state must reset too — otherwise EventText for
 				// the queued message would StreamRichCardText against the previous
 				// turn's cardID, overwriting that card's body with the new turn's
-				// content. Same risk for partialText/toolSteps leaking across turns.
+				// content. Same risk for presentation state leaking across turns.
 				cardMessageID = nil
-				toolSteps = nil
-				partialText = ""
+				richPresentation = richTurnPresentation{}
 				lastRichCardUpdate = time.Time{}
 				lastRichCardLen = 0
 				queuedRenderer := func(content string) string {
@@ -6161,7 +6160,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.eventsNeedResync = true
 			state.mu.Unlock()
 			if hasRichCard && cardMessageID != nil {
-				errCard := buildResolvedRichCard(CardStatusError, "", toolSteps, partialText, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
+				errCard := buildResolvedRichCard(CardStatusError, "", richPresentation.Steps, richPresentation.Markdown, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
 				if updater, ok := p.(MessageUpdater); ok {
 					if err := updater.UpdateMessage(e.ctx, cardMessageID, errCard); err != nil {
 						slog.Debug("rich card: failed to update error card", "platform", p.Name(), "error", err)
@@ -6269,13 +6268,27 @@ func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen in
 	}
 
 	idx := -1
-	for i := len(steps) - 1; i >= 0; i-- {
-		if steps[i].Kind == ToolStepKindThinking {
-			continue
+	itemID := strings.TrimSpace(event.ItemID)
+	if itemID != "" {
+		for i := len(steps) - 1; i >= 0; i-- {
+			if steps[i].Kind != ToolStepKindThinking && steps[i].ID == itemID {
+				idx = i
+				break
+			}
 		}
-		if strings.TrimSpace(steps[i].Name) == "" || strings.TrimSpace(steps[i].Name) == toolName {
-			idx = i
-			break
+	}
+	if idx == -1 {
+		for i := len(steps) - 1; i >= 0; i-- {
+			if steps[i].Kind == ToolStepKindThinking {
+				continue
+			}
+			if itemID != "" && steps[i].ID != "" {
+				continue
+			}
+			if strings.TrimSpace(steps[i].Name) == "" || strings.TrimSpace(steps[i].Name) == toolName {
+				idx = i
+				break
+			}
 		}
 	}
 	if idx == -1 {
@@ -6284,6 +6297,7 @@ func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen in
 			summary = truncateIf(summary, maxLen)
 		}
 		steps = append(steps, ToolStep{
+			ID:      itemID,
 			Kind:    ToolStepKindTool,
 			Name:    toolName,
 			Summary: summary,
@@ -6293,6 +6307,9 @@ func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen in
 
 	if strings.TrimSpace(steps[idx].Name) == "" {
 		steps[idx].Name = toolName
+	}
+	if steps[idx].ID == "" {
+		steps[idx].ID = itemID
 	}
 	if steps[idx].Kind == "" {
 		steps[idx].Kind = ToolStepKindTool

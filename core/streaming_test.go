@@ -67,6 +67,25 @@ func TestStreamPreview_BasicFlow(t *testing.T) {
 	}
 }
 
+func TestRichTurnPresentation_MergesToolResultsByItemID(t *testing.T) {
+	display := DisplayCfg{ThinkingMessages: true, ToolMessages: true, ThinkingMaxLen: 300, ToolMaxLen: 500}
+	presentation := richTurnPresentationFromEvents([]Event{
+		{Type: EventToolUse, ItemID: "tool-1", ToolName: "Bash", ToolInput: "first"},
+		{Type: EventToolUse, ItemID: "tool-2", ToolName: "Bash", ToolInput: "second"},
+		{Type: EventToolResult, ItemID: "tool-1", ToolName: "Bash", ToolResult: "first result", ToolStatus: "completed"},
+	}, display)
+
+	if len(presentation.Steps) != 2 {
+		t.Fatalf("steps = %#v, want two tool rows", presentation.Steps)
+	}
+	if first := presentation.Steps[0]; first.ID != "tool-1" || first.Result != "first result" || !first.Done {
+		t.Fatalf("first tool step = %#v", first)
+	}
+	if second := presentation.Steps[1]; second.ID != "tool-2" || second.Result != "" || second.Done {
+		t.Fatalf("second tool step = %#v", second)
+	}
+}
+
 func TestStreamPreview_ThrottlesUpdates(t *testing.T) {
 	mp := &mockUpdaterPlatform{}
 	cfg := StreamPreviewCfg{

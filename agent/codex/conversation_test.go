@@ -27,6 +27,40 @@ func TestAppServerMethodUnavailable(t *testing.T) {
 	}
 }
 
+func TestAppServerConversationPresentationEvents_MatchesLiveEventSemantics(t *testing.T) {
+	items := []map[string]any{
+		{"type": "agentMessage", "id": "commentary-1", "text": "Inspecting files"},
+		{
+			"type": "mcpToolCall", "id": "tool-1", "server": "workspace", "tool": "read_file",
+			"arguments": map[string]any{"path": "README.md"}, "result": map[string]any{"text": "contents"}, "status": "completed",
+		},
+		{"type": "reasoning", "id": "reasoning-1", "summary": []any{"Checking the result"}},
+		{"type": "agentMessage", "id": "answer-1", "text": "Done"},
+	}
+
+	events := appServerConversationPresentationEvents(items, core.ConversationTurnCompleted)
+	if len(events) != 5 {
+		t.Fatalf("presentation events = %#v, want thinking, tool use/result, thinking, text", events)
+	}
+	wantTypes := []core.EventType{
+		core.EventThinking, core.EventToolUse, core.EventToolResult, core.EventThinking, core.EventText,
+	}
+	for i, want := range wantTypes {
+		if events[i].Type != want {
+			t.Fatalf("event[%d].Type = %q, want %q; events=%#v", i, events[i].Type, want, events)
+		}
+	}
+	if events[1].ItemID != "tool-1" || events[1].ToolName != "MCP" || !strings.Contains(events[1].ToolInput, "workspace:read_file") {
+		t.Fatalf("tool-use event = %#v", events[1])
+	}
+	if events[2].ItemID != "tool-1" || events[2].ToolName != "read_file" || !strings.Contains(events[2].ToolResult, "contents") {
+		t.Fatalf("tool-result event = %#v", events[2])
+	}
+	if events[4].Content != "Done" {
+		t.Fatalf("final text event = %#v", events[4])
+	}
+}
+
 func TestAgentGetConversation_ReadsDaemonWithoutResumingThread(t *testing.T) {
 	daemon := newFakeSharedAppServerDaemon(t)
 	workDir := t.TempDir()
@@ -94,6 +128,19 @@ func TestAgentGetConversation_ReadsDaemonWithoutResumingThread(t *testing.T) {
 	}
 	if got := latest.Messages[0].ClientID; got != "message-marker" {
 		t.Fatalf("user message client marker = %q, want message-marker", got)
+	}
+	presentation := latest.PresentationEvents
+	if len(presentation) != 3 {
+		t.Fatalf("latest presentation events = %#v, want thinking, tool use, thinking", presentation)
+	}
+	if presentation[0].Type != core.EventThinking || presentation[0].Content != "Working on it." {
+		t.Fatalf("commentary presentation = %#v", presentation[0])
+	}
+	if presentation[1].Type != core.EventToolUse || presentation[1].ItemID != "tool-new" || presentation[1].ToolName != "Bash" || presentation[1].ToolInput != "cat /secret/path" {
+		t.Fatalf("tool presentation = %#v", presentation[1])
+	}
+	if presentation[2].Type != core.EventThinking || presentation[2].ItemID != "r-new" || presentation[2].Content != "private reasoning" {
+		t.Fatalf("reasoning presentation = %#v", presentation[2])
 	}
 	serialized := strings.Join([]string{
 		snapshot.Turns[0].Activities[0].Kind,

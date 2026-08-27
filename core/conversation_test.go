@@ -778,6 +778,61 @@ func TestConversationMirror_DefaultOnCreatesOneCardAndOneTerminalNotification(t 
 	}
 }
 
+func TestConversationMirror_RichCardReusesForegroundTurnPresentation(t *testing.T) {
+	code := 0
+	success := true
+	turn := ConversationTurn{
+		ID: "turn-external", Status: ConversationTurnCompleted,
+		Messages: []ConversationMessage{
+			{Role: "user", Content: "inspect the workspace"},
+			{Role: "assistant", Content: "Ran command: ls", Phase: "commentary"},
+			{Role: "assistant", Content: "The workspace is clean.", Phase: "final_answer"},
+		},
+		PresentationEvents: []Event{
+			{Type: EventThinking, ItemID: "reasoning-1", Content: "Inspecting the workspace"},
+			{Type: EventToolUse, ItemID: "tool-1", ToolName: "Bash", ToolInput: "ls"},
+			{
+				Type: EventToolResult, ItemID: "tool-1", ToolName: "Bash", ToolResult: "README.md",
+				ToolStatus: "completed", ToolExitCode: &code, ToolSuccess: &success,
+			},
+			{Type: EventText, ItemID: "answer-1", Content: "The workspace is clean."},
+		},
+	}
+	p := newMirrorTestPlatform()
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	markdown := e.renderTrackMarkdown(&ConversationSnapshot{}, turn)
+	e.renderTrackPayload(p, &ConversationSnapshot{SessionID: "thread-1"}, turn, markdown, "mirror:chat:admin")
+
+	p.trackMu.Lock()
+	if len(p.options) != 1 {
+		p.trackMu.Unlock()
+		t.Fatalf("rendered options = %d, want 1", len(p.options))
+	}
+	options := p.options[0]
+	p.trackMu.Unlock()
+
+	if len(options.Steps) != 2 {
+		t.Fatalf("steps = %#v, want one reasoning row and one merged tool row", options.Steps)
+	}
+	if options.Steps[0].Kind != ToolStepKindThinking || options.Steps[0].Summary != "Inspecting the workspace" {
+		t.Fatalf("reasoning step = %#v", options.Steps[0])
+	}
+	tool := options.Steps[1]
+	if tool.Kind != ToolStepKindTool || tool.ID != "tool-1" || tool.Summary != "ls" || tool.Result != "README.md" || !tool.Done {
+		t.Fatalf("tool step = %#v", tool)
+	}
+	for _, want := range []string{"inspect the workspace", "The workspace is clean."} {
+		if !strings.Contains(options.Markdown, want) {
+			t.Fatalf("rich markdown %q does not contain %q", options.Markdown, want)
+		}
+	}
+	for _, duplicate := range []string{"Ran command: ls", "Latest activity", "Turn status"} {
+		if strings.Contains(options.Markdown, duplicate) {
+			t.Fatalf("rich markdown duplicated progress text %q: %q", duplicate, options.Markdown)
+		}
+	}
+}
+
 func TestSetTrackCfg_ReenableResumesDefaultMirror(t *testing.T) {
 	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
 	p := newMirrorTestPlatform()

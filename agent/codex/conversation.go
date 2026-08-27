@@ -596,14 +596,91 @@ func mapAppServerConversationTurn(turn appServerConversationTurn) core.Conversat
 				})
 			}
 		case "reasoning":
-			// Reasoning is deliberately omitted from user-visible snapshots.
+			// Keep reasoning out of history messages. Its user-visible summary is
+			// projected through PresentationEvents below, matching the live card.
 		default:
 			if activity, ok := appServerConversationActivity(itemType, item, mapped.Status); ok {
 				mapped.Activities = append(mapped.Activities, activity)
 			}
 		}
 	}
+	mapped.PresentationEvents = appServerConversationPresentationEvents(turn.Items, mapped.Status)
 	return mapped
+}
+
+func appServerConversationPresentationEvents(items []map[string]any, turnStatus core.ConversationTurnStatus) []core.Event {
+	var events []core.Event
+	var pendingMessages []core.Event
+	flushPending := func(eventType core.EventType) {
+		for _, event := range pendingMessages {
+			event.Type = eventType
+			events = append(events, event)
+		}
+		pendingMessages = pendingMessages[:0]
+	}
+
+	for _, item := range items {
+		itemType := stringMapValue(item, "type")
+		itemID := stringMapValue(item, "id")
+		switch itemType {
+		case "userMessage", "plan", "hookPrompt", "contextCompaction":
+			continue
+		case "agentMessage":
+			text, _ := item["text"].(string)
+			if strings.TrimSpace(text) != "" {
+				pendingMessages = append(pendingMessages, core.Event{ItemID: itemID, Content: text})
+			}
+			continue
+		case "reasoning":
+			if text := appServerReasoningText(item); text != "" {
+				events = append(events, core.Event{Type: core.EventThinking, ItemID: itemID, Content: text})
+			}
+			continue
+		}
+
+		// The live app-server adapter flushes completed agent messages as
+		// thinking when the next tool starts. Reproduce that boundary before
+		// projecting the authoritative item into the same foreground events.
+		flushPending(core.EventThinking)
+		if event, ok := appServerToolUseEvent(item); ok {
+			event.ItemID = itemID
+			events = append(events, event)
+		}
+		if appServerConversationItemCompleted(item, turnStatus) {
+			if event, ok := appServerToolResultEvent(item); ok {
+				event.ItemID = itemID
+				events = append(events, event)
+			}
+		}
+	}
+
+	if conversationTurnStatusTerminal(turnStatus) {
+		flushPending(core.EventText)
+	}
+	return events
+}
+
+func appServerConversationItemCompleted(item map[string]any, turnStatus core.ConversationTurnStatus) bool {
+	status := normalizeConversationStatus(stringMapValue(item, "status"))
+	if status == "in_progress" {
+		return false
+	}
+	if status != "" {
+		return true
+	}
+	if stringMapValue(item, "type") == "webSearch" {
+		return true
+	}
+	return conversationTurnStatusTerminal(turnStatus)
+}
+
+func conversationTurnStatusTerminal(status core.ConversationTurnStatus) bool {
+	switch status {
+	case core.ConversationTurnCompleted, core.ConversationTurnFailed, core.ConversationTurnInterrupted:
+		return true
+	default:
+		return false
+	}
 }
 
 func appServerConversationActivity(itemType string, item map[string]any, turnStatus core.ConversationTurnStatus) (core.ConversationActivity, bool) {

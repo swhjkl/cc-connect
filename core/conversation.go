@@ -1484,6 +1484,69 @@ func (e *Engine) renderTrackMarkdown(snapshot *ConversationSnapshot, turn Conver
 	return strings.Join(sections, "\n\n")
 }
 
+func (e *Engine) conversationTurnPresentation(turn ConversationTurn) richTurnPresentation {
+	events := turn.PresentationEvents
+	if len(events) == 0 {
+		events = e.fallbackConversationPresentationEvents(turn)
+	}
+	return richTurnPresentationFromEvents(events, e.display)
+}
+
+func (e *Engine) fallbackConversationPresentationEvents(turn ConversationTurn) []Event {
+	var events []Event
+	var finalResponse string
+	for _, message := range turn.Messages {
+		if message.Role != "assistant" || strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(message.Phase)) {
+		case "final_answer", "finalanswer":
+			finalResponse = message.Content
+		case "commentary":
+			events = append(events, Event{Type: EventThinking, ItemID: message.ID, Content: message.Content})
+		case "":
+			finalResponse = message.Content
+		}
+	}
+	for _, activity := range turn.Activities {
+		name := strings.TrimSpace(activity.Name)
+		if name == "" {
+			name = e.trackActivityLabel(activity.Kind)
+		}
+		events = append(events, Event{
+			Type: EventToolUse, ItemID: activity.ID,
+			ToolName: name, ToolInput: activity.Summary,
+		})
+		status := normalizedTrackStatus(activity.Status)
+		if status != "in_progress" || activity.Result != "" || activity.ExitCode != nil || activity.Success != nil {
+			events = append(events, Event{
+				Type: EventToolResult, ItemID: activity.ID,
+				ToolName: name, ToolInput: activity.Summary, ToolResult: activity.Result,
+				ToolStatus: status, ToolExitCode: activity.ExitCode, ToolSuccess: activity.Success,
+			})
+		}
+	}
+	if strings.TrimSpace(finalResponse) != "" {
+		events = append(events, Event{Type: EventText, Content: finalResponse})
+	}
+	return events
+}
+
+func (e *Engine) renderRichTrackMarkdown(turn ConversationTurn, presentation richTurnPresentation) string {
+	prompt := e.renderTrackSection(conversationPrompt(turn))
+	if prompt == "" {
+		prompt = e.i18n.T(MsgTrackContentPending)
+	}
+	response := e.renderTrackSection(presentation.Markdown)
+	if response == "" {
+		response = e.i18n.T(MsgTrackContentPending)
+	}
+	return strings.Join([]string{
+		e.i18n.Tf(MsgTrackPromptSection, prompt),
+		e.i18n.Tf(MsgTrackResponseSection, response),
+	}, "\n\n")
+}
+
 func (e *Engine) renderTrackSection(content string) string {
 	content = strings.TrimSpace(content)
 	if len(content) <= trackSectionMaxBytes {
@@ -1513,31 +1576,13 @@ func truncateUTF8Bytes(content string, maxBytes int) string {
 }
 
 func (e *Engine) renderTrackPayload(p Platform, snapshot *ConversationSnapshot, turn ConversationTurn, markdown, sessionKey string) string {
-	rich, ok := p.(RichCardSupporter)
-	optionsRenderer, hasOptions := p.(RichCardOptionsSupporter)
+	_, ok := p.(RichCardSupporter)
+	_, hasOptions := p.(RichCardOptionsSupporter)
 	if !ok && !hasOptions {
 		return markdown
 	}
-	activities := turn.Activities
-	if e.display.Mode == "quiet" {
-		activities = nil
-	}
-	if len(activities) > 10 {
-		activities = activities[len(activities)-10:]
-	}
-	steps := make([]ToolStep, 0, len(activities))
-	for _, activity := range activities {
-		status := normalizedTrackStatus(activity.Status)
-		name := strings.TrimSpace(activity.Name)
-		if name == "" {
-			name = e.trackActivityLabel(activity.Kind)
-		}
-		steps = append(steps, ToolStep{
-			Name: name, Summary: activity.Summary, Result: activity.Result,
-			Status: status, ExitCode: activity.ExitCode, Success: activity.Success,
-			Done: status != "in_progress",
-		})
-	}
+	presentation := e.conversationTurnPresentation(turn)
+	richMarkdown := e.renderRichTrackMarkdown(turn, presentation)
 	footer := e.i18n.T(MsgTrackMirrorFooter)
 	if elapsed := e.trackElapsed(turn); elapsed != "" {
 		footer += "\n" + elapsed
@@ -1573,15 +1618,15 @@ func (e *Engine) renderTrackPayload(p Platform, snapshot *ConversationSnapshot, 
 	}
 	options := RichCardRenderOptions{
 		Status: status, Title: e.i18n.T(MsgTrackMirrorTitle), Variant: CardVariantMirror,
-		Steps: steps, Markdown: markdown, Streaming: streaming, StatusFooter: footer, Buttons: buttons,
+		Steps: presentation.Steps, Markdown: richMarkdown, Streaming: streaming, StatusFooter: footer, Buttons: buttons,
 	}
-	if hasOptions {
-		return optionsRenderer.BuildRichCardWithOptions(options)
+	if resolver, ok := p.(RichCardMarkdownResolver); ok && options.Markdown != "" {
+		options.Markdown = resolver.ResolveRichCardMarkdown(e.ctx, options.Markdown, !streaming)
 	}
-	if actions, ok := p.(RichCardActionSupporter); ok && len(buttons) > 0 {
-		return actions.BuildRichCardWithActions(status, options.Title, steps, markdown, streaming, footer, buttons)
+	if card, rendered := buildRichCardFrame(p, options); rendered {
+		return card
 	}
-	return rich.BuildRichCard(status, options.Title, steps, markdown, streaming, footer)
+	return markdown
 }
 
 func (e *Engine) replyTrackFallback(p Platform, replyCtx any, markdown string) {

@@ -1831,28 +1831,8 @@ func (s *appServerSession) handleItemStarted(notif itemNotification) {
 	}
 
 	s.flushPendingAsThinking()
-
-	switch itemType {
-	case "commandExecution":
-		command, _ := item["command"].(string)
-		s.emit(appServerItemEvent(notif, core.Event{Type: core.EventToolUse, ToolName: "Bash", ToolInput: command}))
-
-	case "mcpToolCall":
-		server, _ := item["server"].(string)
-		tool, _ := item["tool"].(string)
-		name := strings.Trim(strings.Join([]string{server, tool}, ":"), ":")
-		s.emit(appServerItemEvent(notif, core.Event{Type: core.EventToolUse, ToolName: "MCP", ToolInput: name + "\n" + appServerJSON(item["arguments"])}))
-
-	case "webSearch":
-		query, _ := item["query"].(string)
-		s.emit(appServerItemEvent(notif, core.Event{Type: core.EventToolUse, ToolName: "WebSearch", ToolInput: query}))
-
-	case "dynamicToolCall":
-		tool, _ := item["tool"].(string)
-		s.emit(appServerItemEvent(notif, core.Event{Type: core.EventToolUse, ToolName: tool, ToolInput: appServerJSON(item["arguments"])}))
-
-	case "fileChange":
-		s.emit(appServerItemEvent(notif, core.Event{Type: core.EventToolUse, ToolName: "Patch", ToolInput: appServerJSON(item["changes"])}))
+	if event, ok := appServerToolUseEvent(item); ok {
+		s.emit(appServerItemEvent(notif, event))
 	}
 }
 
@@ -1878,62 +1858,78 @@ func (s *appServerSession) handleItemCompleted(notif itemNotification) {
 			s.stateMu.Unlock()
 		}
 
+	default:
+		if event, ok := appServerToolResultEvent(item); ok {
+			s.emit(appServerItemEvent(notif, event))
+		}
+	}
+}
+
+func appServerToolUseEvent(item map[string]any) (core.Event, bool) {
+	switch itemType, _ := item["type"].(string); itemType {
 	case "commandExecution":
 		command, _ := item["command"].(string)
-		status, _ := item["status"].(string)
-		output, _ := item["aggregatedOutput"].(string)
+		return core.Event{Type: core.EventToolUse, ToolName: "Bash", ToolInput: command}, true
+	case "mcpToolCall":
+		server, _ := item["server"].(string)
+		tool, _ := item["tool"].(string)
+		name := strings.Trim(strings.Join([]string{server, tool}, ":"), ":")
+		return core.Event{Type: core.EventToolUse, ToolName: "MCP", ToolInput: name + "\n" + appServerJSON(item["arguments"])}, true
+	case "webSearch":
+		query, _ := item["query"].(string)
+		return core.Event{Type: core.EventToolUse, ToolName: "WebSearch", ToolInput: query}, true
+	case "dynamicToolCall":
+		tool, _ := item["tool"].(string)
+		return core.Event{Type: core.EventToolUse, ToolName: tool, ToolInput: appServerJSON(item["arguments"])}, true
+	case "fileChange":
+		return core.Event{Type: core.EventToolUse, ToolName: "Patch", ToolInput: appServerJSON(item["changes"])}, true
+	default:
+		return core.Event{}, false
+	}
+}
+
+func appServerToolResultEvent(item map[string]any) (core.Event, bool) {
+	switch itemType, _ := item["type"].(string); itemType {
+	case "commandExecution":
+		command, _ := item["command"].(string)
 		exitCode, hasExitCode := toInt(item["exitCode"])
 		var exitCodePtr *int
 		if hasExitCode {
 			exitCodePtr = &exitCode
 		}
+		status := stringMapValue(item, "status")
 		success := appServerToolSuccess(status, exitCodePtr)
-		s.emit(appServerItemEvent(notif, core.Event{
-			Type:         core.EventToolResult,
-			ToolName:     "Bash",
-			ToolInput:    command,
-			ToolResult:   truncate(strings.TrimSpace(output), 500),
-			ToolStatus:   strings.TrimSpace(status),
-			ToolExitCode: exitCodePtr,
-			ToolSuccess:  &success,
-		}))
-
+		return core.Event{
+			Type: core.EventToolResult, ToolName: "Bash", ToolInput: command,
+			ToolResult: truncate(stringMapValue(item, "aggregatedOutput"), 500),
+			ToolStatus: status, ToolExitCode: exitCodePtr, ToolSuccess: &success,
+		}, true
 	case "mcpToolCall":
-		tool, _ := item["tool"].(string)
-		status, _ := item["status"].(string)
+		status := stringMapValue(item, "status")
 		result := appServerJSON(item["result"])
 		if errText := appServerJSON(item["error"]); strings.TrimSpace(errText) != "" && result == "" {
 			result = errText
 		}
 		success := appServerToolSuccess(status, nil)
-		s.emit(appServerItemEvent(notif, core.Event{
-			Type:        core.EventToolResult,
-			ToolName:    tool,
-			ToolResult:  truncate(strings.TrimSpace(result), 500),
-			ToolStatus:  strings.TrimSpace(status),
-			ToolSuccess: &success,
-		}))
-
+		return core.Event{
+			Type: core.EventToolResult, ToolName: stringMapValue(item, "tool"),
+			ToolResult: truncate(strings.TrimSpace(result), 500), ToolStatus: status, ToolSuccess: &success,
+		}, true
 	case "webSearch":
-		query, _ := item["query"].(string)
-		s.emit(appServerItemEvent(notif, core.Event{
-			Type:       core.EventToolResult,
-			ToolName:   "WebSearch",
-			ToolResult: truncate(strings.TrimSpace(query), 500),
-		}))
-
+		return core.Event{
+			Type: core.EventToolResult, ToolName: "WebSearch",
+			ToolResult: truncate(stringMapValue(item, "query"), 500),
+		}, true
 	case "dynamicToolCall":
-		tool, _ := item["tool"].(string)
-		status, _ := item["status"].(string)
-		result := appServerDynamicToolText(item["contentItems"])
+		status := stringMapValue(item, "status")
 		success := appServerToolSuccess(status, nil)
-		s.emit(appServerItemEvent(notif, core.Event{
-			Type:        core.EventToolResult,
-			ToolName:    tool,
-			ToolResult:  truncate(strings.TrimSpace(result), 500),
-			ToolStatus:  strings.TrimSpace(status),
-			ToolSuccess: &success,
-		}))
+		return core.Event{
+			Type: core.EventToolResult, ToolName: stringMapValue(item, "tool"),
+			ToolResult: truncate(strings.TrimSpace(appServerDynamicToolText(item["contentItems"])), 500),
+			ToolStatus: status, ToolSuccess: &success,
+		}, true
+	default:
+		return core.Event{}, false
 	}
 }
 

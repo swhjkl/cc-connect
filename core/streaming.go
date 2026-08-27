@@ -63,6 +63,7 @@ const (
 
 // ToolStep is one summarized progress row shown in rich progress cards.
 type ToolStep struct {
+	ID       string       // immutable backend item identity, when available
 	Kind     ToolStepKind // progress row kind; empty means tool for backward compatibility
 	Name     string       // tool name (e.g. "Bash", "Edit")
 	Summary  string       // human-readable summary shown in the card
@@ -123,6 +124,96 @@ type RichCardRenderOptions struct {
 // retaining the legacy RichCardSupporter interfaces as a fallback.
 type RichCardOptionsSupporter interface {
 	BuildRichCardWithOptions(options RichCardRenderOptions) string
+}
+
+// richTurnPresentation is the shared, source-independent state consumed by
+// rich-card rendering. Foreground agent events and authoritative conversation
+// snapshots must both flow through Apply so their presentation cannot drift.
+type richTurnPresentation struct {
+	Steps    []ToolStep
+	Markdown string
+}
+
+func (p *richTurnPresentation) Apply(event Event, display DisplayCfg) {
+	switch event.Type {
+	case EventThinking:
+		if !display.ThinkingMessages || isEllipsisOnly(event.Content) {
+			return
+		}
+		thinking := strings.TrimSpace(truncateIf(event.Content, display.ThinkingMaxLen))
+		if thinking == "" {
+			return
+		}
+		p.Steps = append(p.Steps, ToolStep{
+			ID: event.ItemID, Kind: ToolStepKindThinking, Name: "Thinking",
+			Summary: thinking, Done: true,
+		})
+
+	case EventToolUse:
+		if !display.ToolMessages {
+			return
+		}
+		p.Steps = append(p.Steps, ToolStep{
+			ID: event.ItemID, Kind: ToolStepKindTool, Name: event.ToolName,
+			Summary: truncateIf(event.ToolInput, display.ToolMaxLen),
+		})
+
+	case EventToolResult:
+		if !display.ToolMessages {
+			return
+		}
+		result := strings.TrimSpace(event.ToolResult)
+		if result == "" {
+			result = strings.TrimSpace(event.Content)
+		}
+		if result != "" {
+			result = truncateIf(result, display.ToolMaxLen)
+		}
+		if result == "" && event.ToolStatus == "" && event.ToolExitCode == nil && event.ToolSuccess == nil {
+			return
+		}
+		p.Steps = mergeRichToolResult(p.Steps, event, result, display.ToolMaxLen)
+
+	case EventText:
+		content := event.Content
+		if display.HideAgentFooter {
+			content = stripAgentFooterLines(content)
+		}
+		if content != "" && !isEllipsisOnly(content) {
+			p.Markdown += content
+		}
+	}
+}
+
+func richTurnPresentationFromEvents(events []Event, display DisplayCfg) richTurnPresentation {
+	var presentation richTurnPresentation
+	for _, event := range events {
+		presentation.Apply(event, display)
+	}
+	return presentation
+}
+
+// buildRichCardFrame is the single rich-card renderer entry point used by
+// both foreground replies and mirrored external turns. Source-specific code
+// may choose options, but must not select a separate presentation renderer.
+func buildRichCardFrame(p Platform, options RichCardRenderOptions) (string, bool) {
+	if renderer, ok := p.(RichCardOptionsSupporter); ok {
+		return renderer.BuildRichCardWithOptions(options), true
+	}
+	rich, ok := p.(RichCardSupporter)
+	if !ok {
+		return "", false
+	}
+	if actions, ok := p.(RichCardActionSupporter); ok && len(options.Buttons) > 0 {
+		return actions.BuildRichCardWithActions(
+			options.Status, options.Title, options.Steps, options.Markdown,
+			options.Streaming, options.StatusFooter, options.Buttons,
+		), true
+	}
+	return rich.BuildRichCard(
+		options.Status, options.Title, options.Steps, options.Markdown,
+		options.Streaming, options.StatusFooter,
+	), true
 }
 
 // RichCardMarkdownResolver is an optional interface for platforms that need to

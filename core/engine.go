@@ -14519,7 +14519,7 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 		return
 	}
 
-	session := sessions.GetOrCreateActive(interactiveKey)
+	session := sessions.GetOrCreateActive(msg.SessionKey)
 	if !session.TryLock() {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return
@@ -14747,7 +14747,7 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 		return
 	}
 
-	session := sessions.GetOrCreateActive(interactiveKey)
+	session := sessions.GetOrCreateActive(msg.SessionKey)
 	if !session.TryLock() {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return

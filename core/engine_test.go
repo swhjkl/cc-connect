@@ -8338,6 +8338,7 @@ func TestCmdBindSetup_UsesSharedLogic(t *testing.T) {
 type stubStartSessionAgent struct {
 	calls   []string
 	failIDs map[string]error // session IDs that should fail
+	session AgentSession
 	mu      sync.Mutex
 }
 
@@ -8350,12 +8351,85 @@ func (a *stubStartSessionAgent) StartSession(_ context.Context, sessionID string
 	if err, ok := a.failIDs[sessionID]; ok {
 		return nil, err
 	}
+	if a.session != nil {
+		return a.session, nil
+	}
 	return &stubAgentSession{}, nil
 }
 func (a *stubStartSessionAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) {
 	return nil, nil
 }
 func (a *stubStartSessionAgent) Stop() error { return nil }
+
+func (a *stubStartSessionAgent) Calls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.calls...)
+}
+
+func setupWorkspaceCommandSession(t *testing.T) (*Engine, *stubPlatformEngine, *stubStartSessionAgent, *SessionManager, *Message, string) {
+	t.Helper()
+
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	e.SetMultiWorkspace(t.TempDir(), filepath.Join(t.TempDir(), "bindings.json"))
+
+	workspace := normalizeWorkspacePath(t.TempDir())
+	channelID := "command-session-key"
+	e.workspaceBindings.Bind("project:test", channelID, "channel", workspace)
+
+	agent := &stubStartSessionAgent{session: newResultAgentSession("done")}
+	ws := e.workspacePool.GetOrCreate(workspace)
+	ws.agent = agent
+	ws.sessions = NewSessionManager("")
+
+	msg := &Message{
+		SessionKey: "test:" + channelID + ":user1",
+		ReplyCtx:   "ctx",
+	}
+	ws.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("existing-agent-session", "stub")
+
+	return e, p, agent, ws.sessions, msg, workspace + ":" + msg.SessionKey
+}
+
+func waitForStartSessionCall(t *testing.T, agent *stubStartSessionAgent) []string {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if calls := agent.Calls(); len(calls) > 0 {
+			return calls
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for StartSession")
+	return nil
+}
+
+func TestExecuteCustomCommand_MultiWorkspaceReusesCurrentSessionKey(t *testing.T) {
+	e, p, agent, sessions, msg, interactiveKey := setupWorkspaceCommandSession(t)
+
+	e.executeCustomCommand(p, msg, &CustomCommand{Name: "finish", Prompt: "finish task"}, nil)
+
+	if calls := waitForStartSessionCall(t, agent); len(calls) != 1 || calls[0] != "existing-agent-session" {
+		t.Fatalf("StartSession calls = %v, want [existing-agent-session]", calls)
+	}
+	if got := sessions.ListSessions(interactiveKey); len(got) != 0 {
+		t.Fatalf("sessions under interactive key = %d, want 0", len(got))
+	}
+}
+
+func TestExecuteSkill_MultiWorkspaceReusesCurrentSessionKey(t *testing.T) {
+	e, p, agent, sessions, msg, interactiveKey := setupWorkspaceCommandSession(t)
+
+	e.executeSkill(p, msg, &Skill{Name: "task", Prompt: "finish task"}, []string{"finish"})
+
+	if calls := waitForStartSessionCall(t, agent); len(calls) != 1 || calls[0] != "existing-agent-session" {
+		t.Fatalf("StartSession calls = %v, want [existing-agent-session]", calls)
+	}
+	if got := sessions.ListSessions(interactiveKey); len(got) != 0 {
+		t.Fatalf("sessions under interactive key = %d, want 0", len(got))
+	}
+}
 
 func TestResumeFailureFallbackToFreshSession(t *testing.T) {
 	agent := &stubStartSessionAgent{

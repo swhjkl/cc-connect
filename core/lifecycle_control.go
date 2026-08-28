@@ -139,6 +139,12 @@ func (e *Engine) WorkspaceRoute(sessionKey, worktree string) (*WorkspaceMutation
 	if shared := e.workspaceBindings.LookupExact(sharedWorkspaceBindingsKey, channelKey); shared != nil {
 		return nil, lifecycleError("state_conflict", "shared route already controls this session")
 	}
+	if current := e.workspaceBindings.LookupExact("project:"+e.name, channelKey); current != nil {
+		currentWorktree, currentErr := canonicalWorktree(current.Workspace)
+		if currentErr == nil && currentWorktree == worktree {
+			return &WorkspaceMutationResult{Project: e.name, Session: sessionKey, Worktree: worktree, Changed: false, Status: "already_routed"}, nil
+		}
+	}
 	busy, err := e.sessionBusyAt(worktree, sessionKey)
 	if err != nil {
 		return nil, lifecycleError("internal_error", "open workspace context: %v", err)

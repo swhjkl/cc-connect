@@ -20,6 +20,10 @@ cc-connect sessions attach --project <project> --session <platform:chat:user> \
   --agent-session-id <exact-native-agent-session-id> --json
 ```
 
+Routing is idempotent: requesting the exact existing project worktree returns
+`status: "already_routed"` and `changed: false`, including while that task's
+session is busy. Busy protection still rejects new or different routing.
+
 Task closeout must use the compare-and-set form below. The native ID is the
 full agent thread/session ID; prefixes and display names are not accepted.
 

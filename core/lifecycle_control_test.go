@@ -110,6 +110,37 @@ func TestLifecycleWorkspaceUnbind_BusyExactCASPreservesActiveTurn(t *testing.T) 
 	}
 }
 
+func TestWorkspaceRoute_ExactExistingRouteIsIdempotentWhileBusy(t *testing.T) {
+	e, _, worktree, sessionKey, live := setupBusyCloseout(t)
+	result, err := e.WorkspaceRoute(sessionKey, worktree)
+	if err != nil {
+		t.Fatalf("exact busy route should be idempotent: %v", err)
+	}
+	if result.Changed || result.Status != "already_routed" || result.Worktree != worktree {
+		t.Fatalf("unexpected route result: %#v", result)
+	}
+	if live.closeCalls != 0 {
+		t.Fatal("idempotent route interrupted the active process")
+	}
+	if binding := e.workspaceBindings.LookupExact("project:project", "feishu:chat"); binding == nil || normalizeWorkspacePath(binding.Workspace) != worktree {
+		t.Fatalf("idempotent route changed binding: %#v", binding)
+	}
+}
+
+func TestWorkspaceRoute_NewRouteRemainsBlockedWhileTargetSessionBusy(t *testing.T) {
+	e, _, worktree, sessionKey, _ := setupBusyCloseout(t)
+	changed, err := e.workspaceBindings.UnbindCAS("project:project", "feishu:chat", worktree)
+	if err != nil || !changed {
+		t.Fatalf("remove existing route: changed=%v err=%v", changed, err)
+	}
+	if _, err := e.WorkspaceRoute(sessionKey, worktree); err == nil {
+		t.Fatal("new route succeeded while target session was busy")
+	}
+	if binding := e.workspaceBindings.LookupExact("project:project", "feishu:chat"); binding != nil {
+		t.Fatalf("busy route unexpectedly created binding: %#v", binding)
+	}
+}
+
 func TestSessionsAttach_SerializesRouteValidationAndPersistenceWithUnbind(t *testing.T) {
 	e, _, worktree, sessionKey, _ := setupBusyCloseout(t)
 	ws := e.workspacePool.Get(worktree)

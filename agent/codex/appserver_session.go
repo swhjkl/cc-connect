@@ -1136,16 +1136,7 @@ func (s *appServerSession) handleApprovalRequest(rawID json.RawMessage, method s
 	})
 
 	go func() {
-		timer := time.NewTimer(5 * time.Minute)
-		defer timer.Stop()
-		var result core.PermissionResult
-		select {
-		case result = <-ch:
-		case <-s.ctx.Done():
-			result = core.PermissionResult{Behavior: "deny"}
-		case <-timer.C:
-			result = core.PermissionResult{Behavior: "deny"}
-		}
+		result := waitForAppServerPermission(s.ctx, ch)
 		s.approvalsMu.Lock()
 		delete(s.pendingApprovals, requestID)
 		s.approvalsMu.Unlock()
@@ -1186,16 +1177,7 @@ func (s *appServerSession) handlePermissionsApproval(rawID json.RawMessage, para
 	})
 
 	go func() {
-		timer := time.NewTimer(5 * time.Minute)
-		defer timer.Stop()
-		var result core.PermissionResult
-		select {
-		case result = <-ch:
-		case <-s.ctx.Done():
-			result = core.PermissionResult{Behavior: "deny"}
-		case <-timer.C:
-			result = core.PermissionResult{Behavior: "deny"}
-		}
+		result := waitForAppServerPermission(s.ctx, ch)
 		s.approvalsMu.Lock()
 		delete(s.pendingApprovals, requestID)
 		s.approvalsMu.Unlock()
@@ -1262,16 +1244,7 @@ func (s *appServerSession) handleRequestUserInput(rawID json.RawMessage, paramsR
 	})
 
 	go func() {
-		timer := time.NewTimer(5 * time.Minute)
-		defer timer.Stop()
-		var result core.PermissionResult
-		select {
-		case result = <-ch:
-		case <-s.ctx.Done():
-			result = core.PermissionResult{Behavior: "deny"}
-		case <-timer.C:
-			result = core.PermissionResult{Behavior: "deny"}
-		}
+		result := waitForAppServerPermission(s.ctx, ch)
 		s.approvalsMu.Lock()
 		delete(s.pendingApprovals, requestID)
 		s.approvalsMu.Unlock()
@@ -1285,6 +1258,20 @@ func (s *appServerSession) handleRequestUserInput(rawID json.RawMessage, paramsR
 			"result": response,
 		})
 	}()
+}
+
+// waitForAppServerPermission deliberately has no client-side timeout. App
+// Server permission and user-input requests suspend the turn until a client
+// answers, another client wins the request, or the owning session is closed.
+// Core stops its idle timer while displaying the prompt, so expiring the RPC
+// here would leave a visible card pointing at a request that no longer exists.
+func waitForAppServerPermission(ctx context.Context, result <-chan core.PermissionResult) core.PermissionResult {
+	select {
+	case response := <-result:
+		return response
+	case <-ctx.Done():
+		return core.PermissionResult{Behavior: "deny"}
+	}
 }
 
 func (s *appServerSession) handleObservedRequestUserInput(rawID json.RawMessage, paramsRaw json.RawMessage) {

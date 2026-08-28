@@ -1843,6 +1843,52 @@ func TestAppServerSession_HandleRequestUserInputEmitsAskQuestion(t *testing.T) {
 	}
 }
 
+func TestWaitForAppServerPermission_WaitsForExplicitResolution(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	responses := make(chan core.PermissionResult)
+	done := make(chan core.PermissionResult, 1)
+	go func() {
+		done <- waitForAppServerPermission(ctx, responses)
+	}()
+
+	select {
+	case result := <-done:
+		t.Fatalf("permission wait resolved without a client response: %#v", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	responses <- core.PermissionResult{Behavior: "allow"}
+	select {
+	case result := <-done:
+		if result.Behavior != "allow" {
+			t.Fatalf("permission result = %#v, want allow", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("permission wait did not accept the explicit response")
+	}
+}
+
+func TestWaitForAppServerPermission_SessionCloseDenies(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	responses := make(chan core.PermissionResult)
+	done := make(chan core.PermissionResult, 1)
+	go func() {
+		done <- waitForAppServerPermission(ctx, responses)
+	}()
+
+	cancel()
+	select {
+	case result := <-done:
+		if result.Behavior != "deny" {
+			t.Fatalf("permission result = %#v, want deny", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("permission wait did not stop with the session")
+	}
+}
+
 func TestAppServerSession_HandleRequestUserInputWritesCodexResponse(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

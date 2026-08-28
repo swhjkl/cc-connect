@@ -29,9 +29,10 @@ const (
 type ProgressCardState string
 
 const (
-	ProgressCardStateRunning   ProgressCardState = "running"
-	ProgressCardStateCompleted ProgressCardState = "completed"
-	ProgressCardStateFailed    ProgressCardState = "failed"
+	ProgressCardStateRunning     ProgressCardState = "running"
+	ProgressCardStateCompleted   ProgressCardState = "completed"
+	ProgressCardStateFailed      ProgressCardState = "failed"
+	ProgressCardStateInterrupted ProgressCardState = "interrupted"
 )
 
 type ProgressCardEntryKind string
@@ -63,6 +64,8 @@ type ProgressCardPayload struct {
 	Entries   []string            `json:"entries,omitempty"` // legacy fallback
 	Items     []ProgressCardEntry `json:"items,omitempty"`   // ordered typed events
 	Truncated bool                `json:"truncated"`
+	Hint      string              `json:"hint,omitempty"`
+	Buttons   []CardButton        `json:"buttons,omitempty"`
 }
 
 // BuildProgressCardPayload encodes progress entries into a transport string.
@@ -91,6 +94,16 @@ func BuildProgressCardPayload(entries []string, truncated bool) string {
 
 // BuildProgressCardPayloadV2 encodes ordered typed progress events.
 func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState) string {
+	return buildProgressCardPayloadV2(items, truncated, agent, lang, state, "", nil)
+}
+
+// BuildProgressCardPayloadWithControls encodes typed progress events together
+// with optional controls for an exactly identified running turn.
+func BuildProgressCardPayloadWithControls(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState, hint string, buttons []CardButton) string {
+	return buildProgressCardPayloadV2(items, truncated, agent, lang, state, hint, buttons)
+}
+
+func buildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState, hint string, buttons []CardButton) string {
 	cleaned := make([]ProgressCardEntry, 0, len(items))
 	for _, item := range items {
 		text := strings.TrimSpace(item.Text)
@@ -123,6 +136,8 @@ func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent
 		State:     state,
 		Items:     cleaned,
 		Truncated: truncated,
+		Hint:      strings.TrimSpace(hint),
+		Buttons:   cloneProgressCardButtons(buttons),
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -177,6 +192,8 @@ func ParseProgressCardPayload(content string) (*ProgressCardPayload, bool) {
 	}
 	payload.Items = items
 	payload.Entries = legacy
+	payload.Hint = strings.TrimSpace(payload.Hint)
+	payload.Buttons = cloneProgressCardButtons(payload.Buttons)
 	if len(payload.Entries) == 0 && len(payload.Items) > 0 {
 		payload.Entries = make([]string, 0, len(payload.Items))
 		for _, item := range payload.Items {
@@ -184,6 +201,30 @@ func ParseProgressCardPayload(content string) (*ProgressCardPayload, bool) {
 		}
 	}
 	return &payload, true
+}
+
+func cloneProgressCardButtons(buttons []CardButton) []CardButton {
+	if len(buttons) == 0 {
+		return nil
+	}
+	cloned := make([]CardButton, 0, len(buttons))
+	for _, button := range buttons {
+		button.Text = strings.TrimSpace(button.Text)
+		button.Type = strings.TrimSpace(button.Type)
+		button.Value = strings.TrimSpace(button.Value)
+		if button.Text == "" || button.Value == "" {
+			continue
+		}
+		if len(button.Extra) > 0 {
+			extra := make(map[string]string, len(button.Extra))
+			for key, value := range button.Extra {
+				extra[key] = value
+			}
+			button.Extra = extra
+		}
+		cloned = append(cloned, button)
+	}
+	return cloned
 }
 
 func inferLegacyEntryKind(entry string) ProgressCardEntryKind {
@@ -218,15 +259,18 @@ type compactProgressWriter struct {
 	style      string
 	usePayload bool
 
-	content    string
-	entries    []string
-	items      []ProgressCardEntry
-	state      ProgressCardState
-	agentName  string
-	lang       Language
-	truncated  bool
-	lastSent   string
-	maxEntries int
+	content        string
+	entries        []string
+	items          []ProgressCardEntry
+	state          ProgressCardState
+	agentName      string
+	lang           Language
+	truncated      bool
+	hint           string
+	buttons        []CardButton
+	lastSent       string
+	maxEntries     int
+	handleObserver func(any)
 
 	// Throttle message edits to avoid platform rate limits (e.g. Discord ~5 edits/5s).
 	minUpdateInterval time.Duration
@@ -425,7 +469,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 		}
 		w.truncated = truncated
 		if w.usePayload {
-			w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state)
+			w.content = BuildProgressCardPayloadWithControls(w.items, w.truncated, w.agentName, w.lang, w.state, w.hint, w.buttons)
 			if w.content == "" {
 				slog.Warn("progress writer: failed to build structured payload", "platform", w.platform.Name())
 				w.failed = true
@@ -461,6 +505,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 			w.handle = handle
 			w.lastSent = w.content
 			w.lastUpdateAt = time.Now()
+			w.notifyHandleObserver()
 			return true
 		}
 		callCtx, cancel := w.withAPITimeout()
@@ -474,6 +519,7 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 		w.handle = w.replyCtx
 		w.lastSent = w.content
 		w.lastUpdateAt = time.Now()
+		w.notifyHandleObserver()
 		return true
 	}
 
@@ -486,6 +532,51 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 	cancel()
 	if err != nil {
 		slog.Warn("progress writer: UpdateMessage failed", "platform", w.platform.Name(), "style", w.style, "error", err)
+		w.failed = true
+		return false
+	}
+	w.lastSent = w.content
+	w.lastUpdateAt = time.Now()
+	return true
+}
+
+// SetHandleObserver registers a callback for the platform handle backing the
+// progress card. The callback is invoked synchronously and at most once per
+// registration, including immediately when the card already exists.
+func (w *compactProgressWriter) SetHandleObserver(observer func(any)) {
+	w.handleObserver = observer
+	w.notifyHandleObserver()
+}
+
+func (w *compactProgressWriter) notifyHandleObserver() {
+	if w.handleObserver == nil || w.handle == nil {
+		return
+	}
+	observer := w.handleObserver
+	w.handleObserver = nil
+	observer(w.handle)
+}
+
+// SetControls updates the running progress card with an optional hint and
+// action buttons. Controls are never retained on a terminal card.
+func (w *compactProgressWriter) SetControls(hint string, buttons []CardButton) bool {
+	if !w.enabled || w.failed || w.style != progressStyleCard || !w.usePayload || w.state != ProgressCardStateRunning {
+		return false
+	}
+	w.hint = strings.TrimSpace(hint)
+	w.buttons = cloneProgressCardButtons(buttons)
+	if len(w.items) == 0 {
+		return true
+	}
+	w.content = BuildProgressCardPayloadWithControls(w.items, w.truncated, w.agentName, w.lang, w.state, w.hint, w.buttons)
+	if w.content == "" || w.handle == nil || w.content == w.lastSent {
+		return w.content != ""
+	}
+	callCtx, cancel := w.withAPITimeout()
+	err := w.updater.UpdateMessage(callCtx, w.handle, w.content)
+	cancel()
+	if err != nil {
+		slog.Warn("progress writer: SetControls UpdateMessage failed", "platform", w.platform.Name(), "style", w.style, "error", err)
 		w.failed = true
 		return false
 	}
@@ -507,7 +598,9 @@ func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
 		return true
 	}
 	w.state = state
-	w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state)
+	w.hint = ""
+	w.buttons = nil
+	w.content = BuildProgressCardPayloadWithControls(w.items, w.truncated, w.agentName, w.lang, w.state, "", nil)
 	if w.content == "" || w.content == w.lastSent {
 		return w.content != ""
 	}

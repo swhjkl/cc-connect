@@ -430,6 +430,11 @@ func (p *Platform) ProgressStyle() string { return p.progressStyle }
 
 func (p *Platform) SupportsProgressCardPayload() bool { return true }
 
+// SupportsExactTurnCards reports whether this instance can receive verified
+// card callbacks. Plain-text mode can render progress but has no safe action
+// callback path, so exact turn controls remain hidden there.
+func (p *Platform) SupportsExactTurnCards() bool { return p.useInteractiveCard }
+
 func (p *Platform) tag() string { return p.platformName }
 
 func (p *Platform) dispatchPlatform() core.Platform {
@@ -657,6 +662,7 @@ func (p *Platform) webhookHandler(w http.ResponseWriter, r *http.Request) {
 // Three prefixes are supported:
 //   - nav:/xxx   — render a card page and update the original card in-place
 //   - act:/xxx   — execute an action, then render and update the card in-place
+//   - turn:xxx   — dispatch a verified exact-turn action without replacing the card
 //   - cmd:/xxx   — legacy: dispatch as a user command (sends a new message)
 func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
 	if event.Event == nil || event.Event.Action == nil {
@@ -694,6 +700,10 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 	userID := ""
 	if event.Event.Operator != nil {
 		userID = event.Event.Operator.OpenID
+	}
+	if !core.AllowList(p.allowFrom, userID) {
+		slog.Debug(p.tag()+": card action from unauthorized user", "user", userID)
+		return nil, nil
 	}
 	chatID := ""
 	messageID := ""
@@ -844,6 +854,26 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 				Data: renderCardMap(cb.Build(), sessionKey),
 			},
 		}, nil
+	}
+
+	// turn: — exact native turn-card action. Core validates the opaque token,
+	// source card message ID, session, thread, turn, and execution generation
+	// before it invokes any backend capability. A typed look-alike message does
+	// not carry IsCardAction and is therefore ignored by this control path.
+	if strings.HasPrefix(actionVal, "turn:") {
+		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+		go p.dispatchCoreMessage(&core.Message{
+			SessionKey:          sessionKey,
+			Platform:            p.platformName,
+			ReferencedMessageID: messageID,
+			UserID:              userID,
+			UserName:            p.resolveUserName(userID),
+			ChatName:            p.resolveChatName(chatID),
+			Content:             actionVal,
+			ReplyCtx:            rctx,
+			IsCardAction:        true,
+		})
+		return nil, nil
 	}
 
 	// cmd: — async command dispatch, with optional in-place card replacement
@@ -4093,21 +4123,64 @@ func progressAgentLabel(agent string) string {
 }
 
 func progressStateMeta(state core.ProgressCardState, lang string, agent string) (title string, template string, footer string) {
+	language := strings.ToLower(strings.TrimSpace(lang))
 	zh := isZhLikeProgressLang(lang)
+	traditional := language == "zh-tw" || language == "zh_hk" || language == "zh-hk"
 	switch state {
 	case core.ProgressCardStateCompleted:
 		if zh {
+			if traditional {
+				return fmt.Sprintf("%s · 已完成", agent), "green", "本過程卡片已停止更新，完整回覆見下一則訊息。"
+			}
 			return fmt.Sprintf("%s · 已完成", agent), "green", "本过程卡片已停止更新，完整答复见下一条消息。"
+		}
+		if language == "ja" {
+			return fmt.Sprintf("%s · 完了", agent), "green", "この進捗カードの更新は終了しました。完全な回答は次のメッセージにあります。"
+		}
+		if language == "es" {
+			return fmt.Sprintf("%s · Completado", agent), "green", "Esta tarjeta de progreso dejó de actualizarse. La respuesta completa está en el siguiente mensaje."
 		}
 		return fmt.Sprintf("%s · Completed", agent), "green", "This progress card is no longer updating. Full response is in the next message."
 	case core.ProgressCardStateFailed:
 		if zh {
+			if traditional {
+				return fmt.Sprintf("%s · 失敗", agent), "red", "本過程卡片已停止更新（失敗），完整錯誤說明見下一則訊息。"
+			}
 			return fmt.Sprintf("%s · 失败", agent), "red", "本过程卡片已停止更新（失败），完整错误说明见下一条消息。"
 		}
+		if language == "ja" {
+			return fmt.Sprintf("%s · 失敗", agent), "red", "この進捗カードは失敗状態で停止しました。詳細は次のメッセージにあります。"
+		}
+		if language == "es" {
+			return fmt.Sprintf("%s · Error", agent), "red", "Esta tarjeta de progreso se detuvo por un error. Consulta el siguiente mensaje para ver los detalles."
+		}
 		return fmt.Sprintf("%s · Failed", agent), "red", "This progress card has stopped (failed). See the next message for details."
+	case core.ProgressCardStateInterrupted:
+		if zh {
+			if traditional {
+				return fmt.Sprintf("%s · 已中止", agent), "orange", "本過程卡片已停止更新（已中止）；已產生的過程資訊保留如下。"
+			}
+			return fmt.Sprintf("%s · 已中止", agent), "orange", "本过程卡片已停止更新（已中止）；已产生的过程信息保留如下。"
+		}
+		if language == "ja" {
+			return fmt.Sprintf("%s · 中断", agent), "orange", "この進捗カードは中断されました。既に生成された進捗は以下に保持されています。"
+		}
+		if language == "es" {
+			return fmt.Sprintf("%s · Interrumpido", agent), "orange", "Esta tarjeta de progreso fue interrumpida; el progreso ya generado se conserva abajo."
+		}
+		return fmt.Sprintf("%s · Interrupted", agent), "orange", "This progress card was interrupted; progress produced so far is preserved below."
 	default:
 		if zh {
+			if traditional {
+				return fmt.Sprintf("%s · 進行中", agent), "blue", ""
+			}
 			return fmt.Sprintf("%s · 进行中", agent), "blue", ""
+		}
+		if language == "ja" {
+			return fmt.Sprintf("%s · 実行中", agent), "blue", ""
+		}
+		if language == "es" {
+			return fmt.Sprintf("%s · En curso", agent), "blue", ""
 		}
 		return fmt.Sprintf("%s · Running", agent), "blue", ""
 	}
@@ -4508,6 +4581,18 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 	}
 
 	elements = appendProgressGroupedElements(elements, items, payload.Lang, running)
+	if running && strings.TrimSpace(payload.Hint) != "" {
+		elements = append(elements, map[string]any{"tag": "hr"})
+		elements = append(elements, map[string]any{
+			"tag": "div",
+			"text": map[string]any{
+				"tag":        "plain_text",
+				"content":    strings.TrimSpace(payload.Hint),
+				"text_size":  "notation",
+				"text_color": "grey",
+			},
+		})
+	}
 	if footer != "" {
 		elements = append(elements, map[string]any{"tag": "hr"})
 		elements = append(elements, map[string]any{
@@ -4538,7 +4623,13 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 		},
 	}
 	b, _ := json.Marshal(card)
-	return string(b)
+	cardJSON := string(b)
+	if running && len(payload.Buttons) > 0 {
+		if withActions, err := appendRichCardActions(cardJSON, payload.Buttons); err == nil {
+			return withActions
+		}
+	}
+	return cardJSON
 }
 
 func buildPreviewCardJSON(content string) string {

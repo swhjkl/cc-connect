@@ -179,6 +179,65 @@ func TestBuildAndParseProgressCardPayloadV2(t *testing.T) {
 	}
 }
 
+func TestCompactProgressWriter_ControlsAppearOnlyWhileRunning(t *testing.T) {
+	p := &previewCapturePlatform{}
+	replyCtx := progressHintReplyCtx{style: progressStyleCard, payload: true}
+	w := newCompactProgressWriter(context.Background(), p, replyCtx, "codex", LangChinese, nil)
+
+	handles := make([]any, 0, 1)
+	w.SetHandleObserver(func(handle any) { handles = append(handles, handle) })
+	if !w.AppendEvent(ProgressEntryThinking, "检查中", "", "检查中") {
+		t.Fatal("AppendEvent() = false, want true")
+	}
+	if len(handles) != 1 || handles[0] != "preview-1" {
+		t.Fatalf("observed handles = %#v", handles)
+	}
+	button := CardButton{Text: "中止当前任务", Type: "danger", Value: "turn:interrupt:token", Extra: map[string]string{"session_key": "feishu:chat:user"}}
+	if !w.SetControls("回复此卡片可向当前任务追加指令。", []CardButton{button}) {
+		t.Fatal("SetControls() = false, want true")
+	}
+	if len(p.updated) != 1 {
+		t.Fatalf("control updates = %d, want 1", len(p.updated))
+	}
+	running, ok := ParseProgressCardPayload(p.updated[0])
+	if !ok {
+		t.Fatalf("control payload did not parse: %q", p.updated[0])
+	}
+	if running.Hint == "" || len(running.Buttons) != 1 || running.Buttons[0].Value != button.Value {
+		t.Fatalf("running controls = hint %q buttons %#v", running.Hint, running.Buttons)
+	}
+
+	if !w.Finalize(ProgressCardStateInterrupted) {
+		t.Fatal("Finalize(interrupted) = false, want true")
+	}
+	terminal, ok := ParseProgressCardPayload(p.updated[len(p.updated)-1])
+	if !ok {
+		t.Fatalf("terminal payload did not parse: %q", p.updated[len(p.updated)-1])
+	}
+	if terminal.State != ProgressCardStateInterrupted || terminal.Hint != "" || len(terminal.Buttons) != 0 {
+		t.Fatalf("terminal payload = state %q hint %q buttons %#v", terminal.State, terminal.Hint, terminal.Buttons)
+	}
+}
+
+func TestProgressCardStateFromResult(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		metadata map[string]any
+		want     ProgressCardState
+	}{
+		{name: "default completed", want: ProgressCardStateCompleted},
+		{name: "completed", metadata: map[string]any{"turn_status": "completed"}, want: ProgressCardStateCompleted},
+		{name: "failed", metadata: map[string]any{"turn_status": "failed"}, want: ProgressCardStateFailed},
+		{name: "cancelled aliases interrupted", metadata: map[string]any{"turn_status": "cancelled"}, want: ProgressCardStateInterrupted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := progressCardStateFromResult(Event{Metadata: test.metadata}); got != test.want {
+				t.Fatalf("progressCardStateFromResult() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestParseProgressCardPayloadRejectsInvalid(t *testing.T) {
 	if _, ok := ParseProgressCardPayload("plain text"); ok {
 		t.Fatal("expected parse failure for plain text")

@@ -446,6 +446,10 @@ type Message struct {
 	// "allow"/"deny" typed by a real user must NOT set this flag — they
 	// continue to flow through the regular message handler.
 	IsPermissionResponse bool
+	// IsCardAction marks content synthesized by a verified platform card
+	// callback. Native turn controls require this bit and never accept an
+	// equivalent string typed as an ordinary chat message.
+	IsCardAction bool
 	// UserMessageTimeMs is the platform message creation time in Unix milliseconds
 	// when known (e.g. Feishu im.message.message_received create_time). Used to
 	// drop late redeliveries that reuse a new message_id but an older create_time

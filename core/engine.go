@@ -477,6 +477,7 @@ type Engine struct {
 	trackers            map[string]*conversationTracker // key = interactive session key
 	trackCfg            TrackCfg
 	trackStore          *trackStateStore
+	turnCards           *turnCardStore
 	conversationMirrors map[string]*conversationMirror // key = stable proactive destination
 	trackClientSeq      atomic.Uint64
 
@@ -543,6 +544,7 @@ type interactiveState struct {
 	replyCtx                   any
 	currentMessageID           string
 	currentClientUserMessageID string
+	currentSessionKey          string
 	lastRecallProbeMessageID   string
 	lastRecallProbeAt          time.Time
 	recallProbeInFlight        bool
@@ -561,6 +563,9 @@ type interactiveState struct {
 	pendingProviderAdd         *pendingProviderAddState
 	lastAutoCompressAt         time.Time
 	lastAutoCompressTokens     int
+	currentThreadID            string
+	currentTurnID              string
+	currentTurnGeneration      uint64
 
 	// Unsolicited event reader: a background goroutine that consumes agent
 	// events between user-initiated turns (e.g. background task completions).
@@ -768,6 +773,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		trackers:              make(map[string]*conversationTracker),
 		trackCfg:              DefaultTrackCfg(),
 		trackStore:            newTrackStateStore(trackStatePath(sessionStorePath)),
+		turnCards:             newTurnCardStore(turnCardStatePath(sessionStorePath)),
 		conversationMirrors:   make(map[string]*conversationMirror),
 		sendWorkDirs:          make(map[string]string),
 		platformReady:         make(map[Platform]bool),
@@ -3025,6 +3031,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		agent = wsAgent
 		interactiveKey = resolvedWorkspace + ":" + msg.SessionKey
 	}
+	if e.handleTurnCardAction(p, msg, content, agent, sessions, interactiveKey) {
+		return
+	}
 
 	if len(msg.Images) == 0 && strings.HasPrefix(content, "/") {
 		if e.handleCommand(p, msg, content) {
@@ -3076,6 +3085,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	}
 
 	if e.discardStaleUserMessageIfNeeded(interactiveKey, msg) {
+		return
+	}
+	if e.handleTurnCardReply(p, msg, directContent, agent, sessions, interactiveKey) {
 		return
 	}
 	if e.handleTrackedConversationInput(p, msg, directContent, agent, sessions) {
@@ -3812,6 +3824,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.platform = p
 	state.replyCtx = msg.ReplyCtx
 	state.currentMessageID = msg.MessageID
+	state.currentSessionKey = msg.SessionKey
 	state.currentTurnUserMessageTimeMs = msg.UserMessageTimeMs
 	state.mu.Unlock()
 	stopRecallMonitor := e.startMessageRecallMonitor(interactiveKey)
@@ -4881,6 +4894,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	if replyAgent == nil {
 		replyAgent = e.agent
 	}
+	progressPlatform := state.platform
+	logicalSessionKey := state.currentSessionKey
 	workspaceRenderer := func(content string) string {
 		return e.renderOutgoingContentForWorkspace(state.platform, content, workspaceDir)
 	}
@@ -4906,8 +4921,27 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 	}
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, workspaceRenderer)
-	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
+	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, replyAgent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
 	state.mu.Unlock()
+
+	var turnCard *activeTurnCard
+	observeProgressHandle := func() {
+		writer := cp
+		platform := progressPlatform
+		writer.SetHandleObserver(func(handle any) {
+			e.activateTurnCard(platform, writer, turnCard, handle)
+		})
+	}
+	observeProgressHandle()
+	finishTurnCard := func(status ProgressCardState) {
+		e.finishActiveTurnCard(state, cp, turnCard, status)
+		turnCard = nil
+	}
+	defer func() {
+		if turnCard != nil {
+			e.expireActiveTurnCard(state, turnCard)
+		}
+	}()
 
 	// Send instant confirmation reply if enabled and no streaming card is active.
 	// Streaming cards provide their own "processing" indicator, so instant reply
@@ -4946,6 +4980,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		select {
 		case <-stopCh:
+			finishTurnCard(ProgressCardStateInterrupted)
 			sp.discard()
 			return
 		case event, ok = <-events:
@@ -4956,6 +4991,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			pendingSend = nil
 			if err != nil {
 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
+				finishTurnCard(ProgressCardStateFailed)
 				sp.discard()
 				if stopTyping != nil {
 					stopTyping()
@@ -4975,7 +5011,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		case <-idleCh:
 			slog.Error("agent session idle timeout: no events for too long, killing session",
 				"session_key", sessionKey, "timeout", e.eventIdleTimeout, "elapsed", time.Since(turnStart))
-			cp.Finalize(ProgressCardStateFailed)
+			finishTurnCard(ProgressCardStateFailed)
 			sp.discard()
 			state.mu.Lock()
 			state.eventsNeedResync = true
@@ -4988,7 +5024,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			elapsed := time.Since(turnStart)
 			slog.Warn("agent turn exceeded max_turn_time: sending stop signal, will force-kill if needed",
 				"session_key", sessionKey, "max_turn_time", e.maxTurnTime, "elapsed", elapsed)
-			cp.Finalize(ProgressCardStateFailed)
+			finishTurnCard(ProgressCardStateFailed)
 			sp.discard()
 			state.mu.Lock()
 			p := state.platform
@@ -5033,6 +5069,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			e.cleanupInteractiveState(sessionKey, state)
 			return
 		case <-e.ctx.Done():
+			e.expireActiveTurnCard(state, turnCard)
+			turnCard = nil
 			state.mu.Lock()
 			state.eventsNeedResync = true
 			state.mu.Unlock()
@@ -5040,6 +5078,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 
 		if state.isStopped() {
+			finishTurnCard(ProgressCardStateInterrupted)
 			sp.discard()
 			state.mu.Lock()
 			state.eventsNeedResync = true
@@ -5109,6 +5148,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if err := e.trackStore.confirmForegroundTurn(clientUserMessageID, event.ThreadID, event.TurnID); err != nil {
 					slog.Warn("track: confirm foreground turn failed", "platform", p.Name(), "error", err)
 				}
+			}
+			if event.ThreadID != "" && event.TurnID != "" &&
+				(turnCard == nil || turnCard.identity.ThreadID != event.ThreadID || turnCard.identity.TurnID != event.TurnID) {
+				if turnCard != nil {
+					e.expireActiveTurnCard(state, turnCard)
+				}
+				state.mu.Lock()
+				logicalSessionKey = state.currentSessionKey
+				state.mu.Unlock()
+				turnCard = e.beginActiveTurnCard(state, p, logicalSessionKey, sessionKey, event.ThreadID, event.TurnID, replyAgent)
+				observeProgressHandle()
 			}
 
 		case EventThinking:
@@ -5617,7 +5667,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				)
 				continue
 			}
-			cp.Finalize(ProgressCardStateCompleted)
+			finishTurnCard(progressCardStateFromResult(event))
 			// Use state.agentSession.CurrentSessionID() instead of event.SessionID.
 			// event.SessionID may be empty in some cases, causing the agent_session_id
 			// to not be persisted to disk, breaking session resume on next startup.
@@ -5999,6 +6049,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.platform = queued.platform
 				state.replyCtx = queued.replyCtx
 				state.currentMessageID = queued.messageID
+				state.currentSessionKey = queued.msgSessionKey
 				state.fromVoice = queued.fromVoice
 				state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 				state.mu.Unlock()
@@ -6087,8 +6138,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				queuedRenderer := func(content string) string {
 					return e.renderOutgoingContentForWorkspace(queued.platform, content, workspaceDir)
 				}
+				progressPlatform = queued.platform
+				logicalSessionKey = queued.msgSessionKey
+				turnCard = nil
 				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, queuedRenderer)
-				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, e.agent.Name(), e.i18n.CurrentLang(), queuedRenderer)
+				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, replyAgent.Name(), e.i18n.CurrentLang(), queuedRenderer)
+				observeProgressHandle()
 
 				// Reset streaming card state for the next turn
 				streamCard = nil
@@ -6154,7 +6209,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			return
 
 		case EventError:
-			cp.Finalize(ProgressCardStateFailed)
+			finishTurnCard(ProgressCardStateFailed)
 			sp.discard()
 			state.mu.Lock()
 			state.eventsNeedResync = true
@@ -6197,6 +6252,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 channelClosed:
 	// Channel closed - process exited unexpectedly
+	finishTurnCard(ProgressCardStateFailed)
 	slog.Warn("agent process exited", "session_key", sessionKey)
 	state.mu.Lock()
 	state.eventsNeedResync = true
@@ -6407,6 +6463,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.platform = queued.platform
 		state.replyCtx = queued.replyCtx
 		state.currentMessageID = queued.messageID
+		state.currentSessionKey = queued.msgSessionKey
 		state.fromVoice = queued.fromVoice
 		state.currentTurnUserMessageTimeMs = queued.userMessageTimeMs
 		state.mu.Unlock()

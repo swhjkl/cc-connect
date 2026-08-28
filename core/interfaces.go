@@ -304,6 +304,14 @@ type ProgressCardPayloadSupport interface {
 	SupportsProgressCardPayload() bool
 }
 
+// ExactTurnCardSupport is implemented by platforms whose native progress
+// cards preserve an exact reply target and emit verified card-action messages.
+// Core only adds steer/interrupt controls when this capability is explicit;
+// rendering a button alone is not enough to make a turn-level action safe.
+type ExactTurnCardSupport interface {
+	SupportsExactTurnCards() bool
+}
+
 // ProgressUpdateThrottler is an optional interface for platforms that need
 // rate-limited progress edits (e.g. Discord's ~5 edits / 5s per channel).
 type ProgressUpdateThrottler interface {

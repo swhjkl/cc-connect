@@ -745,6 +745,9 @@ const (
 	MsgTrackSteerFailed                   MsgKey = "track_steer_failed"
 	MsgTrackSharedTurnBusy                MsgKey = "track_shared_turn_busy"
 	MsgTrackSharedTurnCheckFailed         MsgKey = "track_shared_turn_check_failed"
+	MsgTurnCardReplyHint                  MsgKey = "turn_card_reply_hint"
+	MsgTurnCardInterruptStale             MsgKey = "turn_card_interrupt_stale"
+	MsgTurnCardInterruptFailed            MsgKey = "turn_card_interrupt_failed"
 )
 
 var messages = map[MsgKey]map[Language]string{
@@ -1719,6 +1722,27 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 中止追蹤任務失敗：%v",
 		LangJapanese:           "❌ 追跡中ターンの中止に失敗しました: %v",
 		LangSpanish:            "❌ Error al interrumpir el turno seguido: %v",
+	},
+	MsgTurnCardReplyHint: {
+		LangEnglish:            "Reply to this card to add instructions to the current turn.",
+		LangChinese:            "回复此卡片可向当前任务追加指令。",
+		LangTraditionalChinese: "回覆此卡片可向目前任務追加指令。",
+		LangJapanese:           "このカードに返信すると、現在のターンに指示を追加できます。",
+		LangSpanish:            "Responde a esta tarjeta para añadir instrucciones al turno actual.",
+	},
+	MsgTurnCardInterruptStale: {
+		LangEnglish:            "This task card is stale or its turn has already ended; nothing was interrupted.",
+		LangChinese:            "该任务卡片已失效，或对应任务已经结束；未中止任何任务。",
+		LangTraditionalChinese: "該任務卡片已失效，或對應任務已經結束；未中止任何任務。",
+		LangJapanese:           "このタスクカードは古いか、対応するターンはすでに終了しています。中止は行われませんでした。",
+		LangSpanish:            "Esta tarjeta de tarea está obsoleta o su turno ya terminó; no se interrumpió nada.",
+	},
+	MsgTurnCardInterruptFailed: {
+		LangEnglish:            "❌ Failed to interrupt the exact turn shown by this task card: %v",
+		LangChinese:            "❌ 中止该任务卡片对应的精确任务失败：%v",
+		LangTraditionalChinese: "❌ 中止該任務卡片對應的精確任務失敗：%v",
+		LangJapanese:           "❌ このタスクカードが示すターンの中止に失敗しました: %v",
+		LangSpanish:            "❌ No se pudo interrumpir el turno exacto mostrado por esta tarjeta: %v",
 	},
 	MsgTrackMirrorTitle: {
 		LangEnglish:            "Codex · Shared external session",

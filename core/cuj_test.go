@@ -1742,6 +1742,119 @@ func TestCUJ_I6_DefaultMirrorCardReplyLifecycle(t *testing.T) {
 	}
 }
 
+// CUJ-I8 · A Feishu-originated Codex turn exposes controls only after the
+// native progress card is bound to an authoritative thread/turn. Replies steer
+// that exact turn, interrupt is silent, and the terminal card becomes stale.
+func TestCUJ_I8_NativeTurnCardExactControlLifecycle(t *testing.T) {
+	runtimeSession := newNativeTurnSignalSession("thread-native")
+	base := newMirrorTestAgent(&ConversationSnapshot{SessionID: "thread-native"})
+	agent := &nativeTurnCardAgent{mirrorTestAgent: base, session: runtimeSession}
+	p := newNativeTurnCardPlatform()
+	p.cardMessageID = "om-cuj-native-card"
+	e := NewEngine("test", agent, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	defer e.Stop()
+	key := "feishu:group:member"
+
+	// Action 1: start a normal Feishu task. The backend then identifies the
+	// exact turn and emits progress, causing one bound card to gain controls.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i8-prompt", UserID: "member",
+		Content: "inspect the workspace", ReplyCtx: "prompt-ctx",
+	})
+	waitTurnCardTest(t, "native foreground session", func() bool {
+		return e.sessions.GetOrCreateActive(key).Busy()
+	})
+	select {
+	case <-runtimeSession.sent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("native foreground prompt was not sent")
+	}
+	running := ConversationTurn{ID: "turn-native", Status: ConversationTurnInProgress}
+	agent.setSnapshot(&ConversationSnapshot{SessionID: "thread-native", Turns: []ConversationTurn{running}})
+	runtimeSession.events <- Event{
+		Type: EventTurnStarted, ThreadID: "thread-native", TurnID: "turn-native", ClientUserMessageID: "i8-prompt",
+	}
+	runtimeSession.events <- Event{Type: EventThinking, Content: "inspect files"}
+	var action string
+	waitTurnCardTest(t, "native progress controls", func() bool {
+		for _, edit := range p.getPreviewEdits() {
+			payload, ok := ParseProgressCardPayload(edit)
+			if ok && payload.State == ProgressCardStateRunning && payload.Hint != "" && len(payload.Buttons) == 1 {
+				action = payload.Buttons[0].Value
+				return true
+			}
+		}
+		return false
+	})
+	if !strings.HasPrefix(action, turnCardInterruptActionPrefix) {
+		t.Fatalf("native interrupt action = %q", action)
+	}
+
+	// Action 2: reply to the card. User-visible acknowledgement and backend
+	// evidence both confirm exact-turn steer rather than next-turn queueing.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i8-steer", ReferencedMessageID: p.cardMessageID,
+		UserID: "member", Content: "also run the focused tests", ReplyCtx: "steer-ctx",
+	})
+	agent.mu.Lock()
+	steers := append([][4]string(nil), agent.steers...)
+	agent.mu.Unlock()
+	if len(steers) != 1 || steers[0] != [4]string{"thread-native", "turn-native", "also run the focused tests", "i8-steer"} {
+		t.Fatalf("native exact steers = %#v", steers)
+	}
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "exact active turn") {
+		t.Fatalf("native steer acknowledgement = %q", got)
+	}
+
+	// Action 3: click stop. Successful acceptance is intentionally silent;
+	// only Codex's terminal event changes the original process card.
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), ReferencedMessageID: p.cardMessageID,
+		UserID: "member", Content: action, ReplyCtx: "stop-ctx", IsCardAction: true,
+	})
+	agent.mu.Lock()
+	interrupts := append([][2]string(nil), agent.interrupts...)
+	agent.mu.Unlock()
+	if len(interrupts) != 1 || interrupts[0] != [2]string{"thread-native", "turn-native"} {
+		t.Fatalf("native exact interrupts = %#v", interrupts)
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("successful native interrupt sent a standalone message: %#v", sent)
+	}
+
+	// Action 4: Codex confirms interruption. The process card keeps its
+	// progress, turns orange, and drops both its hint and action button.
+	terminal := running
+	terminal.Status = ConversationTurnInterrupted
+	agent.setSnapshot(&ConversationSnapshot{SessionID: "thread-native", Turns: []ConversationTurn{terminal}})
+	runtimeSession.events <- Event{
+		Type: EventResult, ThreadID: "thread-native", TurnID: "turn-native", Content: "interrupted", Done: true,
+		Metadata: map[string]any{"turn_status": "interrupted"},
+	}
+	waitTurnCardTest(t, "native terminal lifecycle", func() bool {
+		return !e.sessions.GetOrCreateActive(key).Busy()
+	})
+	edits := p.getPreviewEdits()
+	last, ok := ParseProgressCardPayload(edits[len(edits)-1])
+	if !ok || last.State != ProgressCardStateInterrupted || last.Hint != "" || len(last.Buttons) != 0 {
+		t.Fatalf("native terminal card = %#v", last)
+	}
+
+	// Action 5: replying to the old card cannot start or queue a new turn.
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i8-late", ReferencedMessageID: p.cardMessageID,
+		UserID: "member", Content: "do not enqueue this", ReplyCtx: "late-ctx",
+	})
+	agent.mu.Lock()
+	steerCount := len(agent.steers)
+	agent.mu.Unlock()
+	if steerCount != 1 || !strings.Contains(strings.Join(p.getSent(), "\n"), "not sent") {
+		t.Fatalf("stale native reply was not fail-closed: steers=%d sent=%q", steerCount, strings.Join(p.getSent(), "\n"))
+	}
+}
+
 // CUJ-I7 · Session lifecycle commands move the mirror binding atomically. An
 // old shared thread must not continue posting after /switch or /new.
 func TestCUJ_I7_SessionCommandsRebindMirror(t *testing.T) {

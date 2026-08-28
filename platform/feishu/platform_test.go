@@ -105,6 +105,34 @@ func TestNew_ProgressStyleSupportsCompactAndCard(t *testing.T) {
 	}
 }
 
+func TestNew_ExactTurnCardsRequireInteractiveCardMode(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "plain mode", enabled: false},
+		{name: "interactive mode", enabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p, err := New(map[string]any{
+				"app_id":             "cli_xxx",
+				"app_secret":         "secret",
+				"enable_feishu_card": test.enabled,
+			})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			support, ok := p.(core.ExactTurnCardSupport)
+			if !ok {
+				t.Fatalf("platform type %T does not implement ExactTurnCardSupport", p)
+			}
+			if got := support.SupportsExactTurnCards(); got != test.enabled {
+				t.Fatalf("SupportsExactTurnCards() = %t, want %t", got, test.enabled)
+			}
+		})
+	}
+}
+
 func TestNew_ProgressStyleRejectsInvalidValue(t *testing.T) {
 	_, err := New(map[string]any{
 		"app_id":         "cli_xxx",
@@ -312,6 +340,70 @@ func TestInteractivePlatform_CardActionPassesCardSenderToHandler(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected card action message")
+	}
+}
+
+func TestInteractivePlatform_NativeTurnCardActionCarriesExactCardIdentity(t *testing.T) {
+	platformAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	msgCh := make(chan *core.Message, 1)
+	ip.handler = func(_ core.Platform, msg *core.Message) { msgCh <- msg }
+
+	action := "turn:interrupt:opaque-token"
+	_, err = ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_test_user"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action": action,
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_exact_card"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+
+	select {
+	case msg := <-msgCh:
+		if !msg.IsCardAction || msg.Content != action || msg.ReferencedMessageID != "om_exact_card" {
+			t.Fatalf("native turn action message = %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected native turn card action message")
+	}
+}
+
+func TestInteractivePlatform_NativeTurnCardActionRejectsUnauthorizedUser(t *testing.T) {
+	platformAny, err := New(map[string]any{
+		"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true,
+		"allow_from": "ou_allowed",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	msgCh := make(chan *core.Message, 1)
+	ip.handler = func(_ core.Platform, msg *core.Message) { msgCh <- msg }
+
+	_, err = ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_denied"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action": "turn:interrupt:opaque-token",
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_exact_card"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	select {
+	case msg := <-msgCh:
+		t.Fatalf("unauthorized action was dispatched: %#v", msg)
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 
@@ -1047,6 +1139,37 @@ func TestBuildPreviewCardJSON_ProgressPayloadUsesStructuredCard(t *testing.T) {
 	header, ok := card["header"].(map[string]any)
 	if !ok || header == nil {
 		t.Fatalf("expected header in card json, got %#v", card["header"])
+	}
+}
+
+func TestBuildPreviewCardJSON_ProgressControlsDisappearWhenInterrupted(t *testing.T) {
+	items := []core.ProgressCardEntry{{Kind: core.ProgressEntryThinking, Text: "检查中"}}
+	button := core.CardButton{
+		Text: "中止当前任务", Type: "danger", Value: "turn:interrupt:opaque-token",
+		Extra: map[string]string{"session_key": "feishu:chat:user"},
+	}
+	runningPayload := core.BuildProgressCardPayloadWithControls(
+		items, false, "Codex", core.LangChinese, core.ProgressCardStateRunning,
+		"回复此卡片可向当前任务追加指令。", []core.CardButton{button},
+	)
+	running := buildPreviewCardJSON(runningPayload)
+	for _, want := range []string{"回复此卡片可向当前任务追加指令", "中止当前任务", "turn:interrupt:opaque-token"} {
+		if !strings.Contains(running, want) {
+			t.Fatalf("running progress card should contain %q: %s", want, running)
+		}
+	}
+
+	terminalPayload := core.BuildProgressCardPayloadWithControls(
+		items, false, "Codex", core.LangChinese, core.ProgressCardStateInterrupted, "", nil,
+	)
+	terminal := buildPreviewCardJSON(terminalPayload)
+	if !strings.Contains(terminal, "Codex · 已中止") || !strings.Contains(terminal, `"template":"orange"`) {
+		t.Fatalf("interrupted progress header = %s", terminal)
+	}
+	for _, absent := range []string{"回复此卡片可向当前任务追加指令", "中止当前任务", "turn:interrupt:"} {
+		if strings.Contains(terminal, absent) {
+			t.Fatalf("terminal progress card retained %q: %s", absent, terminal)
+		}
 	}
 }
 

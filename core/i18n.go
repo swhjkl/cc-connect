@@ -739,6 +739,7 @@ const (
 	MsgTrackMirrorFailedNotification      MsgKey = "track_mirror_failed_notification"
 	MsgTrackMirrorInterruptedNotification MsgKey = "track_mirror_interrupted_notification"
 	MsgTrackMirrorCardFailedNotification  MsgKey = "track_mirror_card_failed_notification"
+	MsgTrackMirrorResultFollows           MsgKey = "track_mirror_result_follows"
 	MsgTrackSteerAccepted                 MsgKey = "track_steer_accepted"
 	MsgTrackSteerStale                    MsgKey = "track_steer_stale"
 	MsgTrackSteerFailed                   MsgKey = "track_steer_failed"
@@ -1802,6 +1803,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⚠️ 共用 Codex 任務已結束，但追蹤卡片更新失敗；可使用 `/track` 重新整理。",
 		LangJapanese:           "⚠️ 共有 Codex タスクは終了しましたが、追跡カードを更新できませんでした。`/track` で更新できます。",
 		LangSpanish:            "⚠️ La tarea compartida de Codex terminó, pero no se pudo actualizar su tarjeta. Usa `/track` para actualizarla.",
+	},
+	MsgTrackMirrorResultFollows: {
+		LangEnglish:            "The final response is sent as the next message.",
+		LangChinese:            "最终回复将在下一条消息中发送。",
+		LangTraditionalChinese: "最終回覆將在下一則訊息中傳送。",
+		LangJapanese:           "最終回答は次のメッセージで送信されます。",
+		LangSpanish:            "La respuesta final se envía en el siguiente mensaje.",
 	},
 	MsgTrackSteerAccepted: {
 		LangEnglish:            "✅ Input was appended to the exact active turn shown by this card.",

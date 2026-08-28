@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1260,6 +1261,47 @@ func TestBuildRichCardWithOptions_MirrorUsesPurpleOnlyWhileRunning(t *testing.T)
 	})
 	if template, _ := decodeHeader(completed); template != "green" {
 		t.Fatalf("completed mirror template = %q, want semantic green", template)
+	}
+}
+
+func TestBuildRichCardWithOptions_MirrorReusesNativeProgressPanels(t *testing.T) {
+	exitCode := 0
+	success := true
+	items := []core.ProgressCardEntry{
+		{Kind: core.ProgressEntryThinking, Text: "检查工作区"},
+		{Kind: core.ProgressEntryToolUse, Tool: "functions.exec_command", Text: `{"cmd":"ls"}`},
+		{Kind: core.ProgressEntryToolResult, Tool: "functions.exec_command", Text: "README.md", Status: "completed", ExitCode: &exitCode, Success: &success},
+	}
+	nativePayload := core.BuildProgressCardPayloadV2(items, false, "Codex", core.LangChinese, core.ProgressCardStateRunning)
+	nativePanels := collectCardPanels(t, buildPreviewCardJSON(nativePayload))
+
+	p := &Platform{}
+	mirrorPanels := collectCardPanels(t, p.BuildRichCardWithOptions(core.RichCardRenderOptions{
+		Status: core.CardStatusWorking, Variant: core.CardVariantMirror,
+		Title: "Codex · 共享外部会话 · 执行中", ProgressItems: items,
+		Language: core.LangChinese, Markdown: "**提示**\n检查", Streaming: true,
+	}))
+
+	if !reflect.DeepEqual(mirrorPanels, nativePanels) {
+		t.Fatalf("mirror progress panels drifted from native panels\nmirror: %#v\nnative: %#v", mirrorPanels, nativePanels)
+	}
+	if len(mirrorPanels) != 2 || cardPanelTitle(mirrorPanels[0]) != "思考 (1)" || cardPanelTitle(mirrorPanels[1]) != "工具 (2)" {
+		t.Fatalf("localized mirror panels = %#v", mirrorPanels)
+	}
+	for _, want := range []string{"工具调用", "工具结果", "exit code: `0`", "README.md"} {
+		if !panelContains(t, mirrorPanels[1], want) {
+			t.Fatalf("mirror tools panel should contain %q: %#v", want, mirrorPanels[1])
+		}
+	}
+}
+
+func TestBuildReplyContent_PreservesPrebuiltRichCard(t *testing.T) {
+	card := buildRichCardWithOptions(core.RichCardRenderOptions{
+		Status: core.CardStatusDone, Title: "Codex · 已完成", Markdown: "plain final response",
+	})
+	msgType, body := buildReplyContent(card)
+	if msgType != larkim.MsgTypeInteractive || body != card {
+		t.Fatalf("prebuilt card reply = type %q body %q", msgType, body)
 	}
 }
 

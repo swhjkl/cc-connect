@@ -230,6 +230,7 @@ type mirrorTestPlatform struct {
 	failUpdates       int
 	failNotifications int
 	options           []RichCardRenderOptions
+	footerSends       []string
 	notificationKey   map[string]struct{}
 }
 
@@ -263,7 +264,7 @@ func (p *mirrorTestPlatform) BuildRichCardWithOptions(options RichCardRenderOpti
 	p.trackMu.Lock()
 	p.options = append(p.options, options)
 	p.trackMu.Unlock()
-	return fmt.Sprintf("%s|%s|%t|%s|%s|%v", options.Status, options.Variant, options.Streaming, options.Title, options.Markdown, options.Steps)
+	return fmt.Sprintf("%s|%s|%t|%s|%s|%v|%v|%t|%s|%s", options.Status, options.Variant, options.Streaming, options.Title, options.Markdown, options.Steps, options.ProgressItems, options.ProgressTruncated, options.Language, options.StatusFooter)
 }
 
 func (p *mirrorTestPlatform) SendPreviewStartIdempotent(_ context.Context, _ any, content, key string) (any, error) {
@@ -325,7 +326,14 @@ func (p *mirrorTestPlatform) SendIdempotent(ctx context.Context, replyCtx any, c
 	return p.stubPlatformEngine.Send(ctx, replyCtx, content)
 }
 
-func TestConversationMirror_CardFailureNotificationRetryPreservesFallback(t *testing.T) {
+func (p *mirrorTestPlatform) SendIdempotentWithStatusFooter(ctx context.Context, replyCtx any, content, footer, key string) error {
+	p.trackMu.Lock()
+	p.footerSends = append(p.footerSends, footer)
+	p.trackMu.Unlock()
+	return p.SendIdempotent(ctx, replyCtx, appendReplyFooter(content, footer), key)
+}
+
+func TestConversationMirror_CardFailureResultRetryPreservesFallback(t *testing.T) {
 	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
 	p := newMirrorTestPlatform()
 	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
@@ -343,18 +351,22 @@ func TestConversationMirror_CardFailureNotificationRetryPreservesFallback(t *tes
 		t.Fatalf("setDeliveryRender() error = %v", err)
 	}
 	p.failNotifications = 1
-	if err := e.sendTrackTerminalNotification(e.ctx, p, "mirror:chat", ConversationTurnCompleted, delivery, true); err == nil {
-		t.Fatal("first fallback notification error = nil")
+	turn := ConversationTurn{
+		ID: "turn-1", Status: ConversationTurnCompleted,
+		Messages: []ConversationMessage{{Role: "assistant", Content: "fallback answer", Phase: "final_answer"}},
+	}
+	if err := e.sendTrackTerminalResult(e.ctx, p, "mirror:chat", turn, delivery, true, false); err == nil {
+		t.Fatal("first fallback result error = nil")
 	}
 	delivery = e.trackStore.deliveryByKey(delivery.Key)
 	if !strings.HasPrefix(delivery.LastError, "terminal_card_") || delivery.NotificationState != "pending" {
 		t.Fatalf("failed notification state = %#v", delivery)
 	}
-	if err := e.sendTrackTerminalNotification(e.ctx, p, "mirror:chat", ConversationTurnCompleted, delivery, strings.HasPrefix(delivery.LastError, "terminal_card_")); err != nil {
-		t.Fatalf("fallback notification retry error = %v", err)
+	if err := e.sendTrackTerminalResult(e.ctx, p, "mirror:chat", turn, delivery, strings.HasPrefix(delivery.LastError, "terminal_card_"), false); err != nil {
+		t.Fatalf("fallback result retry error = %v", err)
 	}
-	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "could not be updated") {
-		t.Fatalf("fallback notification retry = %q", got)
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "fallback answer") || !strings.Contains(got, "could not be updated") {
+		t.Fatalf("fallback result retry = %q", got)
 	}
 }
 
@@ -712,7 +724,7 @@ func TestCmdTrackStop_InterruptsOnlyMatchingLiveTracker(t *testing.T) {
 	}
 }
 
-func TestConversationMirror_DefaultOnCreatesOneCardAndOneTerminalNotification(t *testing.T) {
+func TestConversationMirror_DefaultOnCreatesProgressCardAndFinalResult(t *testing.T) {
 	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
 	p := newMirrorTestPlatform()
 	e, binding, _ := startMirrorTest(t, agent, p)
@@ -736,8 +748,11 @@ func TestConversationMirror_DefaultOnCreatesOneCardAndOneTerminalNotification(t 
 	if firstOptions.Variant != CardVariantMirror || firstOptions.Status != CardStatusWorking || !firstOptions.Streaming {
 		t.Fatalf("running mirror options = %#v", firstOptions)
 	}
-	if !strings.Contains(firstOptions.Markdown, "external prompt") || !strings.Contains(firstOptions.Title, "Shared external") {
+	if !strings.Contains(firstOptions.Markdown, "external prompt") || strings.Contains(firstOptions.Markdown, "working") || !strings.Contains(firstOptions.Title, "Shared external") {
 		t.Fatalf("running mirror presentation = %#v", firstOptions)
+	}
+	if len(firstOptions.ProgressItems) != 2 || firstOptions.ProgressItems[0].Kind != ProgressEntryThinking || firstOptions.ProgressItems[1].Kind != ProgressEntryToolUse {
+		t.Fatalf("running mirror progress = %#v", firstOptions.ProgressItems)
 	}
 
 	completed := running
@@ -747,7 +762,7 @@ func TestConversationMirror_DefaultOnCreatesOneCardAndOneTerminalNotification(t 
 	completed.Activities[0].Status = "completed"
 	agent.setSnapshot(&ConversationSnapshot{SessionID: "thread-1", ThreadState: "idle", Turns: []ConversationTurn{completed}})
 	agent.events <- Event{Type: EventResult, ThreadID: "thread-1", TurnID: completed.ID, Done: true}
-	waitMirrorTest(t, "terminal card and notification", func() bool {
+	waitMirrorTest(t, "terminal card and final result", func() bool {
 		p.trackMu.Lock()
 		updates := len(p.updates)
 		p.trackMu.Unlock()
@@ -762,19 +777,93 @@ func TestConversationMirror_DefaultOnCreatesOneCardAndOneTerminalNotification(t 
 	if len(p.starts) != 1 || len(p.updates) != 1 {
 		t.Fatalf("card lifecycle starts=%d updates=%d", len(p.starts), len(p.updates))
 	}
+	if len(p.options) != 2 {
+		p.trackMu.Unlock()
+		t.Fatalf("rich render count = %d, want progress start and progress finish", len(p.options))
+	}
 	lastOptions := p.options[len(p.options)-1]
+	footerSendCount := len(p.footerSends)
 	p.trackMu.Unlock()
 	if lastOptions.Status != CardStatusDone || lastOptions.Variant != CardVariantMirror || lastOptions.Streaming {
 		t.Fatalf("terminal mirror options = %#v", lastOptions)
 	}
-	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "task finished") {
-		t.Fatalf("terminal notification = %q", got)
+	if strings.Contains(lastOptions.Markdown, "external answer") || !strings.Contains(lastOptions.StatusFooter, "next message") {
+		t.Fatalf("terminal progress card contains the final response: %#v", lastOptions)
+	}
+	if footerSendCount != 1 {
+		t.Fatalf("structured terminal result sends = %d, want 1", footerSendCount)
+	}
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "external answer") || strings.Contains(got, "task finished") {
+		t.Fatalf("terminal result = %q", got)
 	}
 
 	agent.events <- Event{Type: EventResult, ThreadID: "thread-1", TurnID: completed.ID, Done: true}
 	time.Sleep(100 * time.Millisecond)
 	if got := len(p.getSent()); got != 1 {
-		t.Fatalf("duplicate terminal event sent %d notifications", got)
+		t.Fatalf("duplicate terminal event sent %d results", got)
+	}
+}
+
+func TestConversationMirror_NotificationModesDoNotLoseOrDuplicateFinalResponse(t *testing.T) {
+	tests := []struct {
+		name           string
+		notify         string
+		status         ConversationTurnStatus
+		separateResult bool
+	}{
+		{name: "never keeps completed response inline", notify: "never", status: ConversationTurnCompleted},
+		{name: "on failure keeps successful response inline", notify: "on_failure", status: ConversationTurnCompleted},
+		{name: "on failure sends failed response separately", notify: "on_failure", status: ConversationTurnFailed, separateResult: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+			p := newMirrorTestPlatform()
+			e, binding, _ := startMirrorTest(t, agent, p)
+			e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: tc.notify, SharedWrite: "observer_only"})
+			running := ConversationTurn{
+				ID: "turn-mode", Status: ConversationTurnInProgress, StartedAt: time.Now(),
+				Messages: []ConversationMessage{{Role: "user", Content: "mode prompt"}},
+			}
+			agent.setSnapshot(mirrorTestSnapshot("thread-1", running))
+			agent.events <- Event{Type: EventTurnStarted, ThreadID: "thread-1", TurnID: running.ID}
+			waitMirrorTest(t, "mode progress card", func() bool {
+				p.trackMu.Lock()
+				defer p.trackMu.Unlock()
+				return len(p.starts) == 1
+			})
+
+			terminal := running
+			terminal.Status = tc.status
+			terminal.CompletedAt = time.Now()
+			terminal.Messages = append(terminal.Messages, ConversationMessage{Role: "assistant", Content: "mode answer", Phase: "final_answer"})
+			agent.setSnapshot(&ConversationSnapshot{SessionID: "thread-1", ThreadState: "idle", Turns: []ConversationTurn{terminal}})
+			agent.events <- Event{Type: EventResult, ThreadID: "thread-1", TurnID: terminal.ID, Done: true}
+			waitMirrorTest(t, "mode terminal delivery", func() bool {
+				delivery := e.trackStore.delivery(binding.Destination, "thread-1", terminal.ID, "primary")
+				return delivery != nil && delivery.Terminal && delivery.NotificationState == "sent"
+			})
+
+			p.trackMu.Lock()
+			options := append([]RichCardRenderOptions(nil), p.options...)
+			p.trackMu.Unlock()
+			sent := strings.Join(p.getSent(), "\n")
+			if tc.separateResult {
+				if len(options) != 2 || strings.Contains(options[len(options)-1].Markdown, "mode answer") {
+					t.Fatalf("separate result render options = %#v", options)
+				}
+				if !strings.Contains(sent, "mode answer") {
+					t.Fatalf("separate terminal result = %q", sent)
+				}
+				return
+			}
+			if len(options) != 2 || !strings.Contains(options[len(options)-1].Markdown, "mode answer") {
+				t.Fatalf("inline terminal render options = %#v", options)
+			}
+			if sent != "" {
+				t.Fatalf("inline terminal response also sent separately: %q", sent)
+			}
+		})
 	}
 }
 
@@ -830,6 +919,15 @@ func TestConversationMirror_RichCardReusesForegroundTurnPresentation(t *testing.
 		if strings.Contains(options.Markdown, duplicate) {
 			t.Fatalf("rich markdown duplicated progress text %q: %q", duplicate, options.Markdown)
 		}
+	}
+	if len(options.ProgressItems) != 3 {
+		t.Fatalf("progress items = %#v, want reasoning, tool call, and tool result rows", options.ProgressItems)
+	}
+	if options.ProgressItems[0].Kind != ProgressEntryThinking || options.ProgressItems[1].Kind != ProgressEntryToolUse || options.ProgressItems[2].Kind != ProgressEntryToolResult {
+		t.Fatalf("progress item order = %#v", options.ProgressItems)
+	}
+	if options.ProgressItems[2].ExitCode == nil || *options.ProgressItems[2].ExitCode != 0 || options.Language != LangEnglish {
+		t.Fatalf("tool result metadata = %#v, language = %q", options.ProgressItems[2], options.Language)
 	}
 }
 
@@ -1208,7 +1306,7 @@ func TestConversationMirror_KnownExternalMarkerCannotConsumeForegroundReservatio
 	}
 }
 
-func TestConversationMirror_TerminalCardFailureStillNotifiesOnce(t *testing.T) {
+func TestConversationMirror_TerminalCardFailureStillSendsResultOnce(t *testing.T) {
 	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
 	p := newMirrorTestPlatform()
 	e, binding, _ := startMirrorTest(t, agent, p)
@@ -1232,9 +1330,9 @@ func TestConversationMirror_TerminalCardFailureStillNotifiesOnce(t *testing.T) {
 	completed.Messages = append(completed.Messages, ConversationMessage{Role: "assistant", Content: "done", Phase: "final_answer"})
 	agent.setSnapshot(&ConversationSnapshot{SessionID: "thread-1", ThreadState: "idle", Turns: []ConversationTurn{completed}})
 	agent.events <- Event{Type: EventResult, ThreadID: "thread-1", TurnID: completed.ID, Done: true}
-	waitMirrorTest(t, "card failure fallback notification", func() bool { return len(p.getSent()) == 1 })
-	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "could not be updated") {
-		t.Fatalf("fallback notification = %q", got)
+	waitMirrorTest(t, "card failure fallback result", func() bool { return len(p.getSent()) == 1 })
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "done") || !strings.Contains(got, "could not be updated") {
+		t.Fatalf("fallback result = %q", got)
 	}
 	delivery := e.trackStore.delivery(binding.Destination, "thread-1", completed.ID, "primary")
 	if delivery == nil || !delivery.Terminal || delivery.NotificationState != "sent" || delivery.LastError != "terminal_card_update_failed" {
@@ -1499,6 +1597,9 @@ func TestConversationMirror_RestartRestoresCardWithoutDuplicateCreate(t *testing
 	delivery := e2.trackStore.delivery(binding.Destination, "thread-1", running.ID, "primary")
 	if delivery == nil || delivery.CardHandle != "card-1" || delivery.NotificationState != "sent" || !delivery.Terminal {
 		t.Fatalf("recovered delivery = %#v", delivery)
+	}
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "recovered answer") || strings.Contains(got, "task finished") {
+		t.Fatalf("recovered terminal result = %q", got)
 	}
 }
 

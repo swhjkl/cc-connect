@@ -1524,6 +1524,7 @@ func TestSendWithStatusFooter_NoFallbackOnNonMentionAt(t *testing.T) {
 
 	var gotMsgType string
 	var gotContent string
+	var gotUUID string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -1534,12 +1535,14 @@ func TestSendWithStatusFooter_NoFallbackOnNonMentionAt(t *testing.T) {
 			var req struct {
 				MsgType string `json:"msg_type"`
 				Content string `json:"content"`
+				UUID    string `json:"uuid"`
 			}
 			if err := json.Unmarshal(body, &req); err != nil {
 				t.Fatalf("unmarshal request body: %v", err)
 			}
 			gotMsgType = req.MsgType
 			gotContent = req.Content
+			gotUUID = req.UUID
 			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": "om_ok"}})
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -1581,6 +1584,12 @@ func TestSendWithStatusFooter_NoFallbackOnNonMentionAt(t *testing.T) {
 				t.Errorf("mention: content must contain resolved mention + inline footer; got %s", gotContent)
 			}
 		}
+	}
+	if err := p.SendIdempotentWithStatusFooter(ctx, rc, "final response", "shared session", "mirror-result-key"); err != nil {
+		t.Fatalf("SendIdempotentWithStatusFooter error = %v", err)
+	}
+	if gotMsgType != larkim.MsgTypeInteractive || gotUUID != "mirror-result-key" || !strings.Contains(gotContent, "shared session") {
+		t.Fatalf("idempotent footer send = type %q uuid %q content %q", gotMsgType, gotUUID, gotContent)
 	}
 }
 

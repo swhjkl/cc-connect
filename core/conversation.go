@@ -746,10 +746,12 @@ func (e *Engine) updateExternalConversationCard(ctx context.Context, mirror *con
 	if err != nil {
 		return err
 	}
-	markdown := e.renderTrackMarkdown(snapshot, turn)
-	payload := e.renderTrackPayload(p, snapshot, turn, markdown, binding.SessionKey)
-	renderHash := trackRenderHash(payload)
 	terminal := conversationTurnTerminal(turn.Status) || turn.Status == ConversationTurnUnknown
+	separateResult := terminal && e.shouldNotifyTrackTerminal(turn.Status)
+	includeResponse := terminal && !separateResult
+	markdown := e.renderTrackMarkdownWithResponse(snapshot, turn, includeResponse)
+	payload := e.renderTrackPayloadWithResponse(p, snapshot, turn, markdown, binding.SessionKey, includeResponse)
+	renderHash := trackRenderHash(payload)
 	cardFailed := strings.HasPrefix(delivery.LastError, "terminal_card_")
 
 	handle := mirror.handles[delivery.Key]
@@ -795,7 +797,7 @@ func (e *Engine) updateExternalConversationCard(ctx context.Context, mirror *con
 					return persistErr
 				}
 				_ = e.trackStore.setDeliveryError(delivery.Key, "terminal_card_create_failed")
-				return e.sendTrackTerminalNotification(ctx, p, replyCtx, turn.Status, delivery, true)
+				return e.sendTrackTerminalResult(ctx, p, replyCtx, turn, delivery, true, separateResult)
 			}
 			_ = e.trackStore.setDeliveryError(delivery.Key, "card_create_failed")
 			return err
@@ -829,7 +831,7 @@ func (e *Engine) updateExternalConversationCard(ctx context.Context, mirror *con
 					return persistErr
 				}
 				_ = e.trackStore.setDeliveryError(delivery.Key, "terminal_card_update_failed")
-				return e.sendTrackTerminalNotification(ctx, p, replyCtx, turn.Status, delivery, true)
+				return e.sendTrackTerminalResult(ctx, p, replyCtx, turn, delivery, true, separateResult)
 			}
 			_ = e.trackStore.setDeliveryError(delivery.Key, "card_update_failed")
 			return err
@@ -850,7 +852,7 @@ func (e *Engine) updateExternalConversationCard(ctx context.Context, mirror *con
 	if !terminal {
 		return nil
 	}
-	return e.sendTrackTerminalNotification(ctx, p, replyCtx, turn.Status, delivery, cardFailed)
+	return e.sendTrackTerminalResult(ctx, p, replyCtx, turn, delivery, cardFailed, separateResult)
 }
 
 func updateTrackCardWithRetry(ctx context.Context, updater MessageUpdater, handle any, payload string) error {
@@ -870,22 +872,23 @@ func updateTrackCardWithRetry(ctx context.Context, updater MessageUpdater, handl
 	return err
 }
 
-func (e *Engine) sendTrackTerminalNotification(ctx context.Context, p Platform, replyCtx any, status ConversationTurnStatus, delivery *trackDeliveryState, cardFailed bool) error {
+func (e *Engine) sendTrackTerminalResult(ctx context.Context, p Platform, replyCtx any, turn ConversationTurn, delivery *trackDeliveryState, cardFailed, separateResult bool) error {
 	if delivery == nil || delivery.NotificationState == "sent" {
 		return nil
 	}
-	if !cardFailed && !e.shouldNotifyTrackTerminal(status) {
+	if !cardFailed && !separateResult {
 		return e.trackStore.markNotificationSent(delivery.Key)
 	}
-	notification := e.trackTerminalNotification(status)
-	if cardFailed {
-		notification = e.i18n.T(MsgTrackMirrorCardFailedNotification)
-	}
+	result, footer := e.renderTrackTerminalResult(p, turn, cardFailed)
 	var err error
-	if sender, ok := p.(IdempotentSender); ok {
-		err = sender.SendIdempotent(ctx, replyCtx, notification, delivery.NotificationKey)
+	if sender, ok := p.(IdempotentStatusFooterSender); ok {
+		err = sender.SendIdempotentWithStatusFooter(ctx, replyCtx, result, footer, delivery.NotificationKey)
+	} else if sender, ok := p.(IdempotentSender); ok {
+		err = sender.SendIdempotent(ctx, replyCtx, appendReplyFooter(result, footer), delivery.NotificationKey)
+	} else if sender, ok := p.(StatusFooterSender); ok {
+		err = sender.SendWithStatusFooter(ctx, replyCtx, result, footer)
 	} else {
-		err = p.Send(ctx, replyCtx, notification)
+		err = p.Send(ctx, replyCtx, appendReplyFooter(result, footer))
 	}
 	if err != nil {
 		errorState := "terminal_notification_failed"
@@ -898,6 +901,29 @@ func (e *Engine) sendTrackTerminalNotification(ctx context.Context, p Platform, 
 		return err
 	}
 	return e.trackStore.markNotificationSent(delivery.Key)
+}
+
+func (e *Engine) renderTrackTerminalResult(p Platform, turn ConversationTurn, cardFailed bool) (string, string) {
+	response := conversationFinalAnswer(turn)
+	if strings.TrimSpace(response) == "" {
+		response = conversationLiveResponse(turn)
+	}
+	if strings.TrimSpace(response) == "" {
+		response = e.trackTerminalNotification(turn.Status)
+	}
+	response = e.renderTrackSection(response)
+	footer := e.i18n.T(MsgTrackMirrorFooter)
+	if elapsed := e.trackElapsed(turn); elapsed != "" {
+		footer += "\n" + elapsed
+	}
+	if cardFailed {
+		footer += "\n" + e.i18n.T(MsgTrackMirrorCardFailedNotification)
+	}
+
+	if resolver, ok := p.(RichCardMarkdownResolver); ok && response != "" {
+		response = resolver.ResolveRichCardMarkdown(e.ctx, response, true)
+	}
+	return response, footer
 }
 
 func previewMessageID(p Platform, handle any) (string, error) {
@@ -1460,18 +1486,24 @@ func conversationTurnByID(snapshot *ConversationSnapshot, turnID string) (Conver
 }
 
 func (e *Engine) renderTrackMarkdown(snapshot *ConversationSnapshot, turn ConversationTurn) string {
+	return e.renderTrackMarkdownWithResponse(snapshot, turn, true)
+}
+
+func (e *Engine) renderTrackMarkdownWithResponse(snapshot *ConversationSnapshot, turn ConversationTurn, includeResponse bool) string {
 	prompt := e.renderTrackSection(conversationPrompt(turn))
 	if prompt == "" {
 		prompt = e.i18n.T(MsgTrackContentPending)
 	}
-	response := e.renderTrackSection(conversationLiveResponse(turn))
-	if response == "" {
-		response = e.i18n.T(MsgTrackContentPending)
-	}
 
 	var sections []string
 	sections = append(sections, e.i18n.Tf(MsgTrackPromptSection, prompt))
-	sections = append(sections, e.i18n.Tf(MsgTrackResponseSection, response))
+	if includeResponse {
+		response := e.renderTrackSection(conversationLiveResponse(turn))
+		if response == "" {
+			response = e.i18n.T(MsgTrackContentPending)
+		}
+		sections = append(sections, e.i18n.Tf(MsgTrackResponseSection, response))
+	}
 	if len(turn.Activities) > 0 {
 		activity := turn.Activities[len(turn.Activities)-1]
 		sections = append(sections, e.i18n.Tf(MsgTrackActivitySection,
@@ -1532,19 +1564,21 @@ func (e *Engine) fallbackConversationPresentationEvents(turn ConversationTurn) [
 	return events
 }
 
-func (e *Engine) renderRichTrackMarkdown(turn ConversationTurn, presentation richTurnPresentation) string {
+func (e *Engine) renderRichTrackMarkdown(turn ConversationTurn, presentation richTurnPresentation, includeResponse bool) string {
 	prompt := e.renderTrackSection(conversationPrompt(turn))
 	if prompt == "" {
 		prompt = e.i18n.T(MsgTrackContentPending)
+	}
+	sections := []string{e.i18n.Tf(MsgTrackPromptSection, prompt)}
+	if !includeResponse {
+		return strings.Join(sections, "\n\n")
 	}
 	response := e.renderTrackSection(presentation.Markdown)
 	if response == "" {
 		response = e.i18n.T(MsgTrackContentPending)
 	}
-	return strings.Join([]string{
-		e.i18n.Tf(MsgTrackPromptSection, prompt),
-		e.i18n.Tf(MsgTrackResponseSection, response),
-	}, "\n\n")
+	sections = append(sections, e.i18n.Tf(MsgTrackResponseSection, response))
+	return strings.Join(sections, "\n\n")
 }
 
 func (e *Engine) renderTrackSection(content string) string {
@@ -1576,13 +1610,17 @@ func truncateUTF8Bytes(content string, maxBytes int) string {
 }
 
 func (e *Engine) renderTrackPayload(p Platform, snapshot *ConversationSnapshot, turn ConversationTurn, markdown, sessionKey string) string {
+	return e.renderTrackPayloadWithResponse(p, snapshot, turn, markdown, sessionKey, true)
+}
+
+func (e *Engine) renderTrackPayloadWithResponse(p Platform, snapshot *ConversationSnapshot, turn ConversationTurn, markdown, sessionKey string, includeResponse bool) string {
 	_, ok := p.(RichCardSupporter)
 	_, hasOptions := p.(RichCardOptionsSupporter)
 	if !ok && !hasOptions {
 		return markdown
 	}
 	presentation := e.conversationTurnPresentation(turn)
-	richMarkdown := e.renderRichTrackMarkdown(turn, presentation)
+	richMarkdown := e.renderRichTrackMarkdown(turn, presentation, includeResponse)
 	footer := e.i18n.T(MsgTrackMirrorFooter)
 	if elapsed := e.trackElapsed(turn); elapsed != "" {
 		footer += "\n" + elapsed
@@ -1590,16 +1628,10 @@ func (e *Engine) renderTrackPayload(p Platform, snapshot *ConversationSnapshot, 
 	if waiting := e.trackWaitingLabel(snapshot.ActiveFlags); waiting != "" {
 		footer += "\n" + waiting
 	}
-	status := CardStatusWorking
-	if turn.Status == ConversationTurnCompleted {
-		status = CardStatusDone
-	} else if turn.Status == ConversationTurnFailed {
-		status = CardStatusError
-	} else if turn.Status == ConversationTurnInterrupted {
-		status = CardStatusInterrupted
-	} else if turn.Status == ConversationTurnUnknown {
-		status = CardStatusPaused
+	if !includeResponse && (conversationTurnTerminal(turn.Status) || turn.Status == ConversationTurnUnknown) {
+		footer += "\n" + e.i18n.T(MsgTrackMirrorResultFollows)
 	}
+	status := trackCardStatus(turn.Status)
 	streaming := !conversationTurnTerminal(turn.Status) && turn.Status != ConversationTurnUnknown
 	var buttons []CardButton
 	if streaming {
@@ -1617,8 +1649,15 @@ func (e *Engine) renderTrackPayload(p Platform, snapshot *ConversationSnapshot, 
 		}}
 	}
 	options := RichCardRenderOptions{
-		Status: status, Title: e.i18n.T(MsgTrackMirrorTitle), Variant: CardVariantMirror,
-		Steps: presentation.Steps, Markdown: richMarkdown, Streaming: streaming, StatusFooter: footer, Buttons: buttons,
+		Status: status, Title: e.trackMirrorTitle(turn.Status), Variant: CardVariantMirror,
+		Steps:             presentation.Steps,
+		ProgressItems:     append([]ProgressCardEntry{}, presentation.ProgressItems...),
+		ProgressTruncated: presentation.ProgressTruncated,
+		Language:          e.i18n.CurrentLang(),
+		Markdown:          richMarkdown,
+		Streaming:         streaming,
+		StatusFooter:      footer,
+		Buttons:           buttons,
 	}
 	if resolver, ok := p.(RichCardMarkdownResolver); ok && options.Markdown != "" {
 		options.Markdown = resolver.ResolveRichCardMarkdown(e.ctx, options.Markdown, !streaming)
@@ -1627,6 +1666,25 @@ func (e *Engine) renderTrackPayload(p Platform, snapshot *ConversationSnapshot, 
 		return card
 	}
 	return markdown
+}
+
+func trackCardStatus(status ConversationTurnStatus) CardStatus {
+	switch status {
+	case ConversationTurnCompleted:
+		return CardStatusDone
+	case ConversationTurnFailed:
+		return CardStatusError
+	case ConversationTurnInterrupted:
+		return CardStatusInterrupted
+	case ConversationTurnUnknown:
+		return CardStatusPaused
+	default:
+		return CardStatusWorking
+	}
+}
+
+func (e *Engine) trackMirrorTitle(status ConversationTurnStatus) string {
+	return e.i18n.T(MsgTrackMirrorTitle) + " · " + e.trackStatusLabel(string(status))
 }
 
 func (e *Engine) replyTrackFallback(p Platform, replyCtx any, markdown string) {

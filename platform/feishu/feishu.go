@@ -2867,21 +2867,38 @@ func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, 
 	if !ok {
 		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
 	}
+	return p.sendWithStatusFooter(ctx, rc, content, footer, "")
+}
+
+// SendIdempotentWithStatusFooter implements core.IdempotentStatusFooterSender.
+func (p *Platform) SendIdempotentWithStatusFooter(ctx context.Context, rctx any, content, footer, idempotencyKey string) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+	}
+	return p.sendWithStatusFooter(ctx, rc, content, footer, idempotencyKey)
+}
+
+func (p *Platform) sendWithStatusFooter(ctx context.Context, rc replyContext, content, footer, idempotencyKey string) error {
 	// Resolve mentions first so we can detect whether a real @mention is
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
 	if strings.TrimSpace(footer) == "" || strings.Contains(content, `<at user_id=`) || strings.Contains(content, `<at id=`) {
 		if strings.TrimSpace(footer) != "" {
 			content += "\n\n" + footer
 		}
-		return p.Send(ctx, rctx, content)
+		msgType, msgBody := buildReplyContent(content)
+		if p.shouldUseThreadOrReplyAPI(rc) {
+			return p.replyMessageWithUUID(ctx, rc, msgType, msgBody, idempotencyKey)
+		}
+		return p.createMessageWithUUID(ctx, rc.chatID, msgType, msgBody, "send with status footer", idempotencyKey)
 	}
 	processedBody := sanitizeMarkdownURLs(preprocessFeishuMarkdown(content))
 	processedFooter := sanitizeMarkdownURLs(preprocessFeishuMarkdown(footer))
 	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
 	if p.shouldUseThreadOrReplyAPI(rc) {
-		return p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+		return p.replyMessageWithUUID(ctx, rc, larkim.MsgTypeInteractive, cardJSON, idempotencyKey)
 	}
-	return p.sendNewMessageToChat(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+	return p.createMessageWithUUID(ctx, rc.chatID, larkim.MsgTypeInteractive, cardJSON, "send with status footer", idempotencyKey)
 }
 
 func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttachment) error {
@@ -3105,6 +3122,9 @@ func detectMimeType(data []byte) string {
 }
 
 func buildReplyContent(content string) (msgType string, body string) {
+	if isCardJSON(content) {
+		return larkim.MsgTypeInteractive, content
+	}
 	// Feishu does not generate mention events for <at> tags in card/post
 	// messages sent by bots. Force MsgTypeText when a real mention is present
 	// (resolved to an <at user_id="..."> or <at id=...> tag) so Feishu
@@ -4455,6 +4475,23 @@ func appendProgressGroupedElements(elements []map[string]any, items []core.Progr
 	return elements
 }
 
+func appendProgressTruncatedNotice(elements []map[string]any, lang string) []map[string]any {
+	truncatedText := "Showing latest updates only."
+	if isZhLikeProgressLang(lang) {
+		truncatedText = "仅显示最近更新。"
+	}
+	elements = append(elements, map[string]any{
+		"tag": "div",
+		"text": map[string]any{
+			"tag":        "plain_text",
+			"content":    truncatedText,
+			"text_size":  "notation",
+			"text_color": "grey",
+		},
+	})
+	return append(elements, map[string]any{"tag": "hr"})
+}
+
 func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string {
 	items := normalizeProgressItems(payload)
 	if len(items) == 0 {
@@ -4467,20 +4504,7 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 
 	elements := make([]map[string]any, 0, len(items)+3)
 	if payload.Truncated {
-		truncatedText := "Showing latest updates only."
-		if isZhLikeProgressLang(payload.Lang) {
-			truncatedText = "仅显示最近更新。"
-		}
-		elements = append(elements, map[string]any{
-			"tag": "div",
-			"text": map[string]any{
-				"tag":        "plain_text",
-				"content":    truncatedText,
-				"text_size":  "notation",
-				"text_color": "grey",
-			},
-		})
-		elements = append(elements, map[string]any{"tag": "hr"})
+		elements = appendProgressTruncatedNotice(elements, payload.Lang)
 	}
 
 	elements = appendProgressGroupedElements(elements, items, payload.Lang, running)
@@ -6656,16 +6680,22 @@ func buildRichCardWithOptions(options core.RichCardRenderOptions) string {
 		{perLane: 6, textLen: 120},
 		{perLane: 3, textLen: 80},
 	} {
-		compactSteps := compactRichStepsForCardSize(options.Steps, limit.perLane, limit.textLen)
 		compactOptions := options
-		compactOptions.Steps = compactSteps
+		if options.ProgressItems != nil {
+			compactOptions.ProgressItems = compactProgressItemsForCardSize(options.ProgressItems, limit.perLane*2, limit.textLen)
+			compactOptions.ProgressTruncated = options.ProgressTruncated || len(compactOptions.ProgressItems) < len(options.ProgressItems)
+		} else {
+			compactOptions.Steps = compactRichStepsForCardSize(options.Steps, limit.perLane, limit.textLen)
+		}
 		compact, err := buildRichCardJSONBytesWithOptions(compactOptions)
 		if err == nil && len(compact) <= maxRichCardJSONBytes {
 			slog.Debug("feishu: rich card exceeded size limit, compacted panels",
 				"original_size", len(b),
 				"compacted_size", len(compact),
 				"steps", len(options.Steps),
-				"compacted_steps", len(compactSteps),
+				"compacted_steps", len(compactOptions.Steps),
+				"progress_items", len(options.ProgressItems),
+				"compacted_progress_items", len(compactOptions.ProgressItems),
 			)
 			return string(compact)
 		}
@@ -6773,24 +6803,33 @@ func buildRichCardJSONBytesWithOptions(options core.RichCardRenderOptions) ([]by
 	markdown := options.Markdown
 	streaming := options.Streaming
 	statusFooter := options.StatusFooter
-	reasoningSteps, toolSteps := splitRichStepsByLane(steps)
-	panelMaps := make([]map[string]any, 0, 2)
-	if len(reasoningSteps) > 0 {
-		panelMaps = append(panelMaps, buildRichPanel(
-			richLaneTitle("Reasoning", len(reasoningSteps)),
-			streaming,
-			richPanelElements(reasoningSteps, "Thinking..."),
-		))
-	}
-	if len(toolSteps) > 0 {
-		panelMaps = append(panelMaps, buildRichPanel(
-			richLaneTitle("Tools", len(toolSteps)),
-			streaming,
-			richPanelElements(toolSteps, "No tool steps"),
-		))
-	}
-	if len(panelMaps) == 0 && streaming {
-		panelMaps = append(panelMaps, buildRichPanel("Reasoning", true, richPanelElements(nil, "Thinking...")))
+	progressElements := make([]map[string]any, 0, 4)
+	if options.ProgressItems != nil {
+		if options.ProgressTruncated {
+			progressElements = appendProgressTruncatedNotice(progressElements, string(options.Language))
+		}
+		progressElements = appendProgressGroupedElements(
+			progressElements, options.ProgressItems, string(options.Language), streaming,
+		)
+	} else {
+		reasoningSteps, toolSteps := splitRichStepsByLane(steps)
+		if len(reasoningSteps) > 0 {
+			progressElements = append(progressElements, buildRichPanel(
+				richLaneTitle("Reasoning", len(reasoningSteps)),
+				streaming,
+				richPanelElements(reasoningSteps, "Thinking..."),
+			))
+		}
+		if len(toolSteps) > 0 {
+			progressElements = append(progressElements, buildRichPanel(
+				richLaneTitle("Tools", len(toolSteps)),
+				streaming,
+				richPanelElements(toolSteps, "No tool steps"),
+			))
+		}
+		if len(progressElements) == 0 && streaming {
+			progressElements = append(progressElements, buildRichPanel("Reasoning", true, richPanelElements(nil, "Thinking...")))
+		}
 	}
 
 	markdownMap := map[string]any{
@@ -6819,8 +6858,8 @@ func buildRichCardJSONBytesWithOptions(options core.RichCardRenderOptions) ([]by
 	}
 
 	var elements []map[string]any
-	if len(panelMaps) > 0 {
-		elements = append(elements, panelMaps...)
+	if len(progressElements) > 0 {
+		elements = append(elements, progressElements...)
 		elements = append(elements, markdownMap)
 	} else {
 		elements = append(elements, markdownMap)
@@ -6908,6 +6947,18 @@ func compactRichStepsForCardSize(steps []core.ToolStep, perLaneLimit, textLimit 
 		kept[i], kept[j] = kept[j], kept[i]
 	}
 	return kept
+}
+
+func compactProgressItemsForCardSize(items []core.ProgressCardEntry, itemLimit, textLimit int) []core.ProgressCardEntry {
+	if len(items) == 0 || itemLimit <= 0 {
+		return []core.ProgressCardEntry{}
+	}
+	start := max(0, len(items)-itemLimit)
+	compacted := append([]core.ProgressCardEntry(nil), items[start:]...)
+	for index := range compacted {
+		compacted[index].Text = compactRichText(compacted[index].Text, textLimit)
+	}
+	return compacted
 }
 
 func compactRichStepText(step core.ToolStep, textLimit int) core.ToolStep {

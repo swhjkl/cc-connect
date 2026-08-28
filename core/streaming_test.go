@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -83,6 +84,28 @@ func TestRichTurnPresentation_MergesToolResultsByItemID(t *testing.T) {
 	}
 	if second := presentation.Steps[1]; second.ID != "tool-2" || second.Result != "" || second.Done {
 		t.Fatalf("second tool step = %#v", second)
+	}
+	if len(presentation.ProgressItems) != 3 {
+		t.Fatalf("progress items = %#v, want separate call/result rows", presentation.ProgressItems)
+	}
+	if presentation.ProgressItems[0].Kind != ProgressEntryToolUse || presentation.ProgressItems[1].Kind != ProgressEntryToolUse || presentation.ProgressItems[2].Kind != ProgressEntryToolResult {
+		t.Fatalf("progress item order = %#v", presentation.ProgressItems)
+	}
+}
+
+func TestRichTurnPresentation_ProgressItemsKeepLatestTen(t *testing.T) {
+	display := DisplayCfg{ThinkingMessages: true, ToolMessages: true, ThinkingMaxLen: 300, ToolMaxLen: 500}
+	events := make([]Event, 0, 12)
+	for i := 0; i < 12; i++ {
+		events = append(events, Event{Type: EventThinking, Content: fmt.Sprintf("step-%02d", i)})
+	}
+	presentation := richTurnPresentationFromEvents(events, display)
+
+	if !presentation.ProgressTruncated || len(presentation.ProgressItems) != richProgressMaxEntries {
+		t.Fatalf("bounded progress = %#v, truncated = %t", presentation.ProgressItems, presentation.ProgressTruncated)
+	}
+	if got := presentation.ProgressItems[0].Text; got != "step-02" {
+		t.Fatalf("first visible progress item = %q, want step-02", got)
 	}
 }
 

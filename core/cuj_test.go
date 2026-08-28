@@ -1714,8 +1714,8 @@ func TestCUJ_I6_DefaultMirrorCardReplyLifecycle(t *testing.T) {
 		t.Fatalf("exact steer requests = %#v", steers)
 	}
 
-	// Action 4: Codex finishes; the original card reaches a semantic terminal
-	// state and exactly one finish notification becomes visible.
+	// Action 4: Codex finishes; the original progress card reaches a semantic
+	// terminal state and exactly one separate final-response card becomes visible.
 	completed := running
 	completed.Status = ConversationTurnCompleted
 	completed.CompletedAt = time.Now()
@@ -1724,19 +1724,21 @@ func TestCUJ_I6_DefaultMirrorCardReplyLifecycle(t *testing.T) {
 	})
 	agent.setSnapshot(mirrorTestSnapshot("thread-1", completed))
 	agent.events <- Event{Type: EventConversationChanged, ThreadID: "thread-1", TurnID: completed.ID}
-	waitMirrorTest(t, "terminal card and finish notification", func() bool {
+	waitMirrorTest(t, "terminal progress card and final response", func() bool {
 		p.trackMu.Lock()
 		updates := append([]string(nil), p.updates...)
 		p.trackMu.Unlock()
-		return len(updates) > 0 && strings.Contains(updates[len(updates)-1], "external task result") &&
-			strings.Contains(strings.Join(p.getSent(), "\n"), "task finished")
+		sent := strings.Join(p.getSent(), "\n")
+		return len(updates) > 0 && !strings.Contains(updates[len(updates)-1], "external task result") &&
+			strings.Contains(updates[len(updates)-1], "next message") &&
+			strings.Contains(sent, "external task result") && !strings.Contains(sent, "task finished")
 	})
 	p.trackMu.Lock()
 	cardCount := len(p.starts)
-	notificationCount := len(p.notificationKey)
+	resultCount := len(p.notificationKey)
 	p.trackMu.Unlock()
-	if cardCount != 1 || notificationCount != 1 {
-		t.Fatalf("terminal delivery created duplicates: cards=%d notifications=%d", cardCount, notificationCount)
+	if cardCount != 1 || resultCount != 1 {
+		t.Fatalf("terminal delivery created duplicates: progress_cards=%d results=%d", cardCount, resultCount)
 	}
 }
 

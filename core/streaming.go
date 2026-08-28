@@ -110,14 +110,20 @@ const (
 // RichCardRenderOptions describes one complete rich-card frame. It keeps
 // source styling separate from CardStatus so terminal colors remain semantic.
 type RichCardRenderOptions struct {
-	Status       CardStatus
-	Title        string
-	Variant      CardVariant
-	Steps        []ToolStep
-	Markdown     string
-	Streaming    bool
-	StatusFooter string
-	Buttons      []CardButton
+	Status  CardStatus
+	Title   string
+	Variant CardVariant
+	Steps   []ToolStep
+	// ProgressItems opts into the same ordered progress renderer used by native
+	// progress cards. A non-nil empty slice intentionally suppresses the legacy
+	// rich-card placeholder while a turn has not produced progress yet.
+	ProgressItems     []ProgressCardEntry
+	ProgressTruncated bool
+	Language          Language
+	Markdown          string
+	Streaming         bool
+	StatusFooter      string
+	Buttons           []CardButton
 }
 
 // RichCardOptionsSupporter lets a platform render source variants while
@@ -130,8 +136,21 @@ type RichCardOptionsSupporter interface {
 // rich-card rendering. Foreground agent events and authoritative conversation
 // snapshots must both flow through Apply so their presentation cannot drift.
 type richTurnPresentation struct {
-	Steps    []ToolStep
-	Markdown string
+	Steps             []ToolStep
+	ProgressItems     []ProgressCardEntry
+	ProgressTruncated bool
+	Markdown          string
+}
+
+const richProgressMaxEntries = 10
+
+func (p *richTurnPresentation) appendProgress(item ProgressCardEntry) {
+	p.ProgressItems = append(p.ProgressItems, item)
+	if len(p.ProgressItems) <= richProgressMaxEntries {
+		return
+	}
+	p.ProgressItems = p.ProgressItems[len(p.ProgressItems)-richProgressMaxEntries:]
+	p.ProgressTruncated = true
 }
 
 func (p *richTurnPresentation) Apply(event Event, display DisplayCfg) {
@@ -148,6 +167,7 @@ func (p *richTurnPresentation) Apply(event Event, display DisplayCfg) {
 			ID: event.ItemID, Kind: ToolStepKindThinking, Name: "Thinking",
 			Summary: thinking, Done: true,
 		})
+		p.appendProgress(ProgressCardEntry{Kind: ProgressEntryThinking, Text: thinking})
 
 	case EventToolUse:
 		if !display.ToolMessages {
@@ -156,6 +176,11 @@ func (p *richTurnPresentation) Apply(event Event, display DisplayCfg) {
 		p.Steps = append(p.Steps, ToolStep{
 			ID: event.ItemID, Kind: ToolStepKindTool, Name: event.ToolName,
 			Summary: truncateIf(event.ToolInput, display.ToolMaxLen),
+		})
+		p.appendProgress(ProgressCardEntry{
+			Kind: ProgressEntryToolUse,
+			Text: truncateIf(event.ToolInput, display.ToolMaxLen),
+			Tool: event.ToolName,
 		})
 
 	case EventToolResult:
@@ -173,6 +198,14 @@ func (p *richTurnPresentation) Apply(event Event, display DisplayCfg) {
 			return
 		}
 		p.Steps = mergeRichToolResult(p.Steps, event, result, display.ToolMaxLen)
+		p.appendProgress(ProgressCardEntry{
+			Kind:     ProgressEntryToolResult,
+			Text:     result,
+			Tool:     event.ToolName,
+			Status:   event.ToolStatus,
+			ExitCode: event.ToolExitCode,
+			Success:  event.ToolSuccess,
+		})
 
 	case EventText:
 		content := event.Content

@@ -278,6 +278,12 @@ type StatusFooterSender interface {
 	SendWithStatusFooter(ctx context.Context, replyCtx any, content, footer string) error
 }
 
+// IdempotentStatusFooterSender combines native request deduplication with the
+// platform's structured status-footer presentation.
+type IdempotentStatusFooterSender interface {
+	SendIdempotentWithStatusFooter(ctx context.Context, replyCtx any, content, footer, idempotencyKey string) error
+}
+
 // StatusFooterUpdater is the streaming-preview counterpart of
 // StatusFooterSender: it patches an existing preview message with a final
 // content + structured status footer block.

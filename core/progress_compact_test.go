@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -292,6 +293,29 @@ func (p *stubThrottledProgressPlatform) ProgressUpdateInterval() time.Duration {
 	return p.throttle
 }
 
+type stubHeartbeatProgressPlatform struct {
+	stubCompactProgressPlatform
+	heartbeat time.Duration
+}
+
+func (p *stubHeartbeatProgressPlatform) ProgressHeartbeatInterval() time.Duration {
+	return p.heartbeat
+}
+
+func waitForProgressEdits(t *testing.T, p *stubCompactProgressPlatform, count int) []string {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		edits := p.getPreviewEdits()
+		if len(edits) >= count {
+			return edits
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("preview edits = %d, want at least %d", len(p.getPreviewEdits()), count)
+	return nil
+}
+
 func TestCompactProgressWriter_ThrottlesRapidUpdates(t *testing.T) {
 	p := &stubThrottledProgressPlatform{
 		stubCompactProgressPlatform: stubCompactProgressPlatform{
@@ -337,6 +361,90 @@ func TestCompactProgressWriter_ThrottlesRapidUpdates(t *testing.T) {
 	}
 	if len(payload.Items) != 4 {
 		t.Fatalf("items = %d, want 4 (all buffered items)", len(payload.Items))
+	}
+}
+
+func TestCompactProgressWriter_ThrottledUpdateFlushesWithoutAnotherEvent(t *testing.T) {
+	p := &stubThrottledProgressPlatform{
+		stubCompactProgressPlatform: stubCompactProgressPlatform{
+			stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+			style:              "card",
+			supportPayload:     true,
+		},
+		throttle: 30 * time.Millisecond,
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "codex", LangEnglish, nil)
+	t.Cleanup(w.Close)
+
+	w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryThinking, Text: "step 1"}, "step 1")
+	w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryToolUse, Tool: "Bash", Text: "sleep 60"}, "sleep 60")
+
+	edits := waitForProgressEdits(t, &p.stubCompactProgressPlatform, 1)
+	payload, ok := ParseProgressCardPayload(edits[len(edits)-1])
+	if !ok {
+		t.Fatalf("trailing edit should be a valid payload: %q", edits[len(edits)-1])
+	}
+	if len(payload.Items) != 2 || payload.Counts.Reasoning != 1 || payload.Counts.Tools != 1 {
+		t.Fatalf("trailing payload = items %#v counts %#v", payload.Items, payload.Counts)
+	}
+}
+
+func TestCompactProgressWriter_CumulativeCountsSurviveVisibleEntryLimit(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              "card",
+		supportPayload:     true,
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "codex", LangChinese, nil)
+	t.Cleanup(w.Close)
+
+	for i := 0; i < 17; i++ {
+		text := fmt.Sprintf("command-%02d", i)
+		if !w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryToolUse, Tool: "Bash", Text: text}, text) {
+			t.Fatalf("AppendStructured(%d) = false", i)
+		}
+	}
+	edits := p.getPreviewEdits()
+	payload, ok := ParseProgressCardPayload(edits[len(edits)-1])
+	if !ok {
+		t.Fatalf("last edit should be a valid payload: %q", edits[len(edits)-1])
+	}
+	if !payload.Truncated || len(payload.Items) != 10 {
+		t.Fatalf("visible progress = %d, truncated = %t", len(payload.Items), payload.Truncated)
+	}
+	if payload.Counts.Tools != 17 {
+		t.Fatalf("cumulative tool count = %d, want 17", payload.Counts.Tools)
+	}
+	if got := payload.Items[0].Text; got != "command-07" {
+		t.Fatalf("first visible item = %q, want command-07", got)
+	}
+}
+
+func TestCompactProgressWriter_HeartbeatRefreshesLongSilentOperation(t *testing.T) {
+	p := &stubHeartbeatProgressPlatform{
+		stubCompactProgressPlatform: stubCompactProgressPlatform{
+			stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+			style:              "card",
+			supportPayload:     true,
+		},
+		heartbeat: 20 * time.Millisecond,
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "codex", LangEnglish, nil)
+	t.Cleanup(w.Close)
+	if !w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryToolUse, Tool: "Bash", Text: "sleep 60"}, "sleep 60") {
+		t.Fatal("initial progress append failed")
+	}
+	w.mu.Lock()
+	w.startedAt = time.Now().Add(-2 * time.Second)
+	w.mu.Unlock()
+
+	edits := waitForProgressEdits(t, &p.stubCompactProgressPlatform, 1)
+	payload, ok := ParseProgressCardPayload(edits[len(edits)-1])
+	if !ok {
+		t.Fatalf("heartbeat edit should be a valid payload: %q", edits[len(edits)-1])
+	}
+	if payload.State != ProgressCardStateRunning || payload.ElapsedSeconds < 2 {
+		t.Fatalf("heartbeat payload state = %q elapsed = %d", payload.State, payload.ElapsedSeconds)
 	}
 }
 

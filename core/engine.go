@@ -534,6 +534,7 @@ type queuedMessage struct {
 	msgPlatform         string // platform name for sender injection
 	msgSessionKey       string // session key for extracting chat ID
 	channelKey          string // platform-provided channel identifier (preferred over sessionKey extraction)
+	collaborationMode   string // backend collaboration mode selected for exactly this queued turn
 	userMessageTimeMs   int64  // Feishu create_time ms (optional); see Message.UserMessageTimeMs
 }
 
@@ -711,9 +712,19 @@ type pendingPermission struct {
 	ToolName        string
 	ToolInput       map[string]any
 	InputPreview    string
+	ThreadID        string
+	TurnID          string
+	ItemID          string
 	Questions       []UserQuestion // non-nil for AskUserQuestion
 	Answers         map[int]string // collected answers keyed by question index
 	CurrentQuestion int            // index of the question currently being asked
+	CardHandle      any            // exact rich-card handle for cross-client invalidation
+	CardSessionKey  string         // platform session key used to render the tracked card
+	CardMessageID   string         // stable platform message identity for exact callbacks
+	ControlToken    string         // opaque token embedded in exact card actions
+	CardActionable  bool           // true only after handle identity was verified
+	Submitting      bool           // guards duplicate final answers
+	Expired         bool           // terminal state for stop/restart invalidation
 	Resolved        chan struct{}  // closed when user responds
 	resolveOnce     sync.Once
 }
@@ -933,13 +944,17 @@ func (e *Engine) SetTrackCfg(cfg TrackCfg) {
 	previous := e.trackCfg
 	e.trackCfg = cfg
 	restartMirrors := previous.Enabled != cfg.Enabled || previous.DefaultEnabled != cfg.DefaultEnabled
+	var retired []*conversationMirror
 	if restartMirrors {
 		for key, mirror := range e.conversationMirrors {
 			delete(e.conversationMirrors, key)
-			mirror.cancel()
+			retired = append(retired, mirror)
 		}
 	}
 	e.trackMu.Unlock()
+	for _, mirror := range retired {
+		e.retireConversationMirror(mirror)
+	}
 
 	if cfg.Enabled && restartMirrors {
 		e.platformLifecycleMu.Lock()
@@ -2411,6 +2426,13 @@ func (e *Engine) Stop() error {
 	e.stopping = true
 	e.platformLifecycleMu.Unlock()
 
+	// Disable native question controls while platform connections are still
+	// alive. pendingPermission is intentionally in-memory only, so leaving the
+	// old card actionable across a graceful restart would create a dead button.
+	expireCtx, expireCancel := context.WithTimeout(context.Background(), 4*time.Second)
+	e.expireAllPendingAskQuestionCards(expireCtx)
+	expireCancel()
+
 	// Cancel first so late lifecycle callbacks observe shutdown immediately.
 	e.cancel()
 
@@ -2457,6 +2479,35 @@ func (e *Engine) Stop() error {
 		return fmt.Errorf("engine stop errors: %v", errs)
 	}
 	return nil
+}
+
+func (e *Engine) expireAllPendingAskQuestionCards(ctx context.Context) {
+	type update struct {
+		platform Platform
+		card     expiringAskQuestionCard
+	}
+	var updates []update
+	e.interactiveMu.Lock()
+	states := make([]*interactiveState, 0, len(e.interactiveStates))
+	for _, state := range e.interactiveStates {
+		states = append(states, state)
+	}
+	e.interactiveMu.Unlock()
+	for _, state := range states {
+		if state == nil {
+			continue
+		}
+		state.mu.Lock()
+		card, ok := expirePendingAskQuestionLocked(state.pending)
+		platform := state.platform
+		state.mu.Unlock()
+		if ok && platform != nil {
+			updates = append(updates, update{platform: platform, card: card})
+		}
+	}
+	for _, update := range updates {
+		e.updateExpiredAskQuestionCardWithContext(ctx, update.platform, update.card.Handle, update.card.SessionKey, update.card.Question)
+	}
 }
 
 // OnPlatformReady marks an async platform as ready and initializes platform-level
@@ -3031,7 +3082,13 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		agent = wsAgent
 		interactiveKey = resolvedWorkspace + ":" + msg.SessionKey
 	}
+	if e.handleTrackedPlanAction(p, msg, content, agent, sessions) {
+		return
+	}
 	if e.handleTurnCardAction(p, msg, content, agent, sessions, interactiveKey) {
+		return
+	}
+	if e.handleTrackedConversationElicitationInput(p, msg, directContent, sessions) {
 		return
 	}
 
@@ -3277,6 +3334,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		msgPlatform:         msg.Platform,
 		msgSessionKey:       msg.SessionKey,
 		channelKey:          msg.ChannelKey,
+		collaborationMode:   msg.CollaborationModeOverride,
 		userMessageTimeMs:   msg.UserMessageTimeMs,
 	})
 	runMessageAccepted(msg)
@@ -3438,14 +3496,18 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 
 		// Stale platform-callback permission click (e.g. user tapped an old
 		// "Allow"/"Deny" button after the session was reset, the bot was
-		// restarted, or the card message ID was redelivered). Drop silently so
-		// the synthesized "allow"/"deny" payload is not forwarded to the
-		// agent as user input (issue #826). Only applies to permission
+		// restarted, or the card message ID was redelivered). Consume it so the
+		// synthesized payload is not forwarded to the agent as user input
+		// (issue #826); stale question actions also receive explicit feedback.
+		// Only applies to permission
 		// callbacks — plain text "allow"/"deny" from a real user falls
 		// through to the normal message handler below.
 		if msg.IsPermissionResponse {
 			slog.Debug("dropping stale permission callback (no interactive state)",
 				"session", msg.SessionKey, "content", content)
+			if strings.HasPrefix(strings.TrimSpace(content), "askq:") {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAskQuestionExpired))
+			}
 			return true
 		}
 		return false
@@ -3462,39 +3524,136 @@ found:
 			return false
 		}
 
+		trimmed := strings.TrimSpace(content)
+		isAction := strings.HasPrefix(trimmed, "askq:")
+		rejectExactAction := func() bool {
+			state.mu.Unlock()
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAskQuestionExpired))
+			return true
+		}
+
+		state.mu.Lock()
+		if state.pending != pending || pending.Expired || pending.Submitting || pending.CurrentQuestion < 0 || pending.CurrentQuestion >= len(pending.Questions) {
+			state.mu.Unlock()
+			if msg.IsPermissionResponse || isAction {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAskQuestionExpired))
+				return true
+			}
+			return false
+		}
 		curIdx := pending.CurrentQuestion
 		q := pending.Questions[curIdx]
-		answer := e.resolveAskQuestionAnswer(q, content)
+		answerInput := trimmed
+		if pending.ControlToken != "" && isAction {
+			parts := strings.Split(trimmed, ":")
+			if !msg.IsCardAction || !pending.CardActionable || len(parts) != 4 || parts[1] != pending.ControlToken ||
+				pending.CardMessageID == "" || msg.ReferencedMessageID != pending.CardMessageID {
+				return rejectExactAction()
+			}
+			qIdx, qErr := strconv.Atoi(parts[2])
+			optionIdx, optionErr := strconv.Atoi(parts[3])
+			if qErr != nil || optionErr != nil || qIdx != curIdx || optionIdx < 1 || optionIdx > len(q.Options) {
+				return rejectExactAction()
+			}
+			if pending.ThreadID != "" && state.agentSession != nil {
+				currentThreadID := strings.TrimSpace(state.agentSession.CurrentSessionID())
+				if currentThreadID != "" && currentThreadID != pending.ThreadID {
+					return rejectExactAction()
+				}
+			}
+			if pending.TurnID != "" && state.currentTurnID != "" && pending.TurnID != state.currentTurnID {
+				return rejectExactAction()
+			}
+			answerInput = strconv.Itoa(optionIdx)
+		} else if pending.ControlToken != "" && msg.IsCardAction {
+			return rejectExactAction()
+		}
+		answer := e.resolveAskQuestionAnswer(q, answerInput)
 
 		if pending.Answers == nil {
 			pending.Answers = make(map[int]string)
 		}
 		pending.Answers[curIdx] = answer
+		questions := append([]UserQuestion(nil), pending.Questions...)
+		agentSession := state.agentSession
 
 		// More questions remaining — advance to next and send new card
 		if curIdx+1 < len(pending.Questions) {
+			oldHandle := pending.CardHandle
+			oldSessionKey := pending.CardSessionKey
 			pending.CurrentQuestion = curIdx + 1
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf("✅ %s: **%s**", q.Question, answer))
-			e.sendAskQuestionPrompt(p, msg.ReplyCtx, pending.Questions, curIdx+1)
+			pending.CardHandle = nil
+			pending.CardMessageID = ""
+			pending.CardActionable = false
+			nextQuestion := pending.Questions[curIdx+1]
+			controlToken := pending.ControlToken
+			state.mu.Unlock()
+			e.updateResolvedAskQuestionCard(p, oldHandle, oldSessionKey, q, answer, false)
+			e.reply(p, msg.ReplyCtx, e.askQuestionAnswerConfirmation(q, answer))
+			delivery := e.sendAskQuestionPrompt(p, msg.ReplyCtx, questions, curIdx+1, controlToken)
+			state.mu.Lock()
+			stillPending := state.pending == pending
+			if stillPending {
+				pending.CardHandle = delivery.Handle
+				pending.CardSessionKey = msg.SessionKey
+				pending.CardMessageID = delivery.MessageID
+				pending.ControlToken = delivery.Token
+				pending.CardActionable = delivery.Actionable
+			}
+			expired := pending.Expired
+			state.mu.Unlock()
+			if !stillPending {
+				if expired {
+					e.updateExpiredAskQuestionCardWithContext(e.ctx, p, delivery.Handle, msg.SessionKey, nextQuestion)
+				} else {
+					e.updateResolvedAskQuestionCard(p, delivery.Handle, msg.SessionKey, nextQuestion, "", true)
+				}
+			}
 			return true
 		}
 
 		// All questions answered — build response and resolve
-		updatedInput := buildAskQuestionResponse(pending.ToolInput, pending.Questions, pending.Answers)
+		requestID := pending.RequestID
+		updatedInput := buildAskQuestionResponse(pending.ToolInput, questions, pending.Answers)
+		cardHandle := pending.CardHandle
+		cardSessionKey := pending.CardSessionKey
+		pending.Submitting = true
+		pending.CardActionable = false
+		state.mu.Unlock()
 
-		if err := state.agentSession.RespondPermission(pending.RequestID, PermissionResult{
-			Behavior:     "allow",
-			UpdatedInput: updatedInput,
-		}); err != nil {
-			slog.Error("failed to send AskUserQuestion response", "error", err)
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+		var responseErr error
+		if agentSession == nil {
+			responseErr = fmt.Errorf("agent session is unavailable")
 		} else {
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf("✅ %s: **%s**", q.Question, answer))
+			responseErr = agentSession.RespondPermission(requestID, PermissionResult{
+				Behavior:     "allow",
+				UpdatedInput: updatedInput,
+			})
+		}
+		if responseErr != nil {
+			slog.Error("failed to send AskUserQuestion response", "error", responseErr)
+			state.mu.Lock()
+			if state.pending == pending && !pending.Expired {
+				pending.Submitting = false
+				pending.CardActionable = pending.ControlToken != "" && pending.CardMessageID != ""
+			}
+			state.mu.Unlock()
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), responseErr))
+			return true
 		}
 
 		state.mu.Lock()
-		state.pending = nil
+		accepted := state.pending == pending && !pending.Expired
+		if accepted {
+			state.pending = nil
+		}
 		state.mu.Unlock()
+		if !accepted {
+			pending.resolve()
+			return true
+		}
+		e.updateResolvedAskQuestionCard(p, cardHandle, cardSessionKey, q, answer, false)
+		e.reply(p, msg.ReplyCtx, e.askQuestionAnswerConfirmation(q, answer))
 		pending.resolve()
 		return true
 	}
@@ -3915,7 +4074,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 			sendDone <- fmt.Errorf("agent session became nil")
 			return
 		}
-		sendDone <- as.Send(promptContent, clientUserMessageID, msg.Images, msg.Files)
+		sendDone <- sendAgentSessionTurn(as, promptContent, clientUserMessageID, msg.Images, msg.Files, msg.CollaborationModeOverride)
 	}()
 
 	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
@@ -4343,7 +4502,12 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 		state.mu.Lock()
 		pending := state.pending
 		state.pending = nil
+		expiredCard, expireCard := expirePendingAskQuestionLocked(pending)
+		platform := state.platform
 		state.mu.Unlock()
+		if expireCard && platform != nil {
+			e.updateExpiredAskQuestionCardWithContext(e.ctx, platform, expiredCard.Handle, expiredCard.SessionKey, expiredCard.Question)
+		}
 		if pending != nil {
 			pending.resolve()
 		}
@@ -4923,6 +5087,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	sp := newStreamPreview(e.streamPreview, state.platform, state.replyCtx, e.ctx, workspaceRenderer)
 	cp := newCompactProgressWriter(e.ctx, state.platform, state.replyCtx, replyAgent.Name(), e.i18n.CurrentLang(), workspaceRenderer)
 	state.mu.Unlock()
+	defer func() { cp.Close() }()
 
 	var turnCard *activeTurnCard
 	observeProgressHandle := func() {
@@ -5608,15 +5773,48 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				ToolName:     event.ToolName,
 				ToolInput:    event.ToolInputRaw,
 				InputPreview: event.ToolInput,
+				ThreadID:     strings.TrimSpace(event.ThreadID),
+				TurnID:       strings.TrimSpace(event.TurnID),
+				ItemID:       strings.TrimSpace(event.ItemID),
 				Questions:    event.Questions,
 				Resolved:     make(chan struct{}),
+			}
+			if pending.ThreadID == "" {
+				pending.ThreadID = strings.TrimSpace(event.SessionID)
 			}
 			state.mu.Lock()
 			state.pending = pending
 			state.mu.Unlock()
 
 			if isAskQuestion {
-				e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0)
+				controlToken := ""
+				if _, tracked := p.(TrackedCardSender); tracked {
+					if _, identifiable := p.(PreviewHandleIdentifier); identifiable {
+						var tokenErr error
+						controlToken, tokenErr = newConversationElicitationToken()
+						if tokenErr != nil {
+							slog.Warn("AskUserQuestion: exact controls disabled", "platform", p.Name(), "error", tokenErr)
+						}
+					}
+				}
+				state.mu.Lock()
+				if state.pending == pending {
+					// Publish the token before sending. A callback racing the send
+					// completion then fails closed while CardActionable is still false
+					// instead of being parsed as a legacy free-text answer.
+					pending.ControlToken = controlToken
+				}
+				state.mu.Unlock()
+				delivery := e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0, controlToken)
+				state.mu.Lock()
+				if state.pending == pending {
+					pending.CardHandle = delivery.Handle
+					pending.CardSessionKey = logicalSessionKey
+					pending.CardMessageID = delivery.MessageID
+					pending.ControlToken = delivery.Token
+					pending.CardActionable = delivery.Actionable
+				}
+				state.mu.Unlock()
 			} else {
 				permLimit := e.display.ToolMaxLen
 				if permLimit > 0 {
@@ -5634,8 +5832,53 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				idleTimer.Stop()
 			}
 
-			<-pending.Resolved
+			var permissionResolved <-chan string
+			var externallyResolvedQuestion *UserQuestion
+			var externallyResolvedHandle any
+			var externallyResolvedSessionKey string
+			if source, ok := state.agentSession.(PermissionResolutionSource); ok {
+				permissionResolved = source.PermissionResolutions()
+			}
+		permissionWait:
+			for {
+				select {
+				case <-pending.Resolved:
+					break permissionWait
+				case requestID, ok := <-permissionResolved:
+					if !ok {
+						permissionResolved = nil
+						continue
+					}
+					if requestID != pending.RequestID {
+						continue
+					}
+					state.mu.Lock()
+					if state.pending == pending {
+						if pending.CurrentQuestion >= 0 && pending.CurrentQuestion < len(pending.Questions) {
+							question := pending.Questions[pending.CurrentQuestion]
+							externallyResolvedQuestion = &question
+							externallyResolvedHandle = pending.CardHandle
+							externallyResolvedSessionKey = pending.CardSessionKey
+						}
+						pending.CardActionable = false
+						pending.Submitting = false
+						state.pending = nil
+					}
+					state.mu.Unlock()
+					pending.resolve()
+					break permissionWait
+				case <-stopCh:
+					pending.resolve()
+					break permissionWait
+				case <-e.ctx.Done():
+					pending.resolve()
+					break permissionWait
+				}
+			}
 			slog.Info("permission resolved", "request_id", event.RequestID)
+			if externallyResolvedQuestion != nil {
+				e.updateResolvedAskQuestionCard(p, externallyResolvedHandle, externallyResolvedSessionKey, *externallyResolvedQuestion, "", true)
+			}
 
 			// The stream preview was frozen+detached when this permission
 			// request was emitted, so any subsequent EventText in this turn
@@ -5650,6 +5893,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if idleTimer != nil {
 				idleTimer.Reset(e.eventIdleTimeout)
 			}
+
+		case EventPermissionResolved:
+			// Resolutions are consumed through PermissionResolutionSource while
+			// the event loop is blocked on the corresponding prompt. The regular
+			// event is retained for passive conversation observers.
+			continue
 
 		case EventResult:
 			// Non-terminal result events (e.g. mid-turn compaction: Claude
@@ -6104,7 +6353,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						nextSend <- fmt.Errorf("agent session became nil")
 						return
 					}
-					nextSend <- as.Send(queuedPrompt, queuedClientUserMessageID, queued.images, queued.files)
+					nextSend <- sendAgentSessionTurn(as, queuedPrompt, queuedClientUserMessageID, queued.images, queued.files, queued.collaborationMode)
 				}()
 				pendingSend = nextSend
 
@@ -6142,6 +6391,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				logicalSessionKey = queued.msgSessionKey
 				turnCard = nil
 				sp = newStreamPreview(e.streamPreview, queued.platform, queued.replyCtx, e.ctx, queuedRenderer)
+				cp.Close()
 				cp = newCompactProgressWriter(e.ctx, queued.platform, queued.replyCtx, replyAgent.Name(), e.i18n.CurrentLang(), queuedRenderer)
 				observeProgressHandle()
 
@@ -6499,7 +6749,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 				sendDone <- fmt.Errorf("agent session became nil")
 				return
 			}
-			sendDone <- as.Send(prompt, queuedClientUserMessageID, queued.images, queued.files)
+			sendDone <- sendAgentSessionTurn(as, prompt, queuedClientUserMessageID, queued.images, queued.files, queued.collaborationMode)
 		}()
 
 		var stopTyping func()
@@ -6510,6 +6760,18 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		slog.Info("processing queued message", "session", sessionKey)
 		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx)
 	}
+}
+
+func sendAgentSessionTurn(session AgentSession, prompt, messageID string, images []ImageAttachment, files []FileAttachment, collaborationMode string) error {
+	mode := strings.TrimSpace(collaborationMode)
+	if mode == "" {
+		return session.Send(prompt, messageID, images, files)
+	}
+	sender, ok := session.(CollaborationModeTurnSender)
+	if !ok {
+		return fmt.Errorf("agent session does not support collaboration mode %q", mode)
+	}
+	return sender.SendWithCollaborationMode(prompt, messageID, images, files, mode)
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -8802,10 +9064,7 @@ func (e *Engine) cmdStatus(p Platform, msg *Message) {
 		modeStr += e.i18n.Tf(MsgStatusToolMessages, toolStr)
 
 		s := sessions.GetOrCreateActive(msg.SessionKey)
-		sessionDisplayName := sessions.GetSessionName(s.GetAgentSessionID())
-		if sessionDisplayName == "" {
-			sessionDisplayName = s.Name
-		}
+		sessionDisplayName := e.currentSessionDisplayName(agent, sessions, s.GetAgentSessionID())
 		sessionStr := e.i18n.Tf(MsgStatusSession, sessionDisplayName, len(s.History))
 
 		var cronStr string
@@ -9227,10 +9486,7 @@ func (e *Engine) renderStatusCard(sessionKey string, userID string) *Card {
 	modeStr += e.i18n.Tf(MsgStatusToolMessages, toolStr)
 
 	s := sessions.GetOrCreateActive(sessionKey)
-	sessionDisplayName := sessions.GetSessionName(s.GetAgentSessionID())
-	if sessionDisplayName == "" {
-		sessionDisplayName = s.GetName()
-	}
+	sessionDisplayName := e.currentSessionDisplayName(agent, sessions, s.GetAgentSessionID())
 	sessionStr := e.i18n.Tf(MsgStatusSession, sessionDisplayName, len(s.History))
 
 	var cronStr string
@@ -10361,6 +10617,8 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 	state.mu.Lock()
 	pending := state.pending
 	state.pending = nil
+	expiredCard, expireCard := expirePendingAskQuestionLocked(pending)
+	platform := state.platform
 	agentSession := state.agentSession
 	state.mu.Unlock()
 
@@ -10373,6 +10631,10 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 		// Don't delete from interactiveStates — keep it alive.
 		e.interactiveMu.Unlock()
 
+		if expireCard && platform != nil {
+			e.updateExpiredAskQuestionCardWithContext(e.ctx, platform, expiredCard.Handle, expiredCard.SessionKey, expiredCard.Question)
+			expireCard = false
+		}
 		if pending != nil {
 			pending.resolve()
 		}
@@ -10414,6 +10676,9 @@ normalCleanup:
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()
 
+	if expireCard && platform != nil {
+		e.updateExpiredAskQuestionCardWithContext(e.ctx, platform, expiredCard.Handle, expiredCard.SessionKey, expiredCard.Question)
+	}
 	if pending != nil {
 		pending.resolve()
 	}
@@ -11798,14 +12063,50 @@ func (e *Engine) sendPermissionPrompt(p Platform, replyCtx any, prompt, toolName
 	e.send(p, replyCtx, prompt)
 }
 
+type askQuestionCardDelivery struct {
+	Handle     any
+	MessageID  string
+	Token      string
+	Actionable bool
+}
+
+type expiringAskQuestionCard struct {
+	Handle     any
+	SessionKey string
+	Question   UserQuestion
+}
+
+// expirePendingAskQuestionLocked makes a pending question terminal and returns
+// the exact tracked card that should be disabled. state.mu must be held.
+func expirePendingAskQuestionLocked(pending *pendingPermission) (expiringAskQuestionCard, bool) {
+	if pending == nil || len(pending.Questions) == 0 || pending.Expired {
+		return expiringAskQuestionCard{}, false
+	}
+	pending.Expired = true
+	pending.CardActionable = false
+	pending.Submitting = false
+	if pending.CardHandle == nil || pending.CurrentQuestion < 0 || pending.CurrentQuestion >= len(pending.Questions) {
+		return expiringAskQuestionCard{}, false
+	}
+	return expiringAskQuestionCard{
+		Handle: pending.CardHandle, SessionKey: pending.CardSessionKey,
+		Question: pending.Questions[pending.CurrentQuestion],
+	}, true
+}
+
 // sendAskQuestionPrompt renders one question (by index) from the AskUserQuestion list.
-// qIdx is the 0-based index of the question to display.
-func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []UserQuestion, qIdx int) {
+// qIdx is the 0-based index of the question to display. A control token enables
+// exact actions only on platforms that can return the sent card's message ID.
+func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []UserQuestion, qIdx int, controlToken ...string) askQuestionCardDelivery {
 	if qIdx >= len(questions) {
-		return
+		return askQuestionCardDelivery{}
 	}
 	q := questions[qIdx]
 	total := len(questions)
+	token := ""
+	if len(controlToken) > 0 {
+		token = strings.TrimSpace(controlToken[0])
+	}
 
 	titleSuffix := ""
 	if total > 1 {
@@ -11814,39 +12115,45 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 
 	// Try card (Feishu/Lark)
 	if supportsCards(p) {
-		cb := NewCard().Title(e.i18n.T(MsgAskQuestionTitle)+titleSuffix, "blue")
-		body := "**" + q.Question + "**"
-		if q.MultiSelect {
-			// For multiSelect, buttons would resolve on the first click and prevent
-			// selecting multiple options. Render options as a numbered text list
-			// instead, and instruct the user to reply with comma-separated numbers.
-			body += e.i18n.T(MsgAskQuestionMulti) + "\n\n"
-			for i, opt := range q.Options {
-				body += fmt.Sprintf("%d. **%s**", i+1, opt.Label)
-				if opt.Description != "" {
-					body += " — " + opt.Description
-				}
-				body += "\n"
+		exact := token != ""
+		if _, ok := p.(PreviewHandleIdentifier); !ok {
+			exact = false
+		}
+		card := e.buildAskQuestionCard(questions, qIdx, func(questionIndex, optionIndex int) string {
+			if exact {
+				return fmt.Sprintf("askq:%s:%d:%d", token, questionIndex, optionIndex)
 			}
-			cb.Markdown(body)
-			cb.Note(e.i18n.T(MsgAskQuestionNoteMulti))
-		} else {
-			cb.Markdown(body)
-			for i, opt := range q.Options {
-				desc := opt.Label
-				if opt.Description != "" {
-					desc += " — " + opt.Description
+			return fmt.Sprintf("askq:%d:%d", questionIndex, optionIndex)
+		})
+		if tracked, ok := p.(TrackedCardSender); ok {
+			if err := e.waitOutgoing(p); err != nil {
+				slog.Warn("sendAskQuestionPrompt: outgoing wait cancelled", "platform", p.Name(), "error", err)
+				return askQuestionCardDelivery{}
+			}
+			handle, err := tracked.SendTrackedCard(e.ctx, replyCtx, e.renderCardForPlatform(p, card))
+			if err == nil {
+				delivery := askQuestionCardDelivery{Handle: handle}
+				if exact {
+					delivery.Token = token
+					messageID, identifyErr := previewMessageID(p, handle)
+					if identifyErr != nil {
+						slog.Warn("sendAskQuestionPrompt: exact card identity unavailable", "platform", p.Name(), "error", identifyErr)
+						return delivery
+					}
+					delivery.MessageID = messageID
+					delivery.Actionable = true
 				}
-				answerData := fmt.Sprintf("askq:%d:%d", qIdx, i+1)
-				cb.ListItemBtnExtra(desc, opt.Label, "default", answerData, map[string]string{
-					"askq_label":    opt.Label,
-					"askq_question": q.Question,
+				return delivery
+			}
+			slog.Warn("sendAskQuestionPrompt: tracked card failed, falling back", "platform", p.Name(), "error", err)
+			if exact {
+				card = e.buildAskQuestionCard(questions, qIdx, func(questionIndex, optionIndex int) string {
+					return fmt.Sprintf("askq:%d:%d", questionIndex, optionIndex)
 				})
 			}
-			cb.Note(e.i18n.T(MsgAskQuestionNote))
 		}
-		e.sendWithCard(p, replyCtx, cb.Build())
-		return
+		e.sendWithCard(p, replyCtx, card)
+		return askQuestionCardDelivery{}
 	}
 
 	// Try inline buttons (Telegram)
@@ -11883,10 +12190,10 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 		}
 		if err := e.waitOutgoing(p); err != nil {
 			slog.Warn("sendAskQuestionPrompt: outgoing wait cancelled", "platform", p.Name(), "error", err)
-			return
+			return askQuestionCardDelivery{}
 		}
 		if err := bs.SendWithButtons(e.ctx, replyCtx, textBuf.String(), rows); err == nil {
-			return
+			return askQuestionCardDelivery{}
 		}
 	}
 
@@ -11910,6 +12217,91 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 	}
 	sb.WriteString(fmt.Sprintf("\n%s", e.i18n.T(MsgAskQuestionNote)))
 	e.send(p, replyCtx, sb.String())
+	return askQuestionCardDelivery{}
+}
+
+func (e *Engine) buildAskQuestionCard(questions []UserQuestion, qIdx int, action func(questionIndex, optionIndex int) string) *Card {
+	if qIdx < 0 || qIdx >= len(questions) {
+		return nil
+	}
+	q := questions[qIdx]
+	titleSuffix := ""
+	if len(questions) > 1 {
+		titleSuffix = fmt.Sprintf(" (%d/%d)", qIdx+1, len(questions))
+	}
+	cb := NewCard().Title(e.i18n.T(MsgAskQuestionTitle)+titleSuffix, "blue")
+	body := "**" + q.Question + "**"
+	if q.MultiSelect {
+		body += e.i18n.T(MsgAskQuestionMulti) + "\n\n"
+		for i, opt := range q.Options {
+			body += fmt.Sprintf("%d. **%s**", i+1, opt.Label)
+			if opt.Description != "" {
+				body += " — " + opt.Description
+			}
+			body += "\n"
+		}
+		return cb.Markdown(body).Note(e.i18n.T(MsgAskQuestionNoteMulti)).Build()
+	}
+
+	cb.Markdown(body)
+	for i, opt := range q.Options {
+		desc := opt.Label
+		if opt.Description != "" {
+			desc += " — " + opt.Description
+		}
+		answerData := fmt.Sprintf("askq:%d:%d", qIdx, i+1)
+		if action != nil {
+			answerData = action(qIdx, i+1)
+		}
+		cb.ListItemBtnExtra(desc, opt.Label, "default", answerData, map[string]string{
+			"askq_label":    opt.Label,
+			"askq_question": q.Question,
+		})
+	}
+	return cb.Note(e.i18n.T(MsgAskQuestionNote)).Build()
+}
+
+func (e *Engine) updateResolvedAskQuestionCard(p Platform, handle any, sessionKey string, question UserQuestion, answer string, elsewhere bool) {
+	e.updateResolvedAskQuestionCardWithContext(e.ctx, p, handle, sessionKey, question, answer, elsewhere)
+}
+
+func (e *Engine) updateResolvedAskQuestionCardWithContext(ctx context.Context, p Platform, handle any, sessionKey string, question UserQuestion, answer string, elsewhere bool) {
+	tracked, ok := p.(TrackedCardSender)
+	if !ok || handle == nil {
+		return
+	}
+	color := "green"
+	body := "**" + question.Question + "**\n\n✅ **" + strings.TrimSpace(answer) + "**"
+	if question.Secret {
+		body = "**" + question.Question + "**\n\n" + e.i18n.T(MsgAskQuestionAnswerSubmitted)
+	}
+	if elsewhere {
+		color = "grey"
+		body = "**" + question.Question + "**\n\n" + e.i18n.T(MsgAskQuestionResolvedElsewhere)
+	}
+	card := NewCard().Title(e.i18n.T(MsgAskQuestionAnswered), color).Markdown(body).Build()
+	if err := tracked.UpdateTrackedCard(ctx, handle, sessionKey, e.renderCardForPlatform(p, card)); err != nil {
+		slog.Warn("update resolved question card failed", "platform", p.Name(), "error", err)
+	}
+}
+
+func (e *Engine) updateExpiredAskQuestionCardWithContext(ctx context.Context, p Platform, handle any, sessionKey string, question UserQuestion) {
+	tracked, ok := p.(TrackedCardSender)
+	if !ok || handle == nil {
+		return
+	}
+	body := "**" + question.Question + "**\n\n" + e.i18n.T(MsgAskQuestionExpired)
+	card := NewCard().Title(e.i18n.T(MsgAskQuestionTitle), "grey").Markdown(body).Build()
+	if err := tracked.UpdateTrackedCard(ctx, handle, sessionKey, e.renderCardForPlatform(p, card)); err != nil {
+		slog.Warn("update expired question card failed", "platform", p.Name(), "error", err)
+	}
+}
+
+func (e *Engine) askQuestionAnswerConfirmation(question UserQuestion, answer string) string {
+	if question.Secret {
+		return e.i18n.T(MsgAskQuestionAnswerSubmitted)
+	}
+	return e.i18n.Tf(MsgAskQuestionAnswerConfirmed, question.Question, answer)
 }
 
 // waitOutgoing blocks on the per-platform outgoing rate limiter when enabled.

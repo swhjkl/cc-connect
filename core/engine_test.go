@@ -306,6 +306,42 @@ type stubCardPlatform struct {
 	cardErr        error
 }
 
+type trackedQuestionCardPlatform struct {
+	stubCardPlatform
+	trackedMu      sync.Mutex
+	trackedStarts  []*Card
+	trackedUpdates []*Card
+}
+
+func (p *trackedQuestionCardPlatform) SendTrackedCard(_ context.Context, _ any, card *Card) (any, error) {
+	p.trackedMu.Lock()
+	handle := fmt.Sprintf("tracked-question-%d", len(p.trackedStarts)+1)
+	p.trackedStarts = append(p.trackedStarts, card)
+	p.trackedMu.Unlock()
+	return handle, nil
+}
+
+func (p *trackedQuestionCardPlatform) UpdateTrackedCard(_ context.Context, _ any, _ string, card *Card) error {
+	p.trackedMu.Lock()
+	p.trackedUpdates = append(p.trackedUpdates, card)
+	p.trackedMu.Unlock()
+	return nil
+}
+
+func (p *trackedQuestionCardPlatform) PreviewMessageID(handle any) (string, error) {
+	messageID, ok := handle.(string)
+	if !ok || messageID == "" {
+		return "", fmt.Errorf("invalid tracked question handle %T", handle)
+	}
+	return messageID, nil
+}
+
+func (p *trackedQuestionCardPlatform) trackedSnapshot() ([]*Card, []*Card) {
+	p.trackedMu.Lock()
+	defer p.trackedMu.Unlock()
+	return append([]*Card(nil), p.trackedStarts...), append([]*Card(nil), p.trackedUpdates...)
+}
+
 func (p *stubCardPlatform) ReplyCard(_ context.Context, _ any, card *Card) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -5850,6 +5886,53 @@ func TestCmdStatus_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	}
 }
 
+func TestCmdStatus_PlainUsesAgentRenamedSessionTitle(t *testing.T) {
+	const staleName = "Create workspace task and reuse group chat"
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubListAgent{sessions: []AgentSessionInfo{
+		{ID: "session-renamed", Summary: "workspace", MessageCount: 18},
+	}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentInfo("session-renamed", "test", staleName)
+
+	e.cmdStatus(p, msg)
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "Session: workspace") {
+		t.Fatalf("status text = %q, want latest agent session title", p.sent[0])
+	}
+	if strings.Contains(p.sent[0], staleName) {
+		t.Fatalf("status text = %q, should not contain stale local session name", p.sent[0])
+	}
+}
+
+func TestCmdStatus_CardUsesAgentRenamedSessionTitle(t *testing.T) {
+	const staleName = "Create workspace task and reuse group chat"
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "card"}}
+	agent := &stubListAgent{sessions: []AgentSessionInfo{
+		{ID: "session-renamed", Summary: "workspace", MessageCount: 18},
+	}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentInfo("session-renamed", "test", staleName)
+
+	e.cmdStatus(p, msg)
+
+	if len(p.repliedCards) != 1 {
+		t.Fatalf("replied cards = %d, want 1", len(p.repliedCards))
+	}
+	text := p.repliedCards[0].RenderText()
+	if !strings.Contains(text, "Session: workspace") {
+		t.Fatalf("status card = %q, want latest agent session title", text)
+	}
+	if strings.Contains(text, staleName) {
+		t.Fatalf("status card = %q, should not contain stale local session name", text)
+	}
+}
+
 func TestCmdQuiet_TogglesDisplay(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -6746,6 +6829,170 @@ func TestProcessInteractiveEvents_AskUserQuestionFromAgent_RendersRichCardPrompt
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("processInteractiveEvents did not complete")
+	}
+}
+
+func TestProcessInteractiveEvents_AskUserQuestionResolvedByAnotherClientUnblocksAndInvalidatesCard(t *testing.T) {
+	p := &trackedQuestionCardPlatform{
+		stubCardPlatform: stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}},
+	}
+	sess := newExternallyResolvedBlockingSession("codex-external-answer")
+	e := NewEngine("test", &controllableAgent{nextSession: sess}, []Platform{p}, "", LangEnglish)
+	defer e.cancel()
+
+	key := "feishu:chat:user1"
+	session := e.sessions.GetOrCreateActive(key)
+	state := &interactiveState{agentSession: sess, platform: p, replyCtx: "ctx", currentSessionKey: key}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- sess.Send("prompt", "", nil, nil) }()
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "external-answer", time.Now(), nil, sendDone, "ctx")
+		close(done)
+	}()
+
+	select {
+	case <-sess.sendStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send did not reach blocking wait")
+	}
+	sess.events <- Event{
+		Type: EventPermissionRequest, RequestID: `"rui-shared"`, ToolName: "AskUserQuestion",
+		Questions: testQuestions(), ToolInputRaw: map[string]any{"questions": []any{}},
+	}
+	waitMirrorTest(t, "native tracked question card", func() bool {
+		starts, _ := p.trackedSnapshot()
+		return len(starts) == 1
+	})
+	starts, _ := p.trackedSnapshot()
+	action := firstCardActionWithPrefix(starts[0], "askq:")
+	if parts := strings.Split(action, ":"); len(parts) != 4 || parts[1] == "" {
+		t.Fatalf("native question action = %q, want exact askq:<token>:<question>:<option>", action)
+	}
+
+	// The TUI answers the same daemon request. The side channel must release
+	// the foreground event loop even though it is blocked waiting for Feishu.
+	sess.resolutions <- `"rui-shared"`
+	close(sess.unblock)
+	sess.events <- Event{Type: EventResult, Content: "continued", Done: true}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("native event loop remained stuck after external answer")
+	}
+	state.mu.Lock()
+	pending := state.pending
+	state.mu.Unlock()
+	if pending != nil {
+		t.Fatalf("externally resolved pending request was not cleared: %#v", pending)
+	}
+	_, updates := p.trackedSnapshot()
+	if len(updates) != 1 {
+		t.Fatalf("tracked question updates = %d, want 1", len(updates))
+	}
+	card := updates[0]
+	if card.Header == nil || card.Header.Color != "grey" || card.HasButtons() || !strings.Contains(card.RenderText(), "another client") {
+		t.Fatalf("externally resolved native card = %#v text=%q", card, card.RenderText())
+	}
+}
+
+func TestHandlePendingPermission_NativeQuestionCardRequiresExactIdentity(t *testing.T) {
+	e := newTestEngine()
+	p := &trackedQuestionCardPlatform{
+		stubCardPlatform: stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}},
+	}
+	rec := &recordingAgentSession{}
+	questions := testQuestions()
+	delivery := e.sendAskQuestionPrompt(p, "ctx", questions, 0, "opaque-token")
+	if !delivery.Actionable || delivery.MessageID == "" || delivery.Token != "opaque-token" {
+		t.Fatalf("exact question delivery = %#v", delivery)
+	}
+	action := firstCardActionWithPrefix(func() *Card {
+		starts, _ := p.trackedSnapshot()
+		return starts[0]
+	}(), "askq:")
+	key := "feishu:chat:user1"
+	pending := &pendingPermission{
+		RequestID: "req-exact", ToolName: "AskUserQuestion", ThreadID: "stub-session", TurnID: "turn-exact",
+		Questions: questions, Resolved: make(chan struct{}), CardHandle: delivery.Handle,
+		CardSessionKey: key, CardMessageID: delivery.MessageID, ControlToken: delivery.Token,
+		CardActionable: delivery.Actionable,
+	}
+	state := &interactiveState{
+		agentSession: rec, platform: p, replyCtx: "ctx", pending: pending,
+		currentThreadID: "stub-session", currentTurnID: "turn-exact",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	for _, msg := range []*Message{
+		{SessionKey: key, UserID: "user1", Content: action, ReplyCtx: "ctx", ReferencedMessageID: "copied-card", IsCardAction: true, IsPermissionResponse: true},
+		{SessionKey: key, UserID: "user1", Content: action, ReplyCtx: "ctx", ReferencedMessageID: delivery.MessageID, IsPermissionResponse: true},
+		{SessionKey: key, UserID: "user1", Content: "askq:wrong-token:0:1", ReplyCtx: "ctx", ReferencedMessageID: delivery.MessageID, IsCardAction: true, IsPermissionResponse: true},
+	} {
+		if !e.handlePendingPermission(p, msg, msg.Content, key) {
+			t.Fatalf("stale exact action was not consumed: %#v", msg)
+		}
+		if rec.calls != 0 {
+			t.Fatalf("stale exact action reached Codex: calls=%d message=%#v", rec.calls, msg)
+		}
+	}
+
+	valid := &Message{
+		SessionKey: key, UserID: "user1", Content: action, ReplyCtx: "ctx",
+		ReferencedMessageID: delivery.MessageID, IsCardAction: true, IsPermissionResponse: true,
+	}
+	if !e.handlePendingPermission(p, valid, valid.Content, key) {
+		t.Fatal("valid exact question action was not handled")
+	}
+	if rec.calls != 1 || rec.lastID != "req-exact" {
+		t.Fatalf("valid exact action calls=%d request=%q", rec.calls, rec.lastID)
+	}
+	answers, _ := rec.lastResult.UpdatedInput["answers"].(map[string]any)
+	if answers["Which database?"] != "PostgreSQL" {
+		t.Fatalf("exact action answers = %#v", answers)
+	}
+	_, updates := p.trackedSnapshot()
+	if len(updates) == 0 || updates[len(updates)-1].Header == nil || updates[len(updates)-1].Header.Color != "green" || updates[len(updates)-1].HasButtons() {
+		t.Fatalf("accepted question card updates = %#v", updates)
+	}
+}
+
+func TestEngineStop_InvalidatesPendingNativeQuestionCard(t *testing.T) {
+	p := &trackedQuestionCardPlatform{
+		stubCardPlatform: stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}},
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	questions := testQuestions()
+	delivery := e.sendAskQuestionPrompt(p, "ctx", questions, 0, "restart-token")
+	pending := &pendingPermission{
+		RequestID: "req-restart", ToolName: "AskUserQuestion", Questions: questions,
+		Resolved: make(chan struct{}), CardHandle: delivery.Handle, CardSessionKey: "feishu:chat:user1",
+		CardMessageID: delivery.MessageID, ControlToken: delivery.Token, CardActionable: delivery.Actionable,
+	}
+	state := &interactiveState{agentSession: &recordingAgentSession{}, platform: p, pending: pending}
+	e.interactiveMu.Lock()
+	e.interactiveStates["feishu:chat:user1"] = state
+	e.interactiveMu.Unlock()
+
+	if err := e.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	_, updates := p.trackedSnapshot()
+	if len(updates) != 1 {
+		t.Fatalf("question card updates on restart = %d, want 1", len(updates))
+	}
+	card := updates[0]
+	if card.Header == nil || card.Header.Color != "grey" || card.HasButtons() || !strings.Contains(card.RenderText(), e.i18n.T(MsgAskQuestionExpired)) {
+		t.Fatalf("expired question card = %#v text=%q", card, card.RenderText())
+	}
+	if !pending.Expired || pending.CardActionable {
+		t.Fatalf("pending lifecycle after restart = %#v", pending)
 	}
 }
 
@@ -8680,6 +8927,22 @@ type blockingSendAgentSession struct {
 	controllableAgentSession
 	sendStarted chan struct{} // sent to when Send begins waiting on unblock
 	unblock     chan struct{} // close to let Send return
+}
+
+type externallyResolvedBlockingSession struct {
+	*blockingSendAgentSession
+	resolutions chan string
+}
+
+func newExternallyResolvedBlockingSession(id string) *externallyResolvedBlockingSession {
+	return &externallyResolvedBlockingSession{
+		blockingSendAgentSession: newBlockingSendSession(id),
+		resolutions:              make(chan string, 4),
+	}
+}
+
+func (s *externallyResolvedBlockingSession) PermissionResolutions() <-chan string {
+	return s.resolutions
 }
 
 func newBlockingSendSession(id string) *blockingSendAgentSession {

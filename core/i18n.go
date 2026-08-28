@@ -448,12 +448,17 @@ const (
 	MsgPermCardBody    MsgKey = "perm_card_body"
 	MsgPermCardNote    MsgKey = "perm_card_note"
 
-	MsgAskQuestionTitle     MsgKey = "ask_question_title"
-	MsgAskQuestionNote      MsgKey = "ask_question_note"
-	MsgAskQuestionNoteMulti MsgKey = "ask_question_note_multi"
-	MsgAskQuestionMulti     MsgKey = "ask_question_multi"
-	MsgAskQuestionPrompt    MsgKey = "ask_question_prompt"
-	MsgAskQuestionAnswered  MsgKey = "ask_question_answered"
+	MsgAskQuestionTitle             MsgKey = "ask_question_title"
+	MsgAskQuestionNote              MsgKey = "ask_question_note"
+	MsgAskQuestionNoteMulti         MsgKey = "ask_question_note_multi"
+	MsgAskQuestionMulti             MsgKey = "ask_question_multi"
+	MsgAskQuestionPrompt            MsgKey = "ask_question_prompt"
+	MsgAskQuestionAnswered          MsgKey = "ask_question_answered"
+	MsgAskQuestionAnswerConfirmed   MsgKey = "ask_question_answer_confirmed"
+	MsgAskQuestionAnswerSubmitted   MsgKey = "ask_question_answer_submitted"
+	MsgAskQuestionResolvedElsewhere MsgKey = "ask_question_resolved_elsewhere"
+	MsgAskQuestionSensitiveExternal MsgKey = "ask_question_sensitive_external"
+	MsgAskQuestionExpired           MsgKey = "ask_question_expired"
 
 	MsgCommandsTitle        MsgKey = "commands_title"
 	MsgCommandsEmpty        MsgKey = "commands_empty"
@@ -740,6 +745,11 @@ const (
 	MsgTrackMirrorInterruptedNotification MsgKey = "track_mirror_interrupted_notification"
 	MsgTrackMirrorCardFailedNotification  MsgKey = "track_mirror_card_failed_notification"
 	MsgTrackMirrorResultFollows           MsgKey = "track_mirror_result_follows"
+	MsgTrackPlanExecuteHint               MsgKey = "track_plan_execute_hint"
+	MsgTrackPlanExecuteButton             MsgKey = "track_plan_execute_button"
+	MsgTrackPlanExecutePrompt             MsgKey = "track_plan_execute_prompt"
+	MsgTrackPlanExecuteStale              MsgKey = "track_plan_execute_stale"
+	MsgTrackPlanExecuteFailed             MsgKey = "track_plan_execute_failed"
 	MsgTrackSteerAccepted                 MsgKey = "track_steer_accepted"
 	MsgTrackSteerStale                    MsgKey = "track_steer_stale"
 	MsgTrackSteerFailed                   MsgKey = "track_steer_failed"
@@ -1834,6 +1844,41 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "最終回覆將在下一則訊息中傳送。",
 		LangJapanese:           "最終回答は次のメッセージで送信されます。",
 		LangSpanish:            "La respuesta final se envía en el siguiente mensaje.",
+	},
+	MsgTrackPlanExecuteHint: {
+		LangEnglish:            "This turn produced a proposed plan. You can start its implementation here.",
+		LangChinese:            "本轮已生成计划，可在此开始执行。",
+		LangTraditionalChinese: "本輪已產生計畫，可在此開始執行。",
+		LangJapanese:           "このターンで計画が作成されました。ここから実装を開始できます。",
+		LangSpanish:            "Este turno generó un plan. Puedes iniciar su implementación aquí.",
+	},
+	MsgTrackPlanExecuteButton: {
+		LangEnglish:            "Start implementing",
+		LangChinese:            "开始执行计划",
+		LangTraditionalChinese: "開始執行計畫",
+		LangJapanese:           "計画を実行",
+		LangSpanish:            "Implementar el plan",
+	},
+	MsgTrackPlanExecutePrompt: {
+		LangEnglish:            "Implement the proposed plan from the immediately preceding turn.",
+		LangChinese:            "执行上一轮刚刚产出的计划。",
+		LangTraditionalChinese: "執行上一輪剛剛產出的計畫。",
+		LangJapanese:           "直前のターンで作成された計画を実装してください。",
+		LangSpanish:            "Implementa el plan propuesto en el turno inmediatamente anterior.",
+	},
+	MsgTrackPlanExecuteStale: {
+		LangEnglish:            "This plan action is stale, already used, or no longer refers to the latest completed plan.",
+		LangChinese:            "该计划操作已失效、已使用，或已不再对应最新完成的计划。",
+		LangTraditionalChinese: "該計畫操作已失效、已使用，或已不再對應最新完成的計畫。",
+		LangJapanese:           "この計画操作は期限切れ、使用済み、または最新の完了済み計画を指していません。",
+		LangSpanish:            "Esta acción de plan está obsoleta, ya se usó o ya no corresponde al último plan completado.",
+	},
+	MsgTrackPlanExecuteFailed: {
+		LangEnglish:            "❌ Failed to start plan implementation: %v",
+		LangChinese:            "❌ 启动计划执行失败：%v",
+		LangTraditionalChinese: "❌ 啟動計畫執行失敗：%v",
+		LangJapanese:           "❌ 計画の実装を開始できませんでした: %v",
+		LangSpanish:            "❌ No se pudo iniciar la implementación del plan: %v",
 	},
 	MsgTrackSteerAccepted: {
 		LangEnglish:            "✅ Input was appended to the exact active turn shown by this card.",
@@ -3167,6 +3212,41 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "已回答",
 		LangJapanese:           "回答済み",
 		LangSpanish:            "Respondido",
+	},
+	MsgAskQuestionAnswerConfirmed: {
+		LangEnglish:            "✅ %s: **%s**",
+		LangChinese:            "✅ %s：**%s**",
+		LangTraditionalChinese: "✅ %s：**%s**",
+		LangJapanese:           "✅ %s：**%s**",
+		LangSpanish:            "✅ %s: **%s**",
+	},
+	MsgAskQuestionAnswerSubmitted: {
+		LangEnglish:            "✅ Answer submitted.",
+		LangChinese:            "✅ 回答已提交。",
+		LangTraditionalChinese: "✅ 回答已提交。",
+		LangJapanese:           "✅ 回答を送信しました。",
+		LangSpanish:            "✅ Respuesta enviada.",
+	},
+	MsgAskQuestionResolvedElsewhere: {
+		LangEnglish:            "This question was resolved in another client.",
+		LangChinese:            "该问题已在另一个客户端处理。",
+		LangTraditionalChinese: "該問題已在另一個用戶端處理。",
+		LangJapanese:           "この質問は別のクライアントで処理されました。",
+		LangSpanish:            "Esta pregunta se resolvió en otro cliente.",
+	},
+	MsgAskQuestionSensitiveExternal: {
+		LangEnglish:            "This question expects a sensitive answer. For safety, answer it in another client.",
+		LangChinese:            "该问题需要敏感回答。为避免在群聊中泄露，请在其他客户端处理。",
+		LangTraditionalChinese: "該問題需要敏感回答。為避免在群聊中洩露，請在其他用戶端處理。",
+		LangJapanese:           "この質問には機密性の高い回答が必要です。安全のため、別のクライアントで回答してください。",
+		LangSpanish:            "Esta pregunta requiere una respuesta confidencial. Por seguridad, respóndala en otro cliente.",
+	},
+	MsgAskQuestionExpired: {
+		LangEnglish:            "This question is no longer active. The answer was not submitted.",
+		LangChinese:            "该问题已失效，回答未提交。",
+		LangTraditionalChinese: "該問題已失效，回答未提交。",
+		LangJapanese:           "この質問は無効になりました。回答は送信されていません。",
+		LangSpanish:            "Esta pregunta ya no está activa. La respuesta no se envió.",
 	},
 	MsgCommandsTitle: {
 		LangEnglish:            "🔧 **Custom Commands** (%d)\n\n",

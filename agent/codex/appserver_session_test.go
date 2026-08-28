@@ -416,6 +416,55 @@ func TestAppServerSession_ThreadScopedNotificationsFailClosedWithoutValidThreadI
 	}
 }
 
+func TestAppServerSession_ForegroundDeltaFloodPreservesLogicalProgressEvents(t *testing.T) {
+	s := newIsolatedAppServerTestSession("thread-long", "turn-long", 1)
+	t.Cleanup(func() { _ = s.Close() })
+
+	for i := 0; i < 1000; i++ {
+		s.dispatchNotification("item/commandExecution/outputDelta", mustMarshalAppServerTest(t, map[string]any{
+			"threadId": "thread-long", "turnId": "turn-long", "itemId": "command-1", "delta": "x",
+		}))
+	}
+	if got := len(s.events); got != 0 {
+		t.Fatalf("foreground output deltas queued %d observer-only events", got)
+	}
+
+	s.dispatchNotification("item/started", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-long", "turnId": "turn-long",
+		"item": map[string]any{"type": "commandExecution", "id": "command-1", "command": "pwd"},
+	}))
+	completed := make(chan struct{})
+	go func() {
+		s.dispatchNotification("item/completed", mustMarshalAppServerTest(t, map[string]any{
+			"threadId": "thread-long", "turnId": "turn-long",
+			"item": map[string]any{
+				"type": "commandExecution", "id": "command-1", "command": "pwd",
+				"status": "completed", "aggregatedOutput": "/workspace", "exitCode": 0,
+			},
+		}))
+		close(completed)
+	}()
+
+	select {
+	case <-completed:
+		t.Fatal("tool result was dropped instead of applying backpressure")
+	case <-time.After(20 * time.Millisecond):
+	}
+	first := waitForAppServerEvent(t, s.events)
+	if first.Type != core.EventToolUse || first.ToolInput != "pwd" {
+		t.Fatalf("first logical progress event = %#v, want tool use", first)
+	}
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("tool result producer remained blocked after the consumer drained")
+	}
+	second := waitForAppServerEvent(t, s.events)
+	if second.Type != core.EventToolResult || second.ToolResult != "/workspace" {
+		t.Fatalf("second logical progress event = %#v, want tool result", second)
+	}
+}
+
 func TestAppServerSession_InterleavedNotificationsStayWithBoundThread(t *testing.T) {
 	sessionA := newIsolatedAppServerTestSession("thread-A", "", 512)
 	sessionB := newIsolatedAppServerTestSession("thread-B", "", 512)
@@ -538,6 +587,54 @@ func TestAppServerSession_NewThreadBuffersNotificationsUntilBound(t *testing.T) 
 	if got := len(s.bufferedNotifications); got != 0 {
 		t.Fatalf("buffered notifications = %d, want drained", got)
 	}
+}
+
+func TestAppServerSession_CompletedPlanEmitsFinalText(t *testing.T) {
+	s := newIsolatedAppServerTestSession("thread-plan", "turn-plan", 4)
+	t.Cleanup(func() { _ = s.Close() })
+
+	s.handleItemCompleted(itemNotification{
+		ThreadID: "thread-plan",
+		TurnID:   "turn-plan",
+		Item:     map[string]any{"type": "plan", "id": "plan-item", "text": "# Proposed plan\n\n- Execute it"},
+	})
+	s.completeTurn("thread-plan", "turn-plan", "completed")
+
+	textEvent := waitForAppServerEvent(t, s.events)
+	if textEvent.Type != core.EventText || textEvent.Content != "# Proposed plan\n\n- Execute it" || textEvent.TurnID != "turn-plan" {
+		t.Fatalf("plan text event = %#v", textEvent)
+	}
+	resultEvent := waitForAppServerEvent(t, s.events)
+	if resultEvent.Type != core.EventResult || !resultEvent.Done || resultEvent.TurnID != "turn-plan" {
+		t.Fatalf("plan result event = %#v", resultEvent)
+	}
+}
+
+func TestAppServerSession_LiveRequestUserInputHidesTransportJSON(t *testing.T) {
+	s := newIsolatedAppServerTestSession("thread-question", "turn-question", 4)
+	t.Cleanup(func() { _ = s.Close() })
+	s.pendingMsgs = []string{"I need one choice before continuing."}
+
+	item := map[string]any{
+		"type": "dynamicToolCall",
+		"id":   "question-item",
+		"tool": "request_user_input",
+		"arguments": map[string]any{
+			"questions": []any{map[string]any{
+				"id": "scope", "question": "Which scope?",
+			}},
+		},
+		"status":       "completed",
+		"contentItems": []any{map[string]any{"type": "inputText", "text": `{"scope":"all"}`}},
+	}
+	s.handleItemStarted(itemNotification{ThreadID: "thread-question", TurnID: "turn-question", Item: item})
+
+	event := waitForAppServerEvent(t, s.events)
+	if event.Type != core.EventThinking || event.Content != "I need one choice before continuing." {
+		t.Fatalf("pre-question event = %#v, want commentary without request JSON", event)
+	}
+	s.handleItemCompleted(itemNotification{ThreadID: "thread-question", TurnID: "turn-question", Item: item})
+	assertNoAppServerEvent(t, s.events)
 }
 
 func TestAppServerSession_ThreadStartResponseMayFollowNotifications(t *testing.T) {
@@ -680,6 +777,47 @@ func TestAppServerSession_TurnStartResponseClaimsImmediateServerRequest(t *testi
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("Send() error: %v", err)
+	}
+}
+
+func TestAppServerSession_SendWithCollaborationModeUsesAtomicTurnOverride(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdin := &lockedWriteCloser{}
+	s := &appServerSession{
+		transport:        appServerTransportProcess,
+		events:           make(chan core.Event, 4),
+		ctx:              ctx,
+		cancel:           cancel,
+		stdin:            stdin,
+		pending:          make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+		model:            "gpt-test",
+		effort:           "high",
+	}
+	s.alive.Store(true)
+	s.threadID.Store("thread-A")
+
+	done := make(chan error, 1)
+	go func() { done <- s.SendWithCollaborationMode("implement the plan", "message-plan", nil, nil, "default") }()
+	request := waitForAppServerClientRequest(t, stdin, "turn/start")
+	override, ok := request.Params["collaborationMode"].(map[string]any)
+	if !ok || override["mode"] != "default" {
+		t.Fatalf("collaborationMode = %#v", request.Params["collaborationMode"])
+	}
+	settings, ok := override["settings"].(map[string]any)
+	if !ok || settings["model"] != "gpt-test" || settings["reasoning_effort"] != "high" {
+		t.Fatalf("collaborationMode settings = %#v", override["settings"])
+	}
+	if value, exists := settings["developer_instructions"]; !exists || value != nil {
+		t.Fatalf("developer_instructions = %#v, want explicit null", settings)
+	}
+	s.handleResponse(rpcResponseEnvelope{
+		ID:     request.ID,
+		Result: mustMarshalAppServerTest(t, map[string]any{"turn": map[string]any{"id": "turn-plan-execution"}}),
+	})
+	if err := <-done; err != nil {
+		t.Fatalf("SendWithCollaborationMode() error: %v", err)
 	}
 }
 
@@ -1649,6 +1787,7 @@ func TestAppServerSession_HandleRequestUserInputEmitsAskQuestion(t *testing.T) {
 		events:           make(chan core.Event, 4),
 		ctx:              ctx,
 		pendingApprovals: make(map[string]chan core.PermissionResult),
+		permissionDone:   make(chan string, 4),
 		stdin:            stdin,
 	}
 	s.threadID.Store("thread-1")
@@ -1665,7 +1804,7 @@ func TestAppServerSession_HandleRequestUserInputEmitsAskQuestion(t *testing.T) {
 				"header":   "Database",
 				"question": "Which database should we use?",
 				"isOther":  true,
-				"isSecret": false,
+				"isSecret": true,
 				"options": []any{
 					map[string]any{"label": "Postgres", "description": "Use the existing relational database"},
 					map[string]any{"label": "SQLite", "description": "Keep it embedded"},
@@ -1693,7 +1832,7 @@ func TestAppServerSession_HandleRequestUserInputEmitsAskQuestion(t *testing.T) {
 		t.Fatalf("questions = %d, want 1", len(event.Questions))
 	}
 	q := event.Questions[0]
-	if q.Question != "Which database should we use?" || q.Header != "Database" {
+	if q.Question != "Which database should we use?" || q.Header != "Database" || !q.Secret {
 		t.Fatalf("question = %#v", q)
 	}
 	if len(q.Options) != 2 || q.Options[0].Label != "Postgres" || q.Options[1].Description != "Keep it embedded" {
@@ -1713,6 +1852,7 @@ func TestAppServerSession_HandleRequestUserInputWritesCodexResponse(t *testing.T
 		events:           make(chan core.Event, 4),
 		ctx:              ctx,
 		pendingApprovals: make(map[string]chan core.PermissionResult),
+		permissionDone:   make(chan string, 4),
 		stdin:            stdin,
 	}
 	s.threadID.Store("thread-1")
@@ -1772,6 +1912,81 @@ func TestAppServerSession_HandleRequestUserInputWritesCodexResponse(t *testing.T
 	got := envelope.Result.Answers["database"].Answers
 	if len(got) != 1 || got[0] != "Postgres" {
 		t.Fatalf("answers[database] = %#v, want [Postgres]", got)
+	}
+	s.handleNotification("serverRequest/resolved", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-1", "requestId": "rui-2",
+	}))
+	select {
+	case requestID := <-s.PermissionResolutions():
+		t.Fatalf("locally answered request leaked into external resolution side channel: %q", requestID)
+	default:
+	}
+}
+
+func TestAppServerSession_RequestUserInputResolvedByAnotherClientDoesNotReply(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stdin := &lockedWriteCloser{}
+	s := &appServerSession{
+		events:           make(chan core.Event, 4),
+		ctx:              ctx,
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+		observedInputs:   make(map[string]appServerObservedRequestUserInput),
+		permissionDone:   make(chan string, 4),
+		stdin:            stdin,
+	}
+	s.threadID.Store("thread-1")
+	s.currentTurn = "turn-1"
+	s.ownedTurn = "turn-1"
+
+	s.handleServerRequest(serverRequestProbe(t, `"rui-external"`, "item/tool/requestUserInput", map[string]any{
+		"threadId": "thread-1",
+		"turnId":   "turn-1",
+		"itemId":   "call-external",
+		"questions": []any{map[string]any{
+			"id": "database", "question": "Which database?",
+			"options": []any{map[string]any{"label": "Postgres"}},
+		}},
+	}))
+	select {
+	case event := <-s.events:
+		if event.Type != core.EventPermissionRequest || event.ThreadID != "thread-1" || event.TurnID != "turn-1" || event.ItemID != "call-external" {
+			t.Fatalf("request event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected AskUserQuestion event")
+	}
+
+	s.handleNotification("serverRequest/resolved", mustMarshalAppServerTest(t, map[string]any{
+		"threadId": "thread-1", "requestId": "rui-external",
+	}))
+	select {
+	case requestID := <-s.PermissionResolutions():
+		if requestID != `"rui-external"` {
+			t.Fatalf("resolved request id = %q", requestID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for permission resolution side channel")
+	}
+	select {
+	case event := <-s.events:
+		if event.Type != core.EventPermissionResolved || event.RequestID != `"rui-external"` || event.ThreadID != "thread-1" {
+			t.Fatalf("resolution event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for permission resolution event")
+	}
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if stdin.String() != "" {
+			t.Fatalf("resolved request wrote a duplicate response: %q", stdin.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := s.RespondPermission(`"rui-external"`, core.PermissionResult{Behavior: "allow"}); err == nil {
+		t.Fatal("stale resolved request unexpectedly accepted another answer")
 	}
 }
 

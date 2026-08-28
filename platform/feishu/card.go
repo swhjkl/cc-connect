@@ -52,6 +52,21 @@ func (p *interactivePlatform) SendCard(ctx context.Context, rctx any, card *core
 	return p.createMessage(ctx, rc.chatID, larkim.MsgTypeInteractive, cardJSON, "send card")
 }
 
+// SendTrackedCard sends a normal interactive card through the preview handle
+// path so core can later invalidate the exact message when another Codex
+// client resolves the same blocking request.
+func (p *interactivePlatform) SendTrackedCard(ctx context.Context, rctx any, card *core.Card) (any, error) {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return nil, fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+	}
+	return p.sendPreviewStart(ctx, rctx, renderCard(card, rc.sessionKey), "")
+}
+
+func (p *interactivePlatform) UpdateTrackedCard(ctx context.Context, handle any, sessionKey string, card *core.Card) error {
+	return p.UpdateMessage(ctx, handle, renderCard(card, sessionKey))
+}
+
 // RefreshCard updates a previously rendered card in-place using the Patch API.
 // It looks up the messageID stored from the most recent card action callback
 // for the given session key and patches that message with the new card content.

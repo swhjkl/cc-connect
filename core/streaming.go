@@ -119,6 +119,7 @@ type RichCardRenderOptions struct {
 	// rich-card placeholder while a turn has not produced progress yet.
 	ProgressItems     []ProgressCardEntry
 	ProgressTruncated bool
+	ProgressCounts    ProgressCardCounts
 	Language          Language
 	Markdown          string
 	Streaming         bool
@@ -139,12 +140,14 @@ type richTurnPresentation struct {
 	Steps             []ToolStep
 	ProgressItems     []ProgressCardEntry
 	ProgressTruncated bool
+	ProgressCounts    ProgressCardCounts
 	Markdown          string
 }
 
 const richProgressMaxEntries = 10
 
 func (p *richTurnPresentation) appendProgress(item ProgressCardEntry) {
+	p.ProgressCounts.add(item.Kind)
 	p.ProgressItems = append(p.ProgressItems, item)
 	if len(p.ProgressItems) <= richProgressMaxEntries {
 		return

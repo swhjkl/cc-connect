@@ -158,6 +158,11 @@ type appServerRequestUserInputResponse struct {
 	Answers map[string]appServerRequestUserInputAnswer `json:"answers"`
 }
 
+type appServerObservedRequestUserInput struct {
+	rawID     json.RawMessage
+	questions []appServerRequestUserInputQuestion
+}
+
 type appServerRequestUserInputAnswer struct {
 	Answers []string `json:"answers"`
 }
@@ -176,6 +181,7 @@ type appServerSession struct {
 	codexHome        string
 	promptPreamble   string
 	observerProgress bool
+	observerInput    bool
 
 	events chan core.Event
 
@@ -199,6 +205,8 @@ type appServerSession struct {
 
 	approvalsMu      sync.Mutex
 	pendingApprovals map[string]chan core.PermissionResult
+	observedInputs   map[string]appServerObservedRequestUserInput
+	permissionDone   chan string
 
 	threadID atomic.Value
 	alive    atomic.Bool
@@ -234,6 +242,7 @@ const (
 	appServerMaxMessageSize        = 10 * 1024 * 1024
 	appServerNotificationBufferTTL = 5 * time.Second
 	appServerNotificationBufferMax = 64
+	appServerPermissionResolved    = "__cc_connect_external_resolved__"
 )
 
 var appServerDaemonWriters = appServerDaemonWriterRegistry{
@@ -260,6 +269,8 @@ func newAppServerSession(ctx context.Context, transport, url, socketPath, workDi
 		cancel:           cancel,
 		pending:          make(map[int64]chan rpcResponseEnvelope),
 		pendingApprovals: make(map[string]chan core.PermissionResult),
+		observedInputs:   make(map[string]appServerObservedRequestUserInput),
+		permissionDone:   make(chan string, 32),
 		preambleSent:     resumeID != "" && resumeID != core.ContinueSession,
 	}
 	s.alive.Store(true)
@@ -592,8 +603,8 @@ func (s *appServerSession) bindThread(threadID string) error {
 
 // bindReadOnlyThread scopes daemon notifications to one validated thread
 // without resuming the thread or acquiring the cc-connect writer lease. It is
-// used only by passive conversation observers; server requests remain owned by
-// whichever client started the turn.
+// the base binding for passive observers and for interactive observers before
+// their explicit thread/resume subscription.
 func (s *appServerSession) bindReadOnlyThread(threadID string) error {
 	threadID = strings.TrimSpace(threadID)
 	if threadID == "" {
@@ -804,6 +815,14 @@ func (s *appServerSession) storeContextUsage(usage *core.ContextUsage) {
 }
 
 func (s *appServerSession) Send(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
+	return s.sendWithCollaborationMode(prompt, messageID, images, files, "")
+}
+
+func (s *appServerSession) SendWithCollaborationMode(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment, mode string) error {
+	return s.sendWithCollaborationMode(prompt, messageID, images, files, mode)
+}
+
+func (s *appServerSession) sendWithCollaborationMode(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment, collaborationMode string) error {
 	if !s.alive.Load() {
 		return fmt.Errorf("session is closed")
 	}
@@ -862,6 +881,26 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	if approval, _ := appServerModeSettings(s.mode); approval != "" {
 		params["approvalPolicy"] = approval
 	}
+	if collaborationMode = strings.ToLower(strings.TrimSpace(collaborationMode)); collaborationMode != "" {
+		if collaborationMode != "default" && collaborationMode != "plan" {
+			return fmt.Errorf("codex app-server: unsupported collaboration mode %q", collaborationMode)
+		}
+		model := s.GetModel()
+		if model == "" {
+			return fmt.Errorf("codex app-server: collaboration mode %q requires a model", collaborationMode)
+		}
+		settings := map[string]any{
+			"model":                  model,
+			"developer_instructions": nil,
+		}
+		if effort := s.GetReasoningEffort(); effort != "" {
+			settings["reasoning_effort"] = effort
+		}
+		params["collaborationMode"] = map[string]any{
+			"mode":     collaborationMode,
+			"settings": settings,
+		}
+	}
 
 	var resp turnStartResponse
 	if err := s.request("turn/start", params, &resp); err != nil {
@@ -904,8 +943,28 @@ func (s *appServerSession) stageImages(prompt string, images []core.ImageAttachm
 
 func (s *appServerSession) RespondPermission(requestID string, result core.PermissionResult) error {
 	s.approvalsMu.Lock()
+	observed, observedOK := s.observedInputs[requestID]
+	if observedOK {
+		delete(s.observedInputs, requestID)
+	}
 	ch := s.pendingApprovals[requestID]
+	if ch != nil {
+		// Claim the request atomically against serverRequest/resolved. Without
+		// removing it here, every locally answered prompt would also enqueue an
+		// "external" resolution and eventually fill the side channel.
+		delete(s.pendingApprovals, requestID)
+	}
 	s.approvalsMu.Unlock()
+	if observedOK {
+		response := appServerRequestUserInputResponseFromResult(observed.questions, result)
+		if err := s.writeJSON(map[string]any{
+			"jsonrpc": "2.0", "id": observed.rawID,
+			"result": response,
+		}); err != nil {
+			return fmt.Errorf("codex app-server: answer observed user input request %s: %w", requestID, err)
+		}
+		return nil
+	}
 	if ch == nil {
 		return fmt.Errorf("codex app-server: no pending approval for request %s", requestID)
 	}
@@ -914,6 +973,10 @@ func (s *appServerSession) RespondPermission(requestID string, result core.Permi
 	default:
 	}
 	return nil
+}
+
+func (s *appServerSession) PermissionResolutions() <-chan string {
+	return s.permissionDone
 }
 
 func (s *appServerSession) handleServerRequest(probe map[string]json.RawMessage) {
@@ -941,7 +1004,11 @@ func (s *appServerSession) handleServerRequest(probe map[string]json.RawMessage)
 	case "item/permissions/requestApproval":
 		s.handlePermissionsApproval(rawID, params)
 	case "item/tool/requestUserInput":
-		s.handleRequestUserInput(rawID, params)
+		if s.observerInput {
+			s.handleObservedRequestUserInput(rawID, params)
+		} else {
+			s.handleRequestUserInput(rawID, params)
+		}
 	case "item/tool/call":
 		s.handleDynamicToolCall(rawID, params)
 	default:
@@ -989,6 +1056,13 @@ func (s *appServerSession) ownsServerRequest(method string, paramsRaw json.RawMe
 			"session_thread", currentThread,
 		)
 		return false
+	}
+	if s.observerInput && method == "item/tool/requestUserInput" {
+		// thread/resume subscribes this exact observer connection to the
+		// daemon's shared server-request stream. It intentionally owns no
+		// turn writer lease, but may answer a blocking question for the bound
+		// thread just like another TUI client.
+		return identity.TurnID != ""
 	}
 	if !s.ownsWriterLease() {
 		slog.Warn("codex app-server: dropping server request without writer lease", "method", method, "thread_id", currentThread)
@@ -1075,6 +1149,9 @@ func (s *appServerSession) handleApprovalRequest(rawID json.RawMessage, method s
 		s.approvalsMu.Lock()
 		delete(s.pendingApprovals, requestID)
 		s.approvalsMu.Unlock()
+		if result.Behavior == appServerPermissionResolved {
+			return
+		}
 
 		decision := "decline"
 		if strings.EqualFold(result.Behavior, "allow") {
@@ -1122,6 +1199,9 @@ func (s *appServerSession) handlePermissionsApproval(rawID json.RawMessage, para
 		s.approvalsMu.Lock()
 		delete(s.pendingApprovals, requestID)
 		s.approvalsMu.Unlock()
+		if result.Behavior == appServerPermissionResolved {
+			return
+		}
 
 		if strings.EqualFold(result.Behavior, "allow") {
 			perms := params["permissions"]
@@ -1170,6 +1250,10 @@ func (s *appServerSession) handleRequestUserInput(rawID json.RawMessage, paramsR
 	s.flushPendingAsThinking()
 	s.emit(core.Event{
 		Type:         core.EventPermissionRequest,
+		ThreadID:     strings.TrimSpace(params.ThreadID),
+		TurnID:       strings.TrimSpace(params.TurnID),
+		ItemID:       strings.TrimSpace(params.ItemID),
+		SessionID:    strings.TrimSpace(params.ThreadID),
 		RequestID:    requestID,
 		ToolName:     "AskUserQuestion",
 		ToolInput:    appServerJSON(rawInput),
@@ -1191,6 +1275,9 @@ func (s *appServerSession) handleRequestUserInput(rawID json.RawMessage, paramsR
 		s.approvalsMu.Lock()
 		delete(s.pendingApprovals, requestID)
 		s.approvalsMu.Unlock()
+		if result.Behavior == appServerPermissionResolved {
+			return
+		}
 
 		response := appServerRequestUserInputResponseFromResult(params.Questions, result)
 		_ = s.writeJSON(map[string]any{
@@ -1198,6 +1285,52 @@ func (s *appServerSession) handleRequestUserInput(rawID json.RawMessage, paramsR
 			"result": response,
 		})
 	}()
+}
+
+func (s *appServerSession) handleObservedRequestUserInput(rawID json.RawMessage, paramsRaw json.RawMessage) {
+	requestID := string(rawID)
+	var params appServerRequestUserInputParams
+	if err := json.Unmarshal(paramsRaw, &params); err != nil {
+		slog.Warn("codex app-server: invalid observed request_user_input", "error", err)
+		return
+	}
+
+	questions := appServerRequestUserInputQuestions(params.Questions)
+	if len(questions) == 0 {
+		return
+	}
+
+	s.approvalsMu.Lock()
+	if s.observedInputs == nil {
+		s.observedInputs = make(map[string]appServerObservedRequestUserInput)
+	}
+	s.observedInputs[requestID] = appServerObservedRequestUserInput{
+		rawID:     append(json.RawMessage(nil), rawID...),
+		questions: append([]appServerRequestUserInputQuestion(nil), params.Questions...),
+	}
+	s.approvalsMu.Unlock()
+	turnID := strings.TrimSpace(params.TurnID)
+	if turnID != "" {
+		s.stateMu.Lock()
+		if s.currentTurn == "" {
+			s.currentTurn = turnID
+		}
+		s.stateMu.Unlock()
+	}
+
+	rawInput := appServerRequestUserInputRawInput(params)
+	s.emit(core.Event{
+		Type:         core.EventPermissionRequest,
+		ThreadID:     strings.TrimSpace(params.ThreadID),
+		TurnID:       strings.TrimSpace(params.TurnID),
+		ItemID:       strings.TrimSpace(params.ItemID),
+		SessionID:    strings.TrimSpace(params.ThreadID),
+		RequestID:    requestID,
+		ToolName:     "AskUserQuestion",
+		ToolInput:    appServerJSON(rawInput),
+		ToolInputRaw: rawInput,
+		Questions:    questions,
+	})
 }
 
 func (s *appServerSession) handleDynamicToolCall(rawID json.RawMessage, paramsRaw json.RawMessage) {
@@ -1220,6 +1353,7 @@ func appServerRequestUserInputQuestions(input []appServerRequestUserInputQuestio
 		q := core.UserQuestion{
 			Question: questionText,
 			Header:   strings.TrimSpace(in.Header),
+			Secret:   in.IsSecret,
 		}
 		for _, opt := range in.Options {
 			q.Options = append(q.Options, core.UserQuestionOption{
@@ -1331,6 +1465,9 @@ func (s *appServerSession) rejectPendingApprovals(err error) {
 		case ch <- core.PermissionResult{Behavior: "deny"}:
 		default:
 		}
+	}
+	for id := range s.observedInputs {
+		delete(s.observedInputs, id)
 	}
 }
 
@@ -1660,6 +1797,7 @@ func classifyAppServerNotification(method string) appServerNotificationScope {
 		"turn/completed",
 		"thread/status/changed",
 		"thread/tokenUsage/updated",
+		"serverRequest/resolved",
 		"error":
 		return appServerNotificationThread
 	case "account/rateLimits/updated":
@@ -1743,6 +1881,12 @@ func (s *appServerSession) dispatchNotification(method string, paramsRaw json.Ra
 		}
 
 	case "item/agentMessage/delta", "item/plan/delta", "item/commandExecution/outputDelta", "item/fileChange/outputDelta", "turn/plan/updated":
+		// Foreground consumers render logical item events and do not consume
+		// snapshot wakeups. Emitting every token/output delta here can fill the
+		// event channel and hide a later tool result or terminal event.
+		if !s.observerProgress {
+			return
+		}
 		var notif struct {
 			ThreadID string `json:"threadId"`
 			TurnID   string `json:"turnId"`
@@ -1786,6 +1930,16 @@ func (s *appServerSession) dispatchNotification(method string, paramsRaw json.Ra
 			s.completeTurn(notif.ThreadID, "", "completed")
 		}
 
+	case "serverRequest/resolved":
+		var notif struct {
+			ThreadID  string          `json:"threadId"`
+			RequestID json.RawMessage `json:"requestId"`
+		}
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && len(notif.RequestID) > 0 {
+			requestID := string(notif.RequestID)
+			s.resolveServerRequest(strings.TrimSpace(notif.ThreadID), requestID)
+		}
+
 	case "account/rateLimits/updated":
 		var notif appServerRateLimitsResponse
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
@@ -1818,6 +1972,36 @@ func (s *appServerSession) dispatchNotification(method string, paramsRaw json.Ra
 	}
 }
 
+func (s *appServerSession) resolveServerRequest(threadID, requestID string) {
+	s.approvalsMu.Lock()
+	ch := s.pendingApprovals[requestID]
+	delete(s.pendingApprovals, requestID)
+	delete(s.observedInputs, requestID)
+	s.approvalsMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- core.PermissionResult{Behavior: appServerPermissionResolved}:
+		default:
+		}
+	}
+	// Only a request still owned by the foreground AgentSession needs the side
+	// channel that unblocks core's permission wait. Observer requests use the
+	// regular EventPermissionResolved event below.
+	if ch != nil && s.permissionDone != nil {
+		select {
+		case s.permissionDone <- requestID:
+		default:
+			slog.Warn("codex app-server: permission resolution channel full", "request_id", requestID)
+		}
+	}
+	s.emit(core.Event{
+		Type:      core.EventPermissionResolved,
+		ThreadID:  threadID,
+		SessionID: threadID,
+		RequestID: requestID,
+	})
+}
+
 func (s *appServerSession) handleItemStarted(notif itemNotification) {
 	item := notif.Item
 	itemType, _ := item["type"].(string)
@@ -1827,6 +2011,13 @@ func (s *appServerSession) handleItemStarted(notif itemNotification) {
 
 	switch itemType {
 	case "agentMessage", "reasoning", "userMessage", "plan", "hookPrompt", "contextCompaction":
+		return
+	}
+	if appServerConversationRequestUserInputItem(itemType, item) {
+		// request_user_input has a dedicated EventPermissionRequest and card.
+		// Flush preceding commentary, but never expose its transport arguments
+		// as an ordinary tool invocation in the live progress card.
+		s.flushPendingAsThinking()
 		return
 	}
 
@@ -1842,6 +2033,11 @@ func (s *appServerSession) handleItemCompleted(notif itemNotification) {
 	if itemType == "" {
 		return
 	}
+	if appServerConversationRequestUserInputItem(itemType, item) {
+		// The corresponding result is protocol JSON, not user-facing tool
+		// output. The permission request lifecycle renders the actual answer.
+		return
+	}
 
 	switch itemType {
 	case "reasoning":
@@ -1850,7 +2046,7 @@ func (s *appServerSession) handleItemCompleted(notif itemNotification) {
 			s.emit(appServerItemEvent(notif, core.Event{Type: core.EventThinking, Content: text}))
 		}
 
-	case "agentMessage":
+	case "agentMessage", "plan":
 		text, _ := item["text"].(string)
 		if strings.TrimSpace(text) != "" {
 			s.stateMu.Lock()
@@ -2270,10 +2466,31 @@ func (s *appServerSession) flushPendingAsText(threadID, turnID string) {
 }
 
 func (s *appServerSession) emit(event core.Event) {
+	if appServerEventRequiresDelivery(event) {
+		select {
+		case s.events <- event:
+		case <-s.ctx.Done():
+		}
+		return
+	}
 	select {
 	case s.events <- event:
 	default:
-		slog.Warn("codex appserver: event channel full, dropping event", "type", event.Type)
+		// Conversation-changed events are edge-triggered snapshot wakeups. One
+		// queued wakeup is sufficient; all logical events use backpressure above.
+	}
+}
+
+func appServerEventRequiresDelivery(event core.Event) bool {
+	return event.Type != core.EventConversationChanged
+}
+
+func appServerObserverEventRequiresDelivery(event core.Event) bool {
+	switch event.Type {
+	case core.EventPermissionRequest, core.EventPermissionResolved, core.EventResult, core.EventError:
+		return true
+	default:
+		return false
 	}
 }
 

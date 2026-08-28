@@ -2,9 +2,12 @@ package core
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +16,7 @@ import (
 const (
 	trackSectionMaxBytes   = 6_000
 	trackReconcileMaxTurns = 256
+	trackPlanExecutePrefix = "plan:execute:"
 )
 
 type conversationTracker struct {
@@ -28,9 +32,44 @@ type conversationMirror struct {
 	threadID    string
 	generation  uint64
 	wake        chan struct{}
+	platform    Platform
 
 	mu      sync.Mutex
 	handles map[string]any
+	pending *conversationElicitation
+}
+
+type conversationElicitation struct {
+	token         string
+	requestID     string
+	threadID      string
+	turnID        string
+	itemID        string
+	generation    uint64
+	questions     []UserQuestion
+	answers       map[int]string
+	current       int
+	responder     ConversationObserver
+	cardHandle    any
+	cardMessageID string
+	actionable    bool
+	resolved      bool
+	submitting    bool
+}
+
+type conversationElicitationCardState struct {
+	handle   any
+	question UserQuestion
+}
+
+func conversationElicitationCardSnapshot(pending *conversationElicitation) (conversationElicitationCardState, bool) {
+	if pending == nil || pending.cardHandle == nil || pending.current < 0 || pending.current >= len(pending.questions) {
+		return conversationElicitationCardState{}, false
+	}
+	return conversationElicitationCardState{
+		handle:   pending.cardHandle,
+		question: pending.questions[pending.current],
+	}, true
 }
 
 func (m *conversationMirror) signal() {
@@ -99,6 +138,9 @@ func conversationPrompt(turn ConversationTurn) string {
 }
 
 func conversationFinalAnswer(turn ConversationTurn) string {
+	if plan := conversationProposedPlan(turn); plan != "" {
+		return plan
+	}
 	var final string
 	var legacy string
 	for _, message := range turn.Messages {
@@ -117,6 +159,19 @@ func conversationFinalAnswer(turn ConversationTurn) string {
 		return final
 	}
 	return legacy
+}
+
+func conversationProposedPlan(turn ConversationTurn) string {
+	var plan string
+	for _, message := range turn.Messages {
+		if message.Role != "assistant" || strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(message.Phase), "proposed_plan") {
+			plan = strings.TrimSpace(message.Content)
+		}
+	}
+	return plan
 }
 
 func conversationLiveResponse(turn ConversationTurn) string {
@@ -331,6 +386,7 @@ func (e *Engine) startConversationMirror(agent Agent, sessions *SessionManager, 
 		return
 	}
 
+	var retired *conversationMirror
 	e.trackMu.Lock()
 	if current := e.conversationMirrors[binding.Destination]; current != nil {
 		if current.threadID == binding.ThreadID && current.generation == binding.Generation {
@@ -339,16 +395,17 @@ func (e *Engine) startConversationMirror(agent Agent, sessions *SessionManager, 
 			return
 		}
 		delete(e.conversationMirrors, binding.Destination)
-		current.cancel()
+		retired = current
 	}
 	ctx, cancel := context.WithCancel(e.ctx)
 	mirror := &conversationMirror{
 		cancel: cancel, destination: binding.Destination, sessionKey: binding.SessionKey,
 		threadID: binding.ThreadID, generation: binding.Generation, wake: make(chan struct{}, 1),
-		handles: make(map[string]any),
+		platform: p, handles: make(map[string]any),
 	}
 	e.conversationMirrors[binding.Destination] = mirror
 	e.trackMu.Unlock()
+	e.retireConversationMirror(retired)
 	go e.runConversationMirror(ctx, mirror, agent, sessions, p)
 }
 
@@ -359,8 +416,26 @@ func (e *Engine) stopConversationMirror(destination string) {
 		delete(e.conversationMirrors, destination)
 	}
 	e.trackMu.Unlock()
-	if mirror != nil {
-		mirror.cancel()
+	e.retireConversationMirror(mirror)
+}
+
+func (e *Engine) retireConversationMirror(mirror *conversationMirror) {
+	if mirror == nil {
+		return
+	}
+	mirror.cancel()
+	mirror.mu.Lock()
+	pending := mirror.pending
+	var card conversationElicitationCardState
+	var cardOK bool
+	if pending != nil && !pending.resolved {
+		pending.resolved = true
+		pending.submitting = false
+		card, cardOK = conversationElicitationCardSnapshot(pending)
+	}
+	mirror.mu.Unlock()
+	if cardOK && mirror.platform != nil {
+		e.updateConversationElicitationCard(mirror.platform, mirror.sessionKey, card, "")
 	}
 }
 
@@ -484,7 +559,17 @@ func (e *Engine) runConversationMirror(ctx context.Context, mirror *conversation
 		if err := e.reconcileConversationMirror(ctx, mirror, provider, sessions, p); err != nil && ctx.Err() == nil {
 			slog.Warn("track: mirror reconcile failed", "platform", p.Name(), "error", err)
 		}
-		events, err := source.WatchConversation(ctx, mirror.threadID)
+		var events <-chan Event
+		var observer ConversationObserver
+		var err error
+		if interactiveSource, ok := agent.(InteractiveConversationEventSource); ok {
+			observer, err = interactiveSource.OpenConversationObserver(ctx, mirror.threadID)
+			if err == nil {
+				events = observer.Events()
+			}
+		} else {
+			events, err = source.WatchConversation(ctx, mirror.threadID)
+		}
 		if err != nil {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, ErrNotSupported) {
 				slog.Warn("track: observer connect failed", "platform", p.Name(), "error", err)
@@ -505,10 +590,22 @@ func (e *Engine) runConversationMirror(ctx context.Context, mirror *conversation
 			case <-ctx.Done():
 				watchdog.Stop()
 				return
-			case _, ok := <-events:
+			case event, ok := <-events:
 				if !ok {
 					connected = false
 					continue
+				}
+				switch event.Type {
+				case EventPermissionRequest:
+					if observer != nil {
+						e.handleConversationElicitation(ctx, mirror, sessions, p, observer, event)
+					}
+				case EventPermissionResolved:
+					e.resolveConversationElicitation(mirror, p, event.RequestID, "")
+				case EventResult:
+					if event.Done {
+						e.resolveConversationElicitationForTurn(mirror, p, event.TurnID)
+					}
 				}
 				mirror.signal()
 			case <-mirror.wake:
@@ -542,9 +639,182 @@ func waitConversationMirror(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
+func newConversationElicitationToken() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("track: generate question token: %w", err)
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func (e *Engine) buildConversationElicitationCard(questions []UserQuestion, questionIndex int, token string) *Card {
+	if questionIndex < 0 || questionIndex >= len(questions) {
+		return nil
+	}
+	question := questions[questionIndex]
+	if question.Secret {
+		title := e.i18n.T(MsgAskQuestionTitle)
+		if len(questions) > 1 {
+			title += fmt.Sprintf(" (%d/%d)", questionIndex+1, len(questions))
+		}
+		return NewCard().Title(title, "blue").
+			Markdown("**" + question.Question + "**").
+			Note(e.i18n.T(MsgAskQuestionSensitiveExternal)).Build()
+	}
+	return e.buildAskQuestionCard(questions, questionIndex, func(qIdx, optionIdx int) string {
+		return fmt.Sprintf("trackq:%s:%d:%d", token, qIdx, optionIdx)
+	})
+}
+
+func (e *Engine) handleConversationElicitation(ctx context.Context, mirror *conversationMirror, sessions *SessionManager, p Platform, responder ConversationObserver, event Event) {
+	if responder == nil || event.ToolName != "AskUserQuestion" || len(event.Questions) == 0 ||
+		strings.TrimSpace(event.RequestID) == "" || strings.TrimSpace(event.ThreadID) != mirror.threadID ||
+		strings.TrimSpace(event.TurnID) == "" {
+		return
+	}
+	binding := e.trackStore.binding(mirror.destination)
+	if binding == nil || binding.ThreadID != mirror.threadID || binding.Generation != mirror.generation || !e.effectiveTrackEnabled(binding) {
+		return
+	}
+	if delivery := e.trackStore.delivery(binding.Destination, binding.ThreadID, event.TurnID, "primary"); delivery != nil && delivery.Source == "foreground" {
+		return
+	}
+	// The foreground AgentSession receives the same daemon request and already
+	// renders the native prompt. The mirror must stay silent for that turn.
+	if session := sessions.GetOrCreateActive(binding.SessionKey); session.GetAgentSessionID() == event.ThreadID && session.Busy() {
+		return
+	}
+
+	reconstructor, ok := p.(ReplyContextReconstructor)
+	if !ok {
+		return
+	}
+	replyCtx, err := reconstructor.ReconstructReplyCtx(binding.Destination)
+	if err != nil {
+		slog.Warn("track: reconstruct question target failed", "platform", p.Name(), "error", err)
+		return
+	}
+
+	mirror.mu.Lock()
+	if current := mirror.pending; current != nil && current.requestID == event.RequestID && current.threadID == event.ThreadID {
+		current.responder = responder
+		mirror.mu.Unlock()
+		return
+	}
+	previous := mirror.pending
+	var previousCard conversationElicitationCardState
+	var previousCardOK bool
+	if previous != nil && !previous.resolved {
+		previous.resolved = true
+		previous.submitting = false
+		previousCard, previousCardOK = conversationElicitationCardSnapshot(previous)
+	}
+	mirror.mu.Unlock()
+	if previousCardOK {
+		e.updateConversationElicitationCard(p, mirror.sessionKey, previousCard, "")
+	}
+
+	token, err := newConversationElicitationToken()
+	if err != nil {
+		slog.Error("track: cannot create exact question control", "error", err)
+		return
+	}
+	pending := &conversationElicitation{
+		token: token, requestID: event.RequestID, threadID: event.ThreadID,
+		turnID: event.TurnID, itemID: event.ItemID, generation: mirror.generation,
+		questions: append([]UserQuestion(nil), event.Questions...), answers: make(map[int]string),
+		responder: responder,
+	}
+	mirror.mu.Lock()
+	mirror.pending = pending
+	mirror.mu.Unlock()
+
+	card := e.buildConversationElicitationCard(pending.questions, 0, pending.token)
+	tracked, trackedOK := p.(TrackedCardSender)
+	if !trackedOK {
+		e.sendWithCard(p, replyCtx, card)
+		return
+	}
+	if err := e.waitOutgoing(p); err != nil {
+		return
+	}
+	handle, err := tracked.SendTrackedCard(ctx, replyCtx, e.renderCardForPlatform(p, card))
+	if err != nil {
+		slog.Warn("track: send question card failed", "platform", p.Name(), "error", err)
+		return
+	}
+	messageID, identifyErr := previewMessageID(p, handle)
+	if identifyErr != nil {
+		slog.Warn("track: identify question card failed", "platform", p.Name(), "error", identifyErr)
+	}
+	mirror.mu.Lock()
+	pending.cardHandle = handle
+	pending.cardMessageID = messageID
+	pending.actionable = identifyErr == nil && messageID != ""
+	stillCurrent := mirror.pending == pending
+	if !stillCurrent {
+		pending.resolved = true
+	}
+	resolved := pending.resolved
+	resolvedCard, resolvedCardOK := conversationElicitationCardSnapshot(pending)
+	mirror.mu.Unlock()
+	if (!stillCurrent || resolved) && resolvedCardOK {
+		e.updateConversationElicitationCard(p, mirror.sessionKey, resolvedCard, "")
+	}
+}
+
+func (e *Engine) resolveConversationElicitation(mirror *conversationMirror, p Platform, requestID, answer string) {
+	if mirror == nil {
+		return
+	}
+	mirror.mu.Lock()
+	pending := mirror.pending
+	if pending == nil || pending.resolved || (requestID != "" && pending.requestID != requestID) {
+		mirror.mu.Unlock()
+		return
+	}
+	pending.resolved = true
+	pending.submitting = false
+	card, cardOK := conversationElicitationCardSnapshot(pending)
+	mirror.mu.Unlock()
+	if cardOK {
+		e.updateConversationElicitationCard(p, mirror.sessionKey, card, answer)
+	}
+}
+
+func (e *Engine) resolveConversationElicitationForTurn(mirror *conversationMirror, p Platform, turnID string) {
+	if mirror == nil || strings.TrimSpace(turnID) == "" {
+		return
+	}
+	mirror.mu.Lock()
+	pending := mirror.pending
+	if pending == nil || pending.turnID != turnID || pending.resolved {
+		mirror.mu.Unlock()
+		return
+	}
+	pending.resolved = true
+	pending.submitting = false
+	card, cardOK := conversationElicitationCardSnapshot(pending)
+	mirror.mu.Unlock()
+	if cardOK {
+		e.updateConversationElicitationCard(p, mirror.sessionKey, card, "")
+	}
+}
+
+func (e *Engine) updateConversationElicitationCard(p Platform, sessionKey string, state conversationElicitationCardState, answer string) {
+	e.updateResolvedAskQuestionCard(p, state.handle, sessionKey, state.question, answer, strings.TrimSpace(answer) == "")
+}
+
 func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conversationMirror, provider ConversationProvider, sessions *SessionManager, p Platform) error {
 	mirror.mu.Lock()
-	defer mirror.mu.Unlock()
+	var terminalQuestionCard conversationElicitationCardState
+	var terminalQuestionCardOK bool
+	defer func() {
+		mirror.mu.Unlock()
+		if terminalQuestionCardOK {
+			e.updateConversationElicitationCard(p, mirror.sessionKey, terminalQuestionCard, "")
+		}
+	}()
 	binding := e.trackStore.binding(mirror.destination)
 	if binding == nil || binding.ThreadID != mirror.threadID || binding.Generation != mirror.generation || !e.effectiveTrackEnabled(binding) {
 		return nil
@@ -568,6 +838,16 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 	}
 	if snapshot == nil || snapshot.SessionID != mirror.threadID {
 		return fmt.Errorf("track: backend returned an unexpected conversation")
+	}
+	if pending := mirror.pending; pending != nil && !pending.resolved {
+		for _, turn := range snapshot.Turns {
+			if turn.ID == pending.turnID && conversationTurnTerminal(turn.Status) {
+				pending.resolved = true
+				pending.submitting = false
+				terminalQuestionCard, terminalQuestionCardOK = conversationElicitationCardSnapshot(pending)
+				break
+			}
+		}
 	}
 	if !coverageProven {
 		_ = e.trackStore.setGap(binding.Destination, "watermark_not_covered")
@@ -873,18 +1153,19 @@ func updateTrackCardWithRetry(ctx context.Context, updater MessageUpdater, handl
 }
 
 func (e *Engine) sendTrackTerminalResult(ctx context.Context, p Platform, replyCtx any, turn ConversationTurn, delivery *trackDeliveryState, cardFailed, separateResult bool) error {
-	if delivery == nil || delivery.NotificationState == "sent" {
+	if delivery == nil || (delivery.NotificationState == "sent" && delivery.NotificationVersion >= trackNotificationVersion) {
 		return nil
 	}
 	if !cardFailed && !separateResult {
 		return e.trackStore.markNotificationSent(delivery.Key)
 	}
 	result, footer := e.renderTrackTerminalResult(p, turn, cardFailed)
+	notificationKey := trackIdempotencyKey(delivery.Key, fmt.Sprintf("terminal-v%d", trackNotificationVersion))
 	var err error
 	if sender, ok := p.(IdempotentStatusFooterSender); ok {
-		err = sender.SendIdempotentWithStatusFooter(ctx, replyCtx, result, footer, delivery.NotificationKey)
+		err = sender.SendIdempotentWithStatusFooter(ctx, replyCtx, result, footer, notificationKey)
 	} else if sender, ok := p.(IdempotentSender); ok {
-		err = sender.SendIdempotent(ctx, replyCtx, appendReplyFooter(result, footer), delivery.NotificationKey)
+		err = sender.SendIdempotent(ctx, replyCtx, appendReplyFooter(result, footer), notificationKey)
 	} else if sender, ok := p.(StatusFooterSender); ok {
 		err = sender.SendWithStatusFooter(ctx, replyCtx, result, footer)
 	} else {
@@ -952,6 +1233,275 @@ func (e *Engine) shouldNotifyTrackTerminal(status ConversationTurnStatus) bool {
 		return status == ConversationTurnFailed || status == ConversationTurnInterrupted
 	default:
 		return true
+	}
+}
+
+func (e *Engine) handleTrackedConversationElicitationInput(p Platform, msg *Message, directContent string, sessions *SessionManager) bool {
+	if msg == nil {
+		return false
+	}
+	content := strings.TrimSpace(directContent)
+	isAction := strings.HasPrefix(content, "trackq:")
+	destination, err := mirrorDestinationKey(p, msg.SessionKey)
+	if err != nil {
+		return false
+	}
+	e.trackMu.Lock()
+	mirror := e.conversationMirrors[destination]
+	e.trackMu.Unlock()
+	if mirror == nil {
+		if isAction {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+			return true
+		}
+		return false
+	}
+
+	mirror.mu.Lock()
+	pending := mirror.pending
+	if pending == nil {
+		mirror.mu.Unlock()
+		if isAction {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+			return true
+		}
+		return false
+	}
+	if !isAction && (pending.cardMessageID == "" || msg.ReferencedMessageID != pending.cardMessageID) {
+		mirror.mu.Unlock()
+		return false
+	}
+	if isAction && !msg.IsCardAction {
+		mirror.mu.Unlock()
+		return false
+	}
+	if isAction && !pending.actionable {
+		mirror.mu.Unlock()
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+		return true
+	}
+	if pending.resolved || pending.submitting || pending.generation != mirror.generation ||
+		pending.threadID != mirror.threadID || pending.current < 0 || pending.current >= len(pending.questions) {
+		mirror.mu.Unlock()
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+		return true
+	}
+	if pending.cardMessageID != "" && msg.ReferencedMessageID != pending.cardMessageID {
+		mirror.mu.Unlock()
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+		return true
+	}
+	if !e.isAdmin(msg.UserID) {
+		mirror.mu.Unlock()
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/track"))
+		return true
+	}
+
+	questionIndex := pending.current
+	question := pending.questions[questionIndex]
+	if question.Secret {
+		mirror.mu.Unlock()
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgAskQuestionSensitiveExternal))
+		return true
+	}
+	answerInput := content
+	if isAction {
+		parts := strings.Split(content, ":")
+		if len(parts) != 4 || parts[1] != pending.token {
+			mirror.mu.Unlock()
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+			return true
+		}
+		qIndex, qErr := strconv.Atoi(parts[2])
+		optionIndex, optionErr := strconv.Atoi(parts[3])
+		if qErr != nil || optionErr != nil || qIndex != questionIndex || optionIndex < 1 || optionIndex > len(question.Options) {
+			mirror.mu.Unlock()
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+			return true
+		}
+		answerInput = strconv.Itoa(optionIndex)
+	}
+	if strings.TrimSpace(answerInput) == "" {
+		mirror.mu.Unlock()
+		return false
+	}
+	answer := e.resolveAskQuestionAnswer(question, answerInput)
+	pending.answers[questionIndex] = answer
+	runMessageAccepted(msg)
+	sessions.GetOrCreateActive(msg.SessionKey).TouchUserActivity()
+
+	if questionIndex+1 < len(pending.questions) {
+		pending.current++
+		nextIndex := pending.current
+		token := pending.token
+		handle := pending.cardHandle
+		questions := append([]UserQuestion(nil), pending.questions...)
+		mirror.mu.Unlock()
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgAskQuestionAnswerConfirmed, question.Question, answer))
+		if tracked, ok := p.(TrackedCardSender); ok && handle != nil {
+			card := e.buildConversationElicitationCard(questions, nextIndex, token)
+			if err := tracked.UpdateTrackedCard(e.ctx, handle, mirror.sessionKey, e.renderCardForPlatform(p, card)); err != nil {
+				slog.Warn("track: advance question card failed", "platform", p.Name(), "error", err)
+			}
+		}
+		// A resolution can race the in-place advance above. Re-apply the
+		// terminal card after the update so stale controls never win last-write.
+		mirror.mu.Lock()
+		resolved := pending.resolved || mirror.pending != pending
+		resolvedCard, resolvedCardOK := conversationElicitationCardSnapshot(pending)
+		mirror.mu.Unlock()
+		if resolved && resolvedCardOK {
+			e.updateConversationElicitationCard(p, mirror.sessionKey, resolvedCard, "")
+		}
+		return true
+	}
+
+	pending.submitting = true
+	responder := pending.responder
+	requestID := pending.requestID
+	updatedInput := buildAskQuestionResponse(nil, pending.questions, pending.answers)
+	mirror.mu.Unlock()
+	if responder == nil {
+		mirror.mu.Lock()
+		if mirror.pending == pending {
+			pending.submitting = false
+		}
+		mirror.mu.Unlock()
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+		return true
+	}
+	if err := responder.RespondPermission(requestID, PermissionResult{Behavior: "allow", UpdatedInput: updatedInput}); err != nil {
+		mirror.mu.Lock()
+		if mirror.pending == pending {
+			pending.submitting = false
+		}
+		alreadyResolved := pending.resolved
+		mirror.mu.Unlock()
+		if alreadyResolved {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+		} else {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+		}
+		return true
+	}
+	e.resolveConversationElicitation(mirror, p, requestID, answer)
+	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgAskQuestionAnswerConfirmed, question.Question, answer))
+	return true
+}
+
+func (e *Engine) handleTrackedPlanAction(p Platform, msg *Message, content string, agent Agent, sessions *SessionManager) bool {
+	if msg == nil || !msg.IsCardAction || !strings.HasPrefix(content, "plan:") {
+		return false
+	}
+	stale := func() {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackPlanExecuteStale))
+	}
+	if !strings.HasPrefix(content, trackPlanExecutePrefix) {
+		stale()
+		return true
+	}
+	if !e.isAdmin(msg.UserID) {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/track"))
+		return true
+	}
+	destination, err := mirrorDestinationKey(p, msg.SessionKey)
+	if err != nil {
+		stale()
+		return true
+	}
+	key := strings.TrimSpace(strings.TrimPrefix(content, trackPlanExecutePrefix))
+	binding := e.trackStore.binding(destination)
+	delivery := e.trackStore.deliveryByKey(key)
+	if key == "" || binding == nil || delivery == nil || delivery.Source != "external" || delivery.Purpose != "primary" ||
+		delivery.Destination != destination || delivery.SessionKey != msg.SessionKey || !strings.EqualFold(delivery.Platform, p.Name()) ||
+		delivery.ThreadID != binding.ThreadID || delivery.Generation != binding.Generation || !delivery.Terminal ||
+		delivery.CardMessageID == "" || delivery.CardMessageID != msg.ReferencedMessageID {
+		stale()
+		return true
+	}
+	session := sessions.GetOrCreateActive(msg.SessionKey)
+	if session.GetAgentSessionID() != delivery.ThreadID || session.Busy() {
+		stale()
+		return true
+	}
+	provider, ok := agent.(ConversationProvider)
+	if !ok {
+		stale()
+		return true
+	}
+	readCtx, cancel := context.WithTimeout(e.ctx, 4*time.Second)
+	snapshot, readErr := provider.GetConversation(readCtx, delivery.ThreadID, 8)
+	cancel()
+	if readErr != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackPlanExecuteFailed, readErr))
+		return true
+	}
+	latest, latestOK := latestConversationTurn(snapshot)
+	turn, turnOK := conversationTurnByID(snapshot, delivery.TurnID)
+	if snapshot == nil || snapshot.SessionID != delivery.ThreadID || !latestOK || !turnOK || latest.ID != turn.ID ||
+		turn.Status != ConversationTurnCompleted || conversationProposedPlan(turn) == "" {
+		stale()
+		return true
+	}
+	claimed, claimErr := e.trackStore.claimPlanAction(delivery.Key)
+	if claimErr != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackPlanExecuteFailed, claimErr))
+		return true
+	}
+	if !claimed {
+		stale()
+		return true
+	}
+
+	accepted := false
+	messageID := trackIdempotencyKey(delivery.Key, "plan-execute")
+	synthetic := &Message{
+		SessionKey:                msg.SessionKey,
+		Platform:                  msg.Platform,
+		MessageID:                 messageID,
+		ClientUserMessageID:       messageID,
+		ChannelID:                 msg.ChannelID,
+		ChannelKey:                msg.ChannelKey,
+		LegacyChannelKey:          msg.LegacyChannelKey,
+		UserID:                    msg.UserID,
+		UserName:                  msg.UserName,
+		ChatName:                  msg.ChatName,
+		Content:                   e.i18n.T(MsgTrackPlanExecutePrompt),
+		ReplyCtx:                  msg.ReplyCtx,
+		CollaborationModeOverride: "default",
+		OnAccepted: func() {
+			accepted = true
+			if err := e.trackStore.markPlanActionAccepted(delivery.Key); err != nil {
+				slog.Warn("track: persist accepted plan action failed", "delivery", delivery.Key, "error", err)
+			}
+		},
+	}
+	e.ReceiveMessage(p, synthetic)
+	if !accepted {
+		if err := e.trackStore.releasePlanAction(delivery.Key); err != nil {
+			slog.Warn("track: release rejected plan action failed", "delivery", delivery.Key, "error", err)
+		}
+	} else {
+		go e.refreshTrackedPlanCard(p, binding, snapshot, turn, delivery.Key)
+	}
+	return true
+}
+
+func (e *Engine) refreshTrackedPlanCard(p Platform, binding *trackBindingState, snapshot *ConversationSnapshot, turn ConversationTurn, deliveryKey string) {
+	e.trackMu.Lock()
+	mirror := e.conversationMirrors[binding.Destination]
+	e.trackMu.Unlock()
+	if mirror == nil {
+		return
+	}
+	delivery := e.trackStore.deliveryByKey(deliveryKey)
+	if delivery == nil {
+		return
+	}
+	mirror.mu.Lock()
+	defer mirror.mu.Unlock()
+	if err := e.updateExternalConversationCard(e.ctx, mirror, binding, snapshot, turn, delivery, p); err != nil && e.ctx.Err() == nil {
+		slog.Warn("track: refresh executed plan card failed", "delivery", deliveryKey, "error", err)
 	}
 }
 
@@ -1127,7 +1677,17 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 			mirror := e.conversationMirrors[destination]
 			e.trackMu.Unlock()
 			if mirror != nil {
-				mirror.signal()
+				if delivery.Terminal {
+					mirror.mu.Lock()
+					err = e.updateExternalConversationCard(e.ctx, mirror, binding, snapshot, turn, delivery, p)
+					mirror.mu.Unlock()
+					if err != nil {
+						e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackReadFailed, err))
+						return
+					}
+				} else {
+					mirror.signal()
+				}
 			}
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackRefreshed))
 			return
@@ -1526,14 +2086,19 @@ func (e *Engine) conversationTurnPresentation(turn ConversationTurn) richTurnPre
 
 func (e *Engine) fallbackConversationPresentationEvents(turn ConversationTurn) []Event {
 	var events []Event
-	var finalResponse string
+	finalResponse := conversationProposedPlan(turn)
 	for _, message := range turn.Messages {
 		if message.Role != "assistant" || strings.TrimSpace(message.Content) == "" {
 			continue
 		}
 		switch strings.ToLower(strings.TrimSpace(message.Phase)) {
 		case "final_answer", "finalanswer":
-			finalResponse = message.Content
+			if finalResponse == "" {
+				finalResponse = message.Content
+			}
+		case "proposed_plan":
+			// Proposed plans are selected before the loop so a protocol that also
+			// exposes a wrapped final_answer cannot override the canonical plan.
 		case "commentary":
 			events = append(events, Event{Type: EventThinking, ItemID: message.ID, Content: message.Content})
 		case "":
@@ -1647,12 +2212,26 @@ func (e *Engine) renderTrackPayloadWithResponse(p Platform, snapshot *Conversati
 			Value: action,
 			Extra: map[string]string{"session_key": sessionKey},
 		}}
+	} else if conversationProposedPlan(turn) != "" {
+		if destination, err := mirrorDestinationKey(p, sessionKey); err == nil {
+			if delivery := e.trackStore.delivery(destination, snapshot.SessionID, turn.ID, "primary"); delivery != nil &&
+				delivery.Source == "external" && delivery.PlanActionState == "" {
+				footer += "\n" + e.i18n.T(MsgTrackPlanExecuteHint)
+				buttons = []CardButton{{
+					Text:  e.i18n.T(MsgTrackPlanExecuteButton),
+					Type:  "primary",
+					Value: trackPlanExecutePrefix + delivery.Key,
+					Extra: map[string]string{"session_key": sessionKey},
+				}}
+			}
+		}
 	}
 	options := RichCardRenderOptions{
 		Status: status, Title: e.trackMirrorTitle(turn.Status), Variant: CardVariantMirror,
 		Steps:             presentation.Steps,
 		ProgressItems:     append([]ProgressCardEntry{}, presentation.ProgressItems...),
 		ProgressTruncated: presentation.ProgressTruncated,
+		ProgressCounts:    presentation.ProgressCounts,
 		Language:          e.i18n.CurrentLang(),
 		Markdown:          richMarkdown,
 		Streaming:         streaming,

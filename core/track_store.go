@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	trackStateVersion      = 1
-	trackReservationMaxAge = 24 * time.Hour
-	trackRecentTurnLimit   = 64
+	trackStateVersion        = 1
+	trackReservationMaxAge   = 24 * time.Hour
+	trackRecentTurnLimit     = 64
+	trackNotificationVersion = 1
 )
 
 type trackOverride string
@@ -44,27 +45,29 @@ type trackBindingState struct {
 }
 
 type trackDeliveryState struct {
-	Key               string    `json:"key"`
-	Destination       string    `json:"destination"`
-	SessionKey        string    `json:"session_key"`
-	Platform          string    `json:"platform"`
-	ThreadID          string    `json:"thread_id"`
-	TurnID            string    `json:"turn_id"`
-	Generation        uint64    `json:"generation"`
-	Purpose           string    `json:"purpose"`
-	Source            string    `json:"source"`
-	ClientID          string    `json:"client_id,omitempty"`
-	CardCreateKey     string    `json:"card_create_key"`
-	CardHandle        string    `json:"card_handle,omitempty"`
-	CardMessageID     string    `json:"card_message_id,omitempty"`
-	RenderHash        string    `json:"render_hash,omitempty"`
-	Status            string    `json:"status,omitempty"`
-	Terminal          bool      `json:"terminal,omitempty"`
-	NotificationState string    `json:"notification_state,omitempty"`
-	NotificationKey   string    `json:"notification_key"`
-	LastError         string    `json:"last_error,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	Key                 string    `json:"key"`
+	Destination         string    `json:"destination"`
+	SessionKey          string    `json:"session_key"`
+	Platform            string    `json:"platform"`
+	ThreadID            string    `json:"thread_id"`
+	TurnID              string    `json:"turn_id"`
+	Generation          uint64    `json:"generation"`
+	Purpose             string    `json:"purpose"`
+	Source              string    `json:"source"`
+	ClientID            string    `json:"client_id,omitempty"`
+	CardCreateKey       string    `json:"card_create_key"`
+	CardHandle          string    `json:"card_handle,omitempty"`
+	CardMessageID       string    `json:"card_message_id,omitempty"`
+	RenderHash          string    `json:"render_hash,omitempty"`
+	Status              string    `json:"status,omitempty"`
+	Terminal            bool      `json:"terminal,omitempty"`
+	PlanActionState     string    `json:"plan_action_state,omitempty"`
+	NotificationState   string    `json:"notification_state,omitempty"`
+	NotificationVersion int       `json:"notification_version,omitempty"`
+	NotificationKey     string    `json:"notification_key"`
+	LastError           string    `json:"last_error,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type trackForegroundReservation struct {
@@ -636,6 +639,44 @@ func (s *trackStateStore) setDeliveryError(key, message string) error {
 func (s *trackStateStore) markNotificationSent(key string) error {
 	_, err := s.updateDelivery(key, func(delivery *trackDeliveryState) {
 		delivery.NotificationState = "sent"
+		delivery.NotificationVersion = trackNotificationVersion
+	})
+	return err
+}
+
+func (s *trackStateStore) claimPlanAction(key string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delivery := s.state.Deliveries[strings.TrimSpace(key)]
+	if delivery == nil {
+		return false, fmt.Errorf("track: delivery not found")
+	}
+	if delivery.PlanActionState != "" {
+		return false, nil
+	}
+	previous := cloneTrackPersistedState(s.state)
+	delivery.PlanActionState = "claimed"
+	delivery.UpdatedAt = time.Now()
+	if err := s.commitLocked(previous); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *trackStateStore) markPlanActionAccepted(key string) error {
+	_, err := s.updateDelivery(key, func(delivery *trackDeliveryState) {
+		if delivery.PlanActionState == "claimed" {
+			delivery.PlanActionState = "accepted"
+		}
+	})
+	return err
+}
+
+func (s *trackStateStore) releasePlanAction(key string) error {
+	_, err := s.updateDelivery(key, func(delivery *trackDeliveryState) {
+		if delivery.PlanActionState == "claimed" {
+			delivery.PlanActionState = ""
+		}
 	})
 	return err
 }

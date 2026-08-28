@@ -107,6 +107,9 @@ func TestRichTurnPresentation_ProgressItemsKeepLatestTen(t *testing.T) {
 	if got := presentation.ProgressItems[0].Text; got != "step-02" {
 		t.Fatalf("first visible progress item = %q, want step-02", got)
 	}
+	if got := presentation.ProgressCounts.Reasoning; got != 12 {
+		t.Fatalf("cumulative reasoning count = %d, want 12", got)
+	}
 }
 
 func TestStreamPreview_ThrottlesUpdates(t *testing.T) {

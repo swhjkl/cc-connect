@@ -125,6 +125,38 @@ type markerQueueSession struct {
 	sent chan string
 }
 
+type planExecutionSend struct {
+	prompt string
+	mode   string
+	id     string
+}
+
+type planExecutionSession struct {
+	events chan Event
+	sends  chan planExecutionSend
+}
+
+func newPlanExecutionSession() *planExecutionSession {
+	return &planExecutionSession{events: make(chan Event, 8), sends: make(chan planExecutionSend, 4)}
+}
+
+func (s *planExecutionSession) Send(string, string, []ImageAttachment, []FileAttachment) error {
+	return errors.New("plain Send used for plan execution")
+}
+
+func (s *planExecutionSession) SendWithCollaborationMode(prompt, messageID string, _ []ImageAttachment, _ []FileAttachment, mode string) error {
+	s.sends <- planExecutionSend{prompt: prompt, mode: mode, id: messageID}
+	s.events <- Event{Type: EventText, ThreadID: "thread-1", TurnID: "turn-execute", Content: "implemented"}
+	s.events <- Event{Type: EventResult, ThreadID: "thread-1", TurnID: "turn-execute", SessionID: "thread-1", Content: "implemented", Done: true}
+	return nil
+}
+
+func (s *planExecutionSession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *planExecutionSession) Events() <-chan Event                             { return s.events }
+func (s *planExecutionSession) CurrentSessionID() string                         { return "thread-1" }
+func (s *planExecutionSession) Alive() bool                                      { return true }
+func (s *planExecutionSession) Close() error                                     { return nil }
+
 func newMarkerQueueSession(id string) *markerQueueSession {
 	return &markerQueueSession{
 		controllableAgentSession: controllableAgentSession{
@@ -232,6 +264,84 @@ type mirrorTestPlatform struct {
 	options           []RichCardRenderOptions
 	footerSends       []string
 	notificationKey   map[string]struct{}
+}
+
+type mirrorQuestionResponse struct {
+	requestID string
+	result    PermissionResult
+}
+
+type mirrorQuestionObserver struct {
+	events    chan Event
+	responses chan mirrorQuestionResponse
+}
+
+type interactiveQuestionMirrorAgent struct {
+	*mirrorTestAgent
+	observer *mirrorQuestionObserver
+	opened   chan struct{}
+	once     sync.Once
+}
+
+func newInteractiveQuestionMirrorAgent(snapshot *ConversationSnapshot) *interactiveQuestionMirrorAgent {
+	return &interactiveQuestionMirrorAgent{
+		mirrorTestAgent: newMirrorTestAgent(snapshot),
+		observer:        newMirrorQuestionObserver(),
+		opened:          make(chan struct{}),
+	}
+}
+
+func (a *interactiveQuestionMirrorAgent) OpenConversationObserver(context.Context, string) (ConversationObserver, error) {
+	a.once.Do(func() { close(a.opened) })
+	return a.observer, nil
+}
+
+func newMirrorQuestionObserver() *mirrorQuestionObserver {
+	return &mirrorQuestionObserver{
+		events:    make(chan Event, 8),
+		responses: make(chan mirrorQuestionResponse, 8),
+	}
+}
+
+func (o *mirrorQuestionObserver) Events() <-chan Event { return o.events }
+
+func (o *mirrorQuestionObserver) RespondPermission(requestID string, result PermissionResult) error {
+	o.responses <- mirrorQuestionResponse{requestID: requestID, result: result}
+	return nil
+}
+
+type mirrorQuestionPlatform struct {
+	*mirrorTestPlatform
+	questionMu      sync.Mutex
+	questionStarts  []*Card
+	questionUpdates []*Card
+}
+
+func newMirrorQuestionPlatform() *mirrorQuestionPlatform {
+	return &mirrorQuestionPlatform{mirrorTestPlatform: newMirrorTestPlatform()}
+}
+
+func (p *mirrorQuestionPlatform) SendTrackedCard(_ context.Context, _ any, card *Card) (any, error) {
+	p.questionMu.Lock()
+	defer p.questionMu.Unlock()
+	handle := fmt.Sprintf("question-card-%d", len(p.questionStarts)+1)
+	p.questionStarts = append(p.questionStarts, card)
+	return handle, nil
+}
+
+func (p *mirrorQuestionPlatform) UpdateTrackedCard(_ context.Context, _ any, _ string, card *Card) error {
+	p.questionMu.Lock()
+	p.questionUpdates = append(p.questionUpdates, card)
+	p.questionMu.Unlock()
+	return nil
+}
+
+func (p *mirrorQuestionPlatform) questionSnapshot() ([]*Card, []*Card) {
+	p.questionMu.Lock()
+	defer p.questionMu.Unlock()
+	starts := append([]*Card(nil), p.questionStarts...)
+	updates := append([]*Card(nil), p.questionUpdates...)
+	return starts, updates
 }
 
 type disabledMirrorTestPlatform struct {
@@ -370,6 +480,111 @@ func TestConversationMirror_CardFailureResultRetryPreservesFallback(t *testing.T
 	}
 }
 
+func TestSendTrackTerminalResult_RepairsLegacyPlanNotificationOnce(t *testing.T) {
+	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+	p := newMirrorTestPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	binding, err := e.bindConversationMirror(p, "mirror:chat:admin", "thread-1")
+	if err != nil {
+		t.Fatalf("bindConversationMirror() error = %v", err)
+	}
+	delivery, _, err := e.trackStore.claimDelivery(binding, "turn-plan", "primary", "external", "")
+	if err != nil {
+		t.Fatalf("claimDelivery() error = %v", err)
+	}
+	delivery, err = e.trackStore.updateDelivery(delivery.Key, func(state *trackDeliveryState) {
+		state.Terminal = true
+		state.NotificationState = "sent"
+		state.NotificationVersion = 0
+	})
+	if err != nil {
+		t.Fatalf("prepare legacy delivery: %v", err)
+	}
+	turn := ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnCompleted,
+		Messages: []ConversationMessage{{Role: "assistant", Content: "# Recovered plan", Phase: "proposed_plan"}},
+	}
+	if err := e.sendTrackTerminalResult(e.ctx, p, "mirror:chat", turn, delivery, false, true); err != nil {
+		t.Fatalf("repair legacy plan result: %v", err)
+	}
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "Recovered plan") {
+		t.Fatalf("repaired result = %q", got)
+	}
+	delivery = e.trackStore.deliveryByKey(delivery.Key)
+	if delivery.NotificationVersion != trackNotificationVersion || delivery.NotificationState != "sent" {
+		t.Fatalf("repaired delivery state = %#v", delivery)
+	}
+	before := len(p.getSent())
+	if err := e.sendTrackTerminalResult(e.ctx, p, "mirror:chat", turn, delivery, false, true); err != nil {
+		t.Fatalf("repeat repaired plan result: %v", err)
+	}
+	if after := len(p.getSent()); after != before {
+		t.Fatalf("repaired notification duplicated: before=%d after=%d", before, after)
+	}
+}
+
+func TestCmdTrack_RepairsPersistedTerminalPlanDelivery(t *testing.T) {
+	turn := ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnCompleted,
+		Messages: []ConversationMessage{
+			{Role: "user", Content: "make a plan"},
+			{Role: "assistant", Content: "# Persisted plan\n\n- Repair it", Phase: "proposed_plan"},
+		},
+	}
+	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", turn))
+	p := newMirrorTestPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetAdminFrom("admin")
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatalf("bindConversationMirror() error = %v", err)
+	}
+	if err := e.trackStore.setInitialized(binding.Destination, turn.ID, []string{turn.ID}); err != nil {
+		t.Fatalf("setInitialized() error = %v", err)
+	}
+	delivery, _, err := e.trackStore.claimDelivery(binding, turn.ID, "primary", "external", "")
+	if err != nil {
+		t.Fatalf("claimDelivery() error = %v", err)
+	}
+	delivery, err = e.trackStore.setDeliveryHandle(delivery.Key, "card-plan", "card-plan")
+	if err != nil {
+		t.Fatalf("setDeliveryHandle() error = %v", err)
+	}
+	_, err = e.trackStore.updateDelivery(delivery.Key, func(state *trackDeliveryState) {
+		state.Terminal = true
+		state.Status = string(turn.Status)
+		state.RenderHash = "legacy-render"
+		state.NotificationState = "sent"
+		state.NotificationVersion = 0
+	})
+	if err != nil {
+		t.Fatalf("prepare persisted delivery: %v", err)
+	}
+
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "track-refresh",
+		UserID: "admin", Content: "/track", ReplyCtx: "ctx",
+	})
+	waitMirrorTest(t, "persisted plan repair", func() bool {
+		state := e.trackStore.deliveryByKey(delivery.Key)
+		return state != nil && state.NotificationVersion == trackNotificationVersion
+	})
+	p.trackMu.Lock()
+	options := append([]RichCardRenderOptions(nil), p.options...)
+	updates := append([]string(nil), p.updates...)
+	p.trackMu.Unlock()
+	if len(updates) == 0 || len(options) == 0 || len(options[len(options)-1].Buttons) != 1 {
+		t.Fatalf("persisted plan card was not refreshed with action: updates=%#v options=%#v", updates, options)
+	}
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "Persisted plan") || !strings.Contains(got, "refreshed") {
+		t.Fatalf("persisted plan repair output = %q", got)
+	}
+}
+
 func waitMirrorTest(t *testing.T, description string, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -419,6 +634,210 @@ func startMirrorTest(t *testing.T, agent *mirrorTestAgent, p *mirrorTestPlatform
 	e.startConversationMirror(agent, e.sessions, p, binding)
 	waitMirrorTest(t, "initial mirror reconciliation", func() bool { return agent.readCount() > 0 })
 	return e, binding, key
+}
+
+func firstCardActionWithPrefix(card *Card, prefix string) string {
+	if card == nil {
+		return ""
+	}
+	for _, element := range card.Elements {
+		switch item := element.(type) {
+		case CardListItem:
+			if strings.HasPrefix(item.BtnValue, prefix) {
+				return item.BtnValue
+			}
+		case CardActions:
+			for _, button := range item.Buttons {
+				if strings.HasPrefix(button.Value, prefix) {
+					return button.Value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func TestConversationMirror_BlockingQuestionIsVisibleAnswerableAndInvalidated(t *testing.T) {
+	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	defer e.cancel()
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatalf("bindConversationMirror() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+	mirror := &conversationMirror{
+		cancel: cancel, destination: binding.Destination, sessionKey: binding.SessionKey,
+		threadID: binding.ThreadID, generation: binding.Generation, wake: make(chan struct{}, 1),
+		platform: p, handles: make(map[string]any),
+	}
+	e.trackMu.Lock()
+	e.conversationMirrors[binding.Destination] = mirror
+	e.trackMu.Unlock()
+	observer := newMirrorQuestionObserver()
+	questions := []UserQuestion{{
+		Question: "Which database?", Header: "Database",
+		Options: []UserQuestionOption{{Label: "Postgres", Description: "Production"}, {Label: "SQLite", Description: "Embedded"}},
+	}}
+
+	// Action 1: the shared external turn blocks and Feishu receives the same
+	// native AskUserQuestion card shape, with exact mirror action tokens.
+	e.handleConversationElicitation(ctx, mirror, e.sessions, p, observer, Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-external", ItemID: "question-1",
+		RequestID: "request-1", ToolName: "AskUserQuestion", Questions: questions,
+	})
+	starts, _ := p.questionSnapshot()
+	if len(starts) != 1 {
+		t.Fatalf("tracked question cards = %d, want 1", len(starts))
+	}
+	card := starts[0]
+	if card.Header == nil || card.Header.Color != "blue" || card.Header.Title != e.i18n.T(MsgAskQuestionTitle) {
+		t.Fatalf("question card header = %#v", card.Header)
+	}
+	if got := card.RenderText(); !strings.Contains(got, "Which database?") || !strings.Contains(got, "Postgres") || !strings.Contains(got, "SQLite") {
+		t.Fatalf("question card text = %q", got)
+	}
+	if got := countCardActionValues(card, "trackq:"); got != 2 {
+		t.Fatalf("trackq controls = %d, want 2", got)
+	}
+	action := firstCardActionWithPrefix(card, "trackq:")
+	if action == "" {
+		t.Fatal("question card has no trackq action")
+	}
+
+	// Action 2: a typed look-alike and a copied-card message ID both fail
+	// closed. Only a real callback from the exact source card reaches Codex.
+	if e.handleTrackedConversationElicitationInput(p, &Message{
+		SessionKey: key, UserID: "admin", Content: action, ReplyCtx: "ctx",
+	}, action, e.sessions) {
+		t.Fatal("typed trackq look-alike was consumed as a card action")
+	}
+	if !e.handleTrackedConversationElicitationInput(p, &Message{
+		SessionKey: key, UserID: "admin", Content: action, ReplyCtx: "ctx",
+		ReferencedMessageID: "copied-card", IsCardAction: true,
+	}, action, e.sessions) {
+		t.Fatal("copied-card action should be consumed as stale")
+	}
+	select {
+	case response := <-observer.responses:
+		t.Fatalf("invalid card action reached observer: %#v", response)
+	default:
+	}
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "answer-1", UserID: "admin",
+		Content: action, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+	})
+	select {
+	case response := <-observer.responses:
+		if response.requestID != "request-1" || response.result.Behavior != "allow" {
+			t.Fatalf("observer response = %#v", response)
+		}
+		answers, ok := response.result.UpdatedInput["answers"].(map[string]any)
+		if !ok || answers["Which database?"] != "Postgres" {
+			t.Fatalf("observer answers = %#v", response.result.UpdatedInput)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exact question action did not answer observer")
+	}
+	_, updates := p.questionSnapshot()
+	if len(updates) == 0 || updates[len(updates)-1].Header == nil || updates[len(updates)-1].Header.Color != "green" || updates[len(updates)-1].HasButtons() {
+		t.Fatalf("answered question card = %#v", updates)
+	}
+	localUpdateCount := len(updates)
+	e.resolveConversationElicitation(mirror, p, "request-1", "")
+	_, updates = p.questionSnapshot()
+	if len(updates) != localUpdateCount || updates[len(updates)-1].Header.Color != "green" {
+		t.Fatalf("daemon resolution overwrote the locally answered card: %#v", updates)
+	}
+
+	// Action 3: if a TUI answers a later question first, the Feishu controls
+	// disappear and explain the cross-client resolution instead of hanging.
+	e.handleConversationElicitation(ctx, mirror, e.sessions, p, observer, Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-external-2", ItemID: "question-2",
+		RequestID: "request-2", ToolName: "AskUserQuestion", Questions: questions,
+	})
+	e.resolveConversationElicitation(mirror, p, "request-2", "")
+	starts, updates = p.questionSnapshot()
+	if len(starts) != 2 || len(updates) < 2 {
+		t.Fatalf("question lifecycle starts=%d updates=%d", len(starts), len(updates))
+	}
+	resolved := updates[len(updates)-1]
+	if resolved.Header == nil || resolved.Header.Color != "grey" || resolved.HasButtons() ||
+		!strings.Contains(resolved.RenderText(), "another client") {
+		t.Fatalf("externally resolved question card = %#v text=%q", resolved, resolved.RenderText())
+	}
+
+	// A foreground cc-connect turn renders the native prompt itself; the
+	// observer copy must not create a duplicate mirror question card.
+	if !session.TryLock() {
+		t.Fatal("failed to mark foreground session busy")
+	}
+	e.handleConversationElicitation(ctx, mirror, e.sessions, p, observer, Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-foreground", ItemID: "question-3",
+		RequestID: "request-3", ToolName: "AskUserQuestion", Questions: questions,
+	})
+	session.UnlockWithoutUpdate()
+	starts, _ = p.questionSnapshot()
+	if len(starts) != 2 {
+		t.Fatalf("foreground request created duplicate mirror card: %d", len(starts))
+	}
+
+	// Sensitive answers are never collected or echoed through a shared chat.
+	secretQuestions := []UserQuestion{{Question: "Enter the deployment token", Secret: true}}
+	e.handleConversationElicitation(ctx, mirror, e.sessions, p, observer, Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-external-4", ItemID: "question-4",
+		RequestID: "request-4", ToolName: "AskUserQuestion", Questions: secretQuestions,
+	})
+	starts, _ = p.questionSnapshot()
+	if len(starts) != 3 || starts[len(starts)-1].HasButtons() || !strings.Contains(starts[len(starts)-1].RenderText(), "sensitive answer") {
+		t.Fatalf("sensitive external question card = %#v", starts)
+	}
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "secret-answer", UserID: "admin",
+		Content: "top-secret", ReplyCtx: "ctx", ReferencedMessageID: "question-card-3",
+	})
+	select {
+	case response := <-observer.responses:
+		t.Fatalf("sensitive answer reached shared observer: %#v", response)
+	default:
+	}
+	if got := strings.Join(p.getSent(), "\n"); strings.Contains(got, "top-secret") || !strings.Contains(got, "another client") {
+		t.Fatalf("sensitive answer handling leaked or omitted warning: %q", got)
+	}
+	e.resolveConversationElicitation(mirror, p, "request-4", "")
+
+	// A terminal authoritative snapshot also retires the prompt, even when a
+	// resumed observer did not receive the original turn/started event.
+	e.handleConversationElicitation(ctx, mirror, e.sessions, p, observer, Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-external-5", ItemID: "question-5",
+		RequestID: "request-5", ToolName: "AskUserQuestion", Questions: questions,
+	})
+	agent.setSnapshot(mirrorTestSnapshot("thread-1", ConversationTurn{ID: "turn-external-5", Status: ConversationTurnCompleted}))
+	if err := e.reconcileConversationMirror(ctx, mirror, agent, e.sessions, p); err != nil {
+		t.Fatalf("terminal snapshot reconciliation error = %v", err)
+	}
+	starts, updates = p.questionSnapshot()
+	if len(starts) != 4 || len(updates) == 0 || updates[len(updates)-1].Header == nil || updates[len(updates)-1].Header.Color != "grey" {
+		t.Fatalf("terminal snapshot left active question controls: starts=%d updates=%#v", len(starts), updates)
+	}
+
+	// Disabling or rebinding tracking also retires any outstanding controls.
+	e.handleConversationElicitation(ctx, mirror, e.sessions, p, observer, Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-external-6", ItemID: "question-6",
+		RequestID: "request-6", ToolName: "AskUserQuestion", Questions: questions,
+	})
+	e.stopConversationMirror(binding.Destination)
+	starts, updates = p.questionSnapshot()
+	if len(starts) != 5 || len(updates) == 0 || updates[len(updates)-1].Header == nil || updates[len(updates)-1].Header.Color != "grey" {
+		t.Fatalf("retired mirror left active question controls: starts=%d updates=%#v", len(starts), updates)
+	}
 }
 
 func (*trackChatAgent) Name() string { return "codex-test" }
@@ -664,6 +1083,131 @@ func TestCmdTrack_RunningCardCarriesExactInterruptAction(t *testing.T) {
 	}
 }
 
+func TestRenderTrackPayload_CompletedPlanCarriesExactExecuteAction(t *testing.T) {
+	p := newMirrorTestPlatform()
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	key := "mirror:chat:admin"
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatalf("bindConversationMirror() error = %v", err)
+	}
+	delivery, _, err := e.trackStore.claimDelivery(binding, "turn-plan", "primary", "external", "")
+	if err != nil {
+		t.Fatalf("claimDelivery() error = %v", err)
+	}
+	delivery, err = e.trackStore.setDeliveryRender(delivery.Key, "", string(ConversationTurnCompleted), true)
+	if err != nil {
+		t.Fatalf("setDeliveryRender() error = %v", err)
+	}
+	turn := ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnCompleted,
+		Messages: []ConversationMessage{
+			{Role: "user", Content: "design it"},
+			{Role: "assistant", Content: "# Plan\n\n- Build it", Phase: "proposed_plan"},
+		},
+	}
+	snapshot := mirrorTestSnapshot("thread-1", turn)
+	e.renderTrackPayloadWithResponse(p, snapshot, turn, "fallback", key, false)
+
+	p.trackMu.Lock()
+	options := append([]RichCardRenderOptions(nil), p.options...)
+	p.trackMu.Unlock()
+	if len(options) != 1 || len(options[0].Buttons) != 1 {
+		t.Fatalf("plan card options = %#v", options)
+	}
+	button := options[0].Buttons[0]
+	if button.Value != trackPlanExecutePrefix+delivery.Key || button.Extra["session_key"] != key || button.Type != "primary" {
+		t.Fatalf("plan execute button = %#v", button)
+	}
+	if !strings.Contains(options[0].StatusFooter, "start its implementation") {
+		t.Fatalf("plan execute footer = %q", options[0].StatusFooter)
+	}
+}
+
+func TestTrackedPlanAction_StartsOneExactDefaultModeTurn(t *testing.T) {
+	turn := ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnCompleted,
+		Messages: []ConversationMessage{
+			{Role: "user", Content: "make a plan"},
+			{Role: "assistant", Content: "# Plan\n\n- Build it", Phase: "proposed_plan"},
+		},
+	}
+	base := newMirrorTestAgent(mirrorTestSnapshot("thread-1", turn))
+	execution := newPlanExecutionSession()
+	agent := &interactiveMirrorAgent{mirrorTestAgent: base, session: execution}
+	p := newMirrorTestPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetAdminFrom("admin")
+	key := "mirror:chat:admin"
+	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatalf("bindConversationMirror() error = %v", err)
+	}
+	delivery, _, err := e.trackStore.claimDelivery(binding, turn.ID, "primary", "external", "")
+	if err != nil {
+		t.Fatalf("claimDelivery() error = %v", err)
+	}
+	delivery, err = e.trackStore.setDeliveryHandle(delivery.Key, "card-plan", "card-plan")
+	if err != nil {
+		t.Fatalf("setDeliveryHandle() error = %v", err)
+	}
+	delivery, err = e.trackStore.setDeliveryRender(delivery.Key, "hash", string(turn.Status), true)
+	if err != nil {
+		t.Fatalf("setDeliveryRender() error = %v", err)
+	}
+	action := trackPlanExecutePrefix + delivery.Key
+
+	// A copied or otherwise mismatched source card fails before the one-shot
+	// action is claimed.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), ReferencedMessageID: "another-card",
+		UserID: "admin", Content: action, ReplyCtx: "ctx", IsCardAction: true,
+	})
+	if got := e.trackStore.deliveryByKey(delivery.Key).PlanActionState; got != "" {
+		t.Fatalf("mismatched card claimed plan action: %q", got)
+	}
+
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), ReferencedMessageID: "card-plan",
+		UserID: "admin", UserName: "Admin", Content: action, ReplyCtx: "ctx", IsCardAction: true,
+	})
+	select {
+	case sent := <-execution.sends:
+		if sent.mode != "default" || sent.id == "" || !strings.Contains(sent.prompt, "immediately preceding turn") {
+			t.Fatalf("plan execution send = %#v", sent)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for plan execution turn")
+	}
+	waitMirrorTest(t, "accepted plan action", func() bool {
+		return e.trackStore.deliveryByKey(delivery.Key).PlanActionState == "accepted"
+	})
+
+	// Repeated delivery of the same callback must not start a second turn.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), ReferencedMessageID: "card-plan",
+		UserID: "admin", Content: action, ReplyCtx: "ctx", IsCardAction: true,
+	})
+	select {
+	case sent := <-execution.sends:
+		t.Fatalf("duplicate plan execution turn = %#v", sent)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestConversationFinalAnswer_UsesProposedPlan(t *testing.T) {
+	turn := ConversationTurn{Messages: []ConversationMessage{{
+		Role: "assistant", Phase: "proposed_plan", Content: "# Plan\n\n- Visible",
+	}}}
+	if got := conversationFinalAnswer(turn); got != "# Plan\n\n- Visible" {
+		t.Fatalf("conversationFinalAnswer() = %q", got)
+	}
+}
+
 func TestRenderTrackMarkdown_TruncatesLongUTF8Sections(t *testing.T) {
 	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
 	longPrompt := strings.Repeat("提示", trackSectionMaxBytes)
@@ -753,6 +1297,9 @@ func TestConversationMirror_DefaultOnCreatesProgressCardAndFinalResult(t *testin
 	}
 	if len(firstOptions.ProgressItems) != 2 || firstOptions.ProgressItems[0].Kind != ProgressEntryThinking || firstOptions.ProgressItems[1].Kind != ProgressEntryToolUse {
 		t.Fatalf("running mirror progress = %#v", firstOptions.ProgressItems)
+	}
+	if firstOptions.ProgressCounts.Reasoning != 1 || firstOptions.ProgressCounts.Tools != 1 {
+		t.Fatalf("running mirror cumulative counts = %#v", firstOptions.ProgressCounts)
 	}
 
 	completed := running
@@ -928,6 +1475,9 @@ func TestConversationMirror_RichCardReusesForegroundTurnPresentation(t *testing.
 	}
 	if options.ProgressItems[2].ExitCode == nil || *options.ProgressItems[2].ExitCode != 0 || options.Language != LangEnglish {
 		t.Fatalf("tool result metadata = %#v, language = %q", options.ProgressItems[2], options.Language)
+	}
+	if options.ProgressCounts.Reasoning != 1 || options.ProgressCounts.Tools != 2 {
+		t.Fatalf("mirror cumulative progress counts = %#v", options.ProgressCounts)
 	}
 }
 

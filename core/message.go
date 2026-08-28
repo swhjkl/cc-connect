@@ -436,6 +436,9 @@ type Message struct {
 	ReplyCtx         any    // platform-specific context needed for replying
 	FromVoice        bool   // true if message originated from voice transcription
 	ModeOverride     string // if set, temporarily override agent permission mode for this message
+	// CollaborationModeOverride selects a backend collaboration mode atomically
+	// with this turn. It is distinct from the permission ModeOverride above.
+	CollaborationModeOverride string
 	// IsPermissionResponse is set by inline-button / card-action paths in
 	// platforms when a synthesized message is forwarded as a permission
 	// decision (e.g. Telegram handleCallbackQuery for perm:allow/deny,
@@ -467,6 +470,7 @@ const (
 	EventResult              EventType = "result"               // final aggregated result
 	EventError               EventType = "error"                // error occurred
 	EventPermissionRequest   EventType = "permission_request"   // agent requests permission via stdio protocol
+	EventPermissionResolved  EventType = "permission_resolved"  // the daemon reports that a pending request is resolved
 	EventThinking            EventType = "thinking"             // thinking/processing status
 	EventTurnStarted         EventType = "turn_started"         // authoritative backend turn started
 	EventConversationChanged EventType = "conversation_changed" // identified observer hint; content is re-read from the backend
@@ -478,6 +482,7 @@ type UserQuestion struct {
 	Header      string               `json:"header"`
 	Options     []UserQuestionOption `json:"options"`
 	MultiSelect bool                 `json:"multiSelect"`
+	Secret      bool                 `json:"isSecret,omitempty"`
 }
 
 // UserQuestionOption is one choice in a UserQuestion.

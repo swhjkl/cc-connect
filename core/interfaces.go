@@ -318,6 +318,12 @@ type ProgressUpdateThrottler interface {
 	ProgressUpdateInterval() time.Duration
 }
 
+// ProgressHeartbeatProvider lets a platform keep a running progress card
+// visibly fresh while the agent is inside one long operation with no events.
+type ProgressHeartbeatProvider interface {
+	ProgressHeartbeatInterval() time.Duration
+}
+
 // ButtonOption represents a clickable inline button.
 type ButtonOption struct {
 	Text string // display text on the button
@@ -337,6 +343,14 @@ type InlineButtonSender interface {
 type CardSender interface {
 	SendCard(ctx context.Context, replyCtx any, card *Card) error
 	ReplyCard(ctx context.Context, replyCtx any, card *Card) error
+}
+
+// TrackedCardSender sends a structured card and returns an opaque handle that
+// can later update that exact message. It is used for cross-client prompts
+// whose controls must be invalidated when another client answers first.
+type TrackedCardSender interface {
+	SendTrackedCard(ctx context.Context, replyCtx any, card *Card) (any, error)
+	UpdateTrackedCard(ctx context.Context, handle any, sessionKey string, card *Card) error
 }
 
 // CardNavigationHandler is called by platforms to render a card for in-place
@@ -414,6 +428,14 @@ type AgentSession interface {
 	Alive() bool
 	// Close terminates the session and its underlying process.
 	Close() error
+}
+
+// CollaborationModeTurnSender is an optional AgentSession capability for
+// selecting a backend collaboration mode atomically with one turn/start.
+// Callers use it when a control must transition modes without racing a
+// separate thread-settings update against another client.
+type CollaborationModeTurnSender interface {
+	SendWithCollaborationMode(prompt string, messageID string, images []ImageAttachment, files []FileAttachment, mode string) error
 }
 
 // PermissionResult represents the user's decision on a permission request.
@@ -513,6 +535,29 @@ type ConversationWindowProvider interface {
 // claim ownership of backend approval requests merely to observe it.
 type ConversationEventSource interface {
 	WatchConversation(ctx context.Context, sessionID string) (<-chan Event, error)
+}
+
+// ConversationObserver is an interactive subscription to one authoritative
+// conversation. RespondPermission must answer the exact server request on the
+// observer connection; implementations must reject stale request IDs.
+type ConversationObserver interface {
+	Events() <-chan Event
+	RespondPermission(requestID string, result PermissionResult) error
+}
+
+// InteractiveConversationEventSource rejoins a running conversation so
+// blocking user-input requests are delivered to the observer as well as the
+// client that started the turn. Core prefers this capability over the passive
+// ConversationEventSource when it is available.
+type InteractiveConversationEventSource interface {
+	OpenConversationObserver(ctx context.Context, sessionID string) (ConversationObserver, error)
+}
+
+// PermissionResolutionSource exposes resolutions performed by another daemon
+// client on a side channel. The main event consumer can be blocked waiting for
+// user input, so this cannot rely solely on the ordinary Events stream.
+type PermissionResolutionSource interface {
+	PermissionResolutions() <-chan string
 }
 
 // ConversationClientMarkerSupport reports whether clientUserMessageID is

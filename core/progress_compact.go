@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -54,18 +55,65 @@ type ProgressCardEntry struct {
 	Success  *bool                 `json:"success,omitempty"`
 }
 
+// ProgressCardCounts keeps cumulative lane totals even when the visible
+// progress entries are bounded to the latest updates.
+type ProgressCardCounts struct {
+	Reasoning int `json:"reasoning,omitempty"`
+	Tools     int `json:"tools,omitempty"`
+	Updates   int `json:"updates,omitempty"`
+}
+
+func (c *ProgressCardCounts) add(kind ProgressCardEntryKind) {
+	switch kind {
+	case ProgressEntryThinking:
+		c.Reasoning++
+	case ProgressEntryToolUse, ProgressEntryToolResult:
+		c.Tools++
+	default:
+		c.Updates++
+	}
+}
+
+func progressCardCountsFromItems(items []ProgressCardEntry) ProgressCardCounts {
+	var counts ProgressCardCounts
+	for _, item := range items {
+		kind := item.Kind
+		if kind == "" {
+			kind = ProgressEntryInfo
+		}
+		counts.add(kind)
+	}
+	return counts
+}
+
+func (c ProgressCardCounts) withVisibleMinimum(items []ProgressCardEntry) ProgressCardCounts {
+	visible := progressCardCountsFromItems(items)
+	if c.Reasoning < visible.Reasoning {
+		c.Reasoning = visible.Reasoning
+	}
+	if c.Tools < visible.Tools {
+		c.Tools = visible.Tools
+	}
+	if c.Updates < visible.Updates {
+		c.Updates = visible.Updates
+	}
+	return c
+}
+
 // ProgressCardPayload carries structured progress entries for platforms that
 // render custom progress cards.
 type ProgressCardPayload struct {
-	Version   int                 `json:"version,omitempty"`
-	Agent     string              `json:"agent,omitempty"`
-	Lang      string              `json:"lang,omitempty"`
-	State     ProgressCardState   `json:"state,omitempty"`
-	Entries   []string            `json:"entries,omitempty"` // legacy fallback
-	Items     []ProgressCardEntry `json:"items,omitempty"`   // ordered typed events
-	Truncated bool                `json:"truncated"`
-	Hint      string              `json:"hint,omitempty"`
-	Buttons   []CardButton        `json:"buttons,omitempty"`
+	Version        int                 `json:"version,omitempty"`
+	Agent          string              `json:"agent,omitempty"`
+	Lang           string              `json:"lang,omitempty"`
+	State          ProgressCardState   `json:"state,omitempty"`
+	Entries        []string            `json:"entries,omitempty"` // legacy fallback
+	Items          []ProgressCardEntry `json:"items,omitempty"`   // ordered typed events
+	Counts         ProgressCardCounts  `json:"counts,omitempty"`
+	ElapsedSeconds int64               `json:"elapsed_seconds,omitempty"`
+	Truncated      bool                `json:"truncated"`
+	Hint           string              `json:"hint,omitempty"`
+	Buttons        []CardButton        `json:"buttons,omitempty"`
 }
 
 // BuildProgressCardPayload encodes progress entries into a transport string.
@@ -104,6 +152,13 @@ func BuildProgressCardPayloadWithControls(items []ProgressCardEntry, truncated b
 }
 
 func buildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState, hint string, buttons []CardButton) string {
+	return buildProgressCardPayloadV2WithMeta(
+		items, truncated, agent, lang, state, hint, buttons,
+		progressCardCountsFromItems(items), 0,
+	)
+}
+
+func buildProgressCardPayloadV2WithMeta(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState, hint string, buttons []CardButton, counts ProgressCardCounts, elapsedSeconds int64) string {
 	cleaned := make([]ProgressCardEntry, 0, len(items))
 	for _, item := range items {
 		text := strings.TrimSpace(item.Text)
@@ -130,14 +185,16 @@ func buildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent
 		state = ProgressCardStateRunning
 	}
 	payload := ProgressCardPayload{
-		Version:   2,
-		Agent:     strings.TrimSpace(agent),
-		Lang:      string(lang),
-		State:     state,
-		Items:     cleaned,
-		Truncated: truncated,
-		Hint:      strings.TrimSpace(hint),
-		Buttons:   cloneProgressCardButtons(buttons),
+		Version:        2,
+		Agent:          strings.TrimSpace(agent),
+		Lang:           string(lang),
+		State:          state,
+		Items:          cleaned,
+		Counts:         counts.withVisibleMinimum(cleaned),
+		ElapsedSeconds: max(elapsedSeconds, 0),
+		Truncated:      truncated,
+		Hint:           strings.TrimSpace(hint),
+		Buttons:        cloneProgressCardButtons(buttons),
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -191,6 +248,10 @@ func ParseProgressCardPayload(content string) (*ProgressCardPayload, bool) {
 		payload.State = ProgressCardStateRunning
 	}
 	payload.Items = items
+	payload.Counts = payload.Counts.withVisibleMinimum(items)
+	if payload.ElapsedSeconds < 0 {
+		payload.ElapsedSeconds = 0
+	}
 	payload.Entries = legacy
 	payload.Hint = strings.TrimSpace(payload.Hint)
 	payload.Buttons = cloneProgressCardButtons(payload.Buttons)
@@ -245,6 +306,8 @@ func inferLegacyEntryKind(entry string) ProgressCardEntryKind {
 // compactProgressWriter coalesces intermediate progress (thinking/tool-use)
 // into one editable message for platforms that support message updates.
 type compactProgressWriter struct {
+	mu sync.Mutex
+
 	ctx       context.Context
 	platform  Platform
 	replyCtx  any
@@ -268,13 +331,19 @@ type compactProgressWriter struct {
 	truncated      bool
 	hint           string
 	buttons        []CardButton
+	counts         ProgressCardCounts
 	lastSent       string
 	maxEntries     int
 	handleObserver func(any)
+	startedAt      time.Time
+	closed         bool
 
 	// Throttle message edits to avoid platform rate limits (e.g. Discord ~5 edits/5s).
 	minUpdateInterval time.Duration
 	lastUpdateAt      time.Time
+	flushTimer        *time.Timer
+	heartbeatInterval time.Duration
+	heartbeatTimer    *time.Timer
 }
 
 func normalizeProgressStyle(style string) string {
@@ -347,9 +416,13 @@ func newCompactProgressWriter(ctx context.Context, p Platform, replyCtx any, age
 		agentName:  normalizeProgressAgentLabel(agentName),
 		lang:       lang,
 		maxEntries: 10,
+		startedAt:  time.Now(),
 	}
 	if throttler, ok := p.(ProgressUpdateThrottler); ok {
 		w.minUpdateInterval = throttler.ProgressUpdateInterval()
+	}
+	if heartbeater, ok := p.(ProgressHeartbeatProvider); ok {
+		w.heartbeatInterval = heartbeater.ProgressHeartbeatInterval()
 	}
 	if w.style != progressStyleCompact && w.style != progressStyleCard {
 		slog.Debug("progress writer disabled: unsupported style", "platform", p.Name(), "style", w.style)
@@ -422,12 +495,15 @@ func (w *compactProgressWriter) AppendEvent(kind ProgressCardEntryKind, text str
 
 // AppendStructured appends one structured progress event and updates the in-place message.
 func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallback string) bool {
-	if !w.enabled || w.failed {
+	w.mu.Lock()
+	if !w.enabled || w.failed || w.closed {
+		w.mu.Unlock()
 		return false
 	}
 	text := strings.TrimSpace(item.Text)
 	fallback = strings.TrimSpace(fallback)
 	if text == "" && fallback == "" {
+		w.mu.Unlock()
 		return true
 	}
 	if text == "" {
@@ -451,33 +527,27 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 	item.Text = text
 	item.Tool = strings.TrimSpace(item.Tool)
 	item.Status = strings.TrimSpace(item.Status)
+	w.counts.add(kind)
 
 	switch w.style {
 	case progressStyleCard:
 		w.items = append(w.items, item)
 		w.entries = append(w.entries, fallback)
-		truncated := false
 		if w.maxEntries > 0 && len(w.items) > w.maxEntries {
 			w.items = w.items[len(w.items)-w.maxEntries:]
 			if len(w.entries) > w.maxEntries {
 				w.entries = w.entries[len(w.entries)-w.maxEntries:]
 			}
-			truncated = true
+			w.truncated = true
 		} else if w.maxEntries > 0 && len(w.entries) > w.maxEntries {
 			w.entries = w.entries[len(w.entries)-w.maxEntries:]
-			truncated = true
+			w.truncated = true
 		}
-		w.truncated = truncated
-		if w.usePayload {
-			w.content = BuildProgressCardPayloadWithControls(w.items, w.truncated, w.agentName, w.lang, w.state, w.hint, w.buttons)
-			if w.content == "" {
-				slog.Warn("progress writer: failed to build structured payload", "platform", w.platform.Name())
-				w.failed = true
-				return false
-			}
-		} else {
-			w.content = renderCardProgressMarkdownFallback(w.entries, truncated)
-			w.content = trimCompactProgressText(w.content, compactProgressMaxChars)
+		if !w.rebuildCardContentLocked() {
+			slog.Warn("progress writer: failed to build structured payload", "platform", w.platform.Name())
+			w.markFailedLocked()
+			w.mu.Unlock()
+			return false
 		}
 	default:
 		if w.content == "" {
@@ -488,8 +558,135 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 		w.content = trimCompactProgressText(w.content, compactProgressMaxChars)
 	}
 
-	if w.content == w.lastSent {
+	handled, observer, handle := w.flushLocked(false)
+	w.mu.Unlock()
+	if observer != nil {
+		observer(handle)
+	}
+	return handled
+}
+
+// SetHandleObserver registers a callback for the platform handle backing the
+// progress card. The callback is invoked synchronously and at most once per
+// registration, including immediately when the card already exists.
+func (w *compactProgressWriter) SetHandleObserver(observer func(any)) {
+	w.mu.Lock()
+	w.handleObserver = observer
+	callback, handle := w.takeHandleObserverLocked()
+	w.mu.Unlock()
+	if callback != nil {
+		callback(handle)
+	}
+}
+
+func (w *compactProgressWriter) takeHandleObserverLocked() (func(any), any) {
+	if w.handleObserver == nil || w.handle == nil {
+		return nil, nil
+	}
+	observer := w.handleObserver
+	w.handleObserver = nil
+	return observer, w.handle
+}
+
+// SetControls updates the running progress card with an optional hint and
+// action buttons. Controls are never retained on a terminal card.
+func (w *compactProgressWriter) SetControls(hint string, buttons []CardButton) bool {
+	w.mu.Lock()
+	if !w.enabled || w.failed || w.closed || w.style != progressStyleCard || !w.usePayload || w.state != ProgressCardStateRunning {
+		w.mu.Unlock()
+		return false
+	}
+	w.hint = strings.TrimSpace(hint)
+	w.buttons = cloneProgressCardButtons(buttons)
+	if len(w.items) == 0 {
+		w.mu.Unlock()
 		return true
+	}
+	if !w.rebuildCardContentLocked() {
+		w.markFailedLocked()
+		w.mu.Unlock()
+		return false
+	}
+	handled, observer, handle := w.flushLocked(true)
+	w.mu.Unlock()
+	if observer != nil {
+		observer(handle)
+	}
+	return handled
+}
+
+// Finalize updates card progress state (running/completed/failed) without
+// appending a new progress entry.
+func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
+	w.mu.Lock()
+	if !w.enabled || w.failed || w.closed || w.style != progressStyleCard || !w.usePayload || w.handle == nil {
+		w.stopTimersLocked()
+		w.closed = true
+		w.mu.Unlock()
+		return false
+	}
+	if state == "" {
+		state = ProgressCardStateCompleted
+	}
+	w.state = state
+	w.hint = ""
+	w.buttons = nil
+	if !w.rebuildCardContentLocked() {
+		w.stopTimersLocked()
+		w.closed = true
+		w.mu.Unlock()
+		return false
+	}
+	handled, observer, handle := w.flushLocked(true)
+	w.stopTimersLocked()
+	w.closed = true
+	w.mu.Unlock()
+	if observer != nil {
+		observer(handle)
+	}
+	return handled
+}
+
+// Close stops background refreshes without changing the card's visible state.
+func (w *compactProgressWriter) Close() {
+	w.mu.Lock()
+	w.stopTimersLocked()
+	w.closed = true
+	w.mu.Unlock()
+}
+
+func (w *compactProgressWriter) rebuildCardContentLocked() bool {
+	if len(w.items) == 0 {
+		return false
+	}
+	if w.usePayload {
+		elapsedSeconds := int64(time.Since(w.startedAt) / time.Second)
+		w.content = buildProgressCardPayloadV2WithMeta(
+			w.items, w.truncated, w.agentName, w.lang, w.state, w.hint, w.buttons,
+			w.counts, elapsedSeconds,
+		)
+	} else {
+		w.content = renderCardProgressMarkdownFallback(w.entries, w.truncated)
+		w.content = trimCompactProgressText(w.content, compactProgressMaxChars)
+	}
+	return w.content != ""
+}
+
+// flushLocked writes the latest complete frame. It returns a deferred handle
+// observer because callbacks may re-enter the writer to install controls.
+func (w *compactProgressWriter) flushLocked(force bool) (bool, func(any), any) {
+	if !w.enabled || w.failed || w.closed {
+		return false, nil, nil
+	}
+	if w.content == "" {
+		return true, nil, nil
+	}
+	if force {
+		w.cancelFlushLocked()
+	}
+	if w.content == w.lastSent {
+		w.scheduleHeartbeatLocked()
+		return true, nil, nil
 	}
 
 	if w.handle == nil {
@@ -499,32 +696,32 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 			cancel()
 			if err != nil || handle == nil {
 				slog.Warn("progress writer: SendPreviewStart failed", "platform", w.platform.Name(), "style", w.style, "error", err, "handle_nil", handle == nil)
-				w.failed = true
-				return false
+				w.markFailedLocked()
+				return false, nil, nil
 			}
 			w.handle = handle
-			w.lastSent = w.content
-			w.lastUpdateAt = time.Now()
-			w.notifyHandleObserver()
-			return true
+		} else {
+			callCtx, cancel := w.withAPITimeout()
+			err := w.platform.Send(callCtx, w.replyCtx, w.content)
+			cancel()
+			if err != nil {
+				slog.Warn("progress writer: initial Send failed", "platform", w.platform.Name(), "style", w.style, "error", err)
+				w.markFailedLocked()
+				return false, nil, nil
+			}
+			w.handle = w.replyCtx
 		}
-		callCtx, cancel := w.withAPITimeout()
-		err := w.platform.Send(callCtx, w.replyCtx, w.content)
-		cancel()
-		if err != nil {
-			slog.Warn("progress writer: initial Send failed", "platform", w.platform.Name(), "style", w.style, "error", err)
-			w.failed = true
-			return false
-		}
-		w.handle = w.replyCtx
-		w.lastSent = w.content
-		w.lastUpdateAt = time.Now()
-		w.notifyHandleObserver()
-		return true
+		w.recordSuccessfulUpdateLocked()
+		observer, handle := w.takeHandleObserverLocked()
+		return true, observer, handle
 	}
 
-	if w.minUpdateInterval > 0 && time.Since(w.lastUpdateAt) < w.minUpdateInterval {
-		return true
+	if !force && w.minUpdateInterval > 0 {
+		elapsed := time.Since(w.lastUpdateAt)
+		if elapsed < w.minUpdateInterval {
+			w.scheduleFlushLocked(w.minUpdateInterval - elapsed)
+			return true, nil, nil
+		}
 	}
 
 	callCtx, cancel := w.withAPITimeout()
@@ -532,88 +729,96 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 	cancel()
 	if err != nil {
 		slog.Warn("progress writer: UpdateMessage failed", "platform", w.platform.Name(), "style", w.style, "error", err)
-		w.failed = true
-		return false
+		w.markFailedLocked()
+		return false, nil, nil
 	}
+	w.recordSuccessfulUpdateLocked()
+	return true, nil, nil
+}
+
+func (w *compactProgressWriter) recordSuccessfulUpdateLocked() {
 	w.lastSent = w.content
 	w.lastUpdateAt = time.Now()
-	return true
+	w.scheduleHeartbeatLocked()
 }
 
-// SetHandleObserver registers a callback for the platform handle backing the
-// progress card. The callback is invoked synchronously and at most once per
-// registration, including immediately when the card already exists.
-func (w *compactProgressWriter) SetHandleObserver(observer func(any)) {
-	w.handleObserver = observer
-	w.notifyHandleObserver()
-}
-
-func (w *compactProgressWriter) notifyHandleObserver() {
-	if w.handleObserver == nil || w.handle == nil {
+func (w *compactProgressWriter) scheduleFlushLocked(delay time.Duration) {
+	if w.flushTimer != nil || w.closed || w.failed {
 		return
 	}
-	observer := w.handleObserver
-	w.handleObserver = nil
-	observer(w.handle)
+	if delay < 0 {
+		delay = 0
+	}
+	w.flushTimer = time.AfterFunc(delay, w.flushPending)
 }
 
-// SetControls updates the running progress card with an optional hint and
-// action buttons. Controls are never retained on a terminal card.
-func (w *compactProgressWriter) SetControls(hint string, buttons []CardButton) bool {
-	if !w.enabled || w.failed || w.style != progressStyleCard || !w.usePayload || w.state != ProgressCardStateRunning {
-		return false
+func (w *compactProgressWriter) flushPending() {
+	w.mu.Lock()
+	w.flushTimer = nil
+	if w.ctx.Err() != nil || w.closed || w.failed {
+		w.mu.Unlock()
+		return
 	}
-	w.hint = strings.TrimSpace(hint)
-	w.buttons = cloneProgressCardButtons(buttons)
-	if len(w.items) == 0 {
-		return true
+	handled, observer, handle := w.flushLocked(false)
+	w.mu.Unlock()
+	if !handled {
+		return
 	}
-	w.content = BuildProgressCardPayloadWithControls(w.items, w.truncated, w.agentName, w.lang, w.state, w.hint, w.buttons)
-	if w.content == "" || w.handle == nil || w.content == w.lastSent {
-		return w.content != ""
+	if observer != nil {
+		observer(handle)
 	}
-	callCtx, cancel := w.withAPITimeout()
-	err := w.updater.UpdateMessage(callCtx, w.handle, w.content)
-	cancel()
-	if err != nil {
-		slog.Warn("progress writer: SetControls UpdateMessage failed", "platform", w.platform.Name(), "style", w.style, "error", err)
-		w.failed = true
-		return false
-	}
-	w.lastSent = w.content
-	w.lastUpdateAt = time.Now()
-	return true
 }
 
-// Finalize updates card progress state (running/completed/failed) without
-// appending a new progress entry.
-func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
-	if !w.enabled || w.failed || w.style != progressStyleCard || !w.usePayload || w.handle == nil {
-		return false
+func (w *compactProgressWriter) scheduleHeartbeatLocked() {
+	if w.heartbeatInterval <= 0 || w.style != progressStyleCard || !w.usePayload ||
+		w.state != ProgressCardStateRunning || w.handle == nil || w.closed || w.failed {
+		return
 	}
-	if state == "" {
-		state = ProgressCardStateCompleted
+	if w.heartbeatTimer != nil {
+		w.heartbeatTimer.Stop()
 	}
-	if w.state == state {
-		return true
+	w.heartbeatTimer = time.AfterFunc(w.heartbeatInterval, w.flushHeartbeat)
+}
+
+func (w *compactProgressWriter) flushHeartbeat() {
+	w.mu.Lock()
+	w.heartbeatTimer = nil
+	if w.ctx.Err() != nil || w.closed || w.failed || w.state != ProgressCardStateRunning {
+		w.mu.Unlock()
+		return
 	}
-	w.state = state
-	w.hint = ""
-	w.buttons = nil
-	w.content = BuildProgressCardPayloadWithControls(w.items, w.truncated, w.agentName, w.lang, w.state, "", nil)
-	if w.content == "" || w.content == w.lastSent {
-		return w.content != ""
+	if !w.rebuildCardContentLocked() {
+		w.mu.Unlock()
+		return
 	}
-	callCtx, cancel := w.withAPITimeout()
-	err := w.updater.UpdateMessage(callCtx, w.handle, w.content)
-	cancel()
-	if err != nil {
-		slog.Warn("progress writer: Finalize UpdateMessage failed", "platform", w.platform.Name(), "style", w.style, "error", err)
-		w.failed = true
-		return false
+	handled, observer, handle := w.flushLocked(true)
+	w.mu.Unlock()
+	if !handled {
+		return
 	}
-	w.lastSent = w.content
-	return true
+	if observer != nil {
+		observer(handle)
+	}
+}
+
+func (w *compactProgressWriter) cancelFlushLocked() {
+	if w.flushTimer != nil {
+		w.flushTimer.Stop()
+		w.flushTimer = nil
+	}
+}
+
+func (w *compactProgressWriter) stopTimersLocked() {
+	w.cancelFlushLocked()
+	if w.heartbeatTimer != nil {
+		w.heartbeatTimer.Stop()
+		w.heartbeatTimer = nil
+	}
+}
+
+func (w *compactProgressWriter) markFailedLocked() {
+	w.failed = true
+	w.stopTimersLocked()
 }
 
 func (w *compactProgressWriter) withAPITimeout() (context.Context, context.CancelFunc) {

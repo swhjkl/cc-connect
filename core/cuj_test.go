@@ -1855,6 +1855,87 @@ func TestCUJ_I8_NativeTurnCardExactControlLifecycle(t *testing.T) {
 	}
 }
 
+// CUJ-I9 · A blocking question from an externally started Codex turn is
+// mirrored as an actionable Feishu card. The exact card can answer the shared
+// daemon request, while an answer from another client invalidates its controls.
+func TestCUJ_I9_ExternalBlockingQuestionMirrorLifecycle(t *testing.T) {
+	agent := newInteractiveQuestionMirrorAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	e.sessions.Save()
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer e.Stop()
+	select {
+	case <-agent.opened:
+	case <-time.After(2 * time.Second):
+		t.Fatal("interactive conversation observer did not open")
+	}
+	questions := testQuestions()
+
+	// Action 1: an external turn blocks and the user sees the full question
+	// plus options instead of only a generic "waiting for input" state.
+	agent.observer.events <- Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-external", ItemID: "question-1",
+		RequestID: "request-1", ToolName: "AskUserQuestion", Questions: questions,
+	}
+	waitMirrorTest(t, "external blocking question card", func() bool {
+		starts, _ := p.questionSnapshot()
+		return len(starts) == 1
+	})
+	starts, _ := p.questionSnapshot()
+	action := firstCardActionWithPrefix(starts[0], "trackq:")
+	if action == "" || !strings.Contains(starts[0].RenderText(), "Which database?") {
+		t.Fatalf("external question card = %#v", starts[0])
+	}
+
+	// Action 2: clicking the exact Feishu card answers that request, and the
+	// original card becomes terminal instead of starting a new turn.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i9-answer", UserID: "admin",
+		Content: action, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+	})
+	select {
+	case response := <-agent.observer.responses:
+		if response.requestID != "request-1" || response.result.Behavior != "allow" {
+			t.Fatalf("shared question response = %#v", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Feishu card did not answer the shared question")
+	}
+	waitMirrorTest(t, "answered question card", func() bool {
+		_, updates := p.questionSnapshot()
+		return len(updates) > 0 && updates[len(updates)-1].Header != nil && updates[len(updates)-1].Header.Color == "green"
+	})
+
+	// Action 3: for the next question, the TUI wins the response race. The
+	// Feishu card turns grey, loses its controls, and no longer looks hung.
+	agent.observer.events <- Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-external-2", ItemID: "question-2",
+		RequestID: "request-2", ToolName: "AskUserQuestion", Questions: questions,
+	}
+	waitMirrorTest(t, "second external question card", func() bool {
+		cards, _ := p.questionSnapshot()
+		return len(cards) == 2
+	})
+	agent.observer.events <- Event{
+		Type: EventPermissionResolved, ThreadID: "thread-1", TurnID: "turn-external-2", RequestID: "request-2",
+	}
+	waitMirrorTest(t, "cross-client question invalidation", func() bool {
+		_, updates := p.questionSnapshot()
+		if len(updates) == 0 {
+			return false
+		}
+		last := updates[len(updates)-1]
+		return last.Header != nil && last.Header.Color == "grey" && !last.HasButtons() && strings.Contains(last.RenderText(), "another client")
+	})
+}
+
 // CUJ-I7 · Session lifecycle commands move the mirror binding atomically. An
 // old shared thread must not continue posting after /switch or /new.
 func TestCUJ_I7_SessionCommandsRebindMirror(t *testing.T) {
@@ -2008,10 +2089,95 @@ func TestCUJ_C1_YoloModeSkipsPermission(t *testing.T) {
 		"core unit-test path: yolo mode is enforced inside Agent.StartSession, not Engine")
 }
 
-// CUJ-C2 · plan mode: agent first emits plan, then waits for user approve.
+// CUJ-C2 · a Plan Mode turn completed in another client remains visible and
+// executable from its exact Feishu mirror card.
 func TestCUJ_C2_PlanModeRequiresApproval(t *testing.T) {
-	t.Log("CUJ-C2: full coverage via release-gate TestCC_AGENT_02_plan (integration); " +
-		"core unit-test path: plan mode is enforced inside Agent.StartSession, not Engine")
+	base := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+	execution := newPlanExecutionSession()
+	agent := &interactiveMirrorAgent{mirrorTestAgent: base, session: execution}
+	p := newMirrorTestPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "always", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatalf("bindConversationMirror() error = %v", err)
+	}
+	e.startConversationMirror(agent, e.sessions, p, binding)
+	t.Cleanup(func() {
+		e.cancel()
+		waitMirrorTest(t, "plan mirror shutdown", func() bool {
+			e.trackMu.Lock()
+			defer e.trackMu.Unlock()
+			return len(e.conversationMirrors) == 0
+		})
+	})
+	waitMirrorTest(t, "initial plan mirror baseline", func() bool { return base.readCount() > 0 })
+
+	planTurn := ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnCompleted,
+		Messages: []ConversationMessage{
+			{Role: "user", Content: "design the feature"},
+			{Role: "assistant", Content: "# Proposed plan\n\n- Implement the feature", Phase: "proposed_plan"},
+		},
+	}
+	base.setSnapshot(mirrorTestSnapshot("thread-1", planTurn))
+	base.events <- Event{Type: EventConversationChanged, ThreadID: "thread-1", TurnID: planTurn.ID}
+	waitMirrorTest(t, "completed plan mirror card", func() bool {
+		delivery := e.trackStore.delivery(binding.Destination, "thread-1", planTurn.ID, "primary")
+		return delivery != nil && delivery.Terminal && delivery.CardMessageID != ""
+	})
+	delivery := e.trackStore.delivery(binding.Destination, "thread-1", planTurn.ID, "primary")
+	waitMirrorTest(t, "plan result message", func() bool {
+		return strings.Contains(strings.Join(p.getSent(), "\n"), "Implement the feature")
+	})
+	p.trackMu.Lock()
+	options := append([]RichCardRenderOptions(nil), p.options...)
+	p.trackMu.Unlock()
+	if len(options) == 0 || len(options[len(options)-1].Buttons) != 1 ||
+		options[len(options)-1].Buttons[0].Value != trackPlanExecutePrefix+delivery.Key {
+		t.Fatalf("completed plan did not expose its exact execute action: %#v", options)
+	}
+
+	// User action 1: /history reads the authoritative plan rather than a
+	// cc-connect-side transcript.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "c2-history",
+		UserID: "admin", Content: "/history", ReplyCtx: "ctx",
+	})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "Proposed plan") {
+		t.Fatalf("authoritative history omitted proposed plan: %q", got)
+	}
+
+	// User action 2: the exact card starts one normal/default-mode turn.
+	action := trackPlanExecutePrefix + delivery.Key
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "c2-execute", ReferencedMessageID: delivery.CardMessageID,
+		UserID: "admin", Content: action, ReplyCtx: "ctx", IsCardAction: true,
+	})
+	select {
+	case sent := <-execution.sends:
+		if sent.mode != "default" || !strings.Contains(sent.prompt, "immediately preceding turn") {
+			t.Fatalf("plan execution turn = %#v", sent)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("exact plan action did not start implementation")
+	}
+	waitMirrorTest(t, "plan execution completion", func() bool { return !session.Busy() })
+
+	// User action 3: a redelivered click cannot execute the plan twice.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "c2-duplicate", ReferencedMessageID: delivery.CardMessageID,
+		UserID: "admin", Content: action, ReplyCtx: "ctx", IsCardAction: true,
+	})
+	select {
+	case duplicate := <-execution.sends:
+		t.Fatalf("duplicate card click started another turn: %#v", duplicate)
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
 // CUJ-C5 · /stop halts current turn but DOES NOT switch session.
@@ -2975,6 +3141,73 @@ func TestCUJ_STREAM1_StreamingResumesAfterPermissionPrompt(t *testing.T) {
 			t.Fatalf("post-resolution text was bulk-sent via plain Send (regression: streaming broken after permission prompt). getSent=%#v", plat.getSent())
 		}
 	}
+}
+
+// CUJ-STREAM-2 · A native AskUserQuestion card is bound to the exact Feishu
+// message and only becomes successful after the foreground Codex session
+// accepts the answer. Copied/stale card actions fail closed.
+func TestCUJ_STREAM2_NativeQuestionCardUsesExactAcceptedAction(t *testing.T) {
+	p := &trackedQuestionCardPlatform{
+		stubCardPlatform: stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}},
+	}
+	agent := &cujAgent{}
+	agent.setNextSessionEvents([]Event{
+		{Type: EventTurnStarted, ThreadID: "cuj-agent-session", TurnID: "turn-question"},
+		{
+			Type: EventPermissionRequest, ThreadID: "cuj-agent-session", TurnID: "turn-question", ItemID: "question-1",
+			RequestID: "request-question", ToolName: "AskUserQuestion", Questions: []UserQuestion{{
+				Question: "Which scope?", Options: []UserQuestionOption{{Label: "All files"}, {Label: "Changed files"}},
+			}},
+		},
+		{Type: EventText, ThreadID: "cuj-agent-session", TurnID: "turn-question", Content: "continued after the accepted answer"},
+		{Type: EventResult, ThreadID: "cuj-agent-session", TurnID: "turn-question", Content: "done after question", Done: true},
+	}, 0)
+	e := NewEngine("test", agent, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	defer e.Stop()
+	key := "feishu:chat:user1"
+
+	// Action 1: start a turn and receive an actionable native question card.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "stream2-prompt", UserID: "user1",
+		Content: "prepare the plan", ReplyCtx: "ctx",
+	})
+	waitMirrorTest(t, "native exact question card", func() bool {
+		starts, _ := p.trackedSnapshot()
+		return len(starts) == 1
+	})
+	starts, _ := p.trackedSnapshot()
+	action := firstCardActionWithPrefix(starts[0], "askq:")
+	if parts := strings.Split(action, ":"); len(parts) != 4 || parts[1] == "" {
+		t.Fatalf("native question action = %q", action)
+	}
+
+	// Action 2: the same control copied onto another message is rejected and
+	// does not paint the real question card as answered.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "stream2-stale", UserID: "user1", Content: action,
+		ReferencedMessageID: "copied-card", ReplyCtx: "ctx", IsCardAction: true, IsPermissionResponse: true,
+	})
+	waitMirrorTest(t, "stale native action feedback", func() bool {
+		return strings.Contains(strings.Join(p.getSent(), "\n"), e.i18n.T(MsgAskQuestionExpired))
+	})
+	_, updates := p.trackedSnapshot()
+	if len(updates) != 0 {
+		t.Fatalf("copied action changed native card: %#v", updates)
+	}
+
+	// Action 3: clicking the exact source card is accepted, turns that card
+	// green without controls, and lets the same turn continue to completion.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "stream2-answer", UserID: "user1", Content: action,
+		ReferencedMessageID: "tracked-question-1", ReplyCtx: "ctx", IsCardAction: true, IsPermissionResponse: true,
+	})
+	waitMirrorTest(t, "accepted native question card", func() bool {
+		_, cards := p.trackedSnapshot()
+		return len(cards) == 1 && cards[0].Header != nil && cards[0].Header.Color == "green" && !cards[0].HasButtons()
+	})
+	waitMirrorTest(t, "turn continuation after native answer", func() bool {
+		return strings.Contains(strings.Join(p.getSent(), "\n"), "done after question")
+	})
 }
 
 func TestCUJ_H4_FeishuTopicsKeepWorkspaceBindingsIsolated(t *testing.T) {

@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -61,6 +62,67 @@ func TestAppServerConversationPresentationEvents_MatchesLiveEventSemantics(t *te
 	}
 }
 
+func TestMapAppServerConversationTurn_ProposedPlanIsVisibleFinalResponse(t *testing.T) {
+	turn := appServerConversationTurn{
+		ID:     "turn-plan",
+		Status: "completed",
+		Items: []map[string]any{
+			{"type": "userMessage", "id": "prompt", "content": []any{map[string]any{"type": "text", "text": "make a plan"}}},
+			{"type": "plan", "id": "plan", "text": "# Proposed plan\n\n- Implement it"},
+		},
+	}
+
+	mapped := mapAppServerConversationTurn(turn)
+	if len(mapped.Messages) != 2 {
+		t.Fatalf("messages = %#v, want user and proposed plan", mapped.Messages)
+	}
+	plan := mapped.Messages[1]
+	if plan.Role != "assistant" || plan.Phase != "proposed_plan" || !strings.Contains(plan.Content, "Implement it") {
+		t.Fatalf("proposed plan message = %#v", plan)
+	}
+	if len(mapped.Activities) != 0 {
+		t.Fatalf("plan was rendered as an activity: %#v", mapped.Activities)
+	}
+	if len(mapped.PresentationEvents) != 1 || mapped.PresentationEvents[0].Type != core.EventText || mapped.PresentationEvents[0].Content != plan.Content {
+		t.Fatalf("plan presentation = %#v, want one final text event", mapped.PresentationEvents)
+	}
+}
+
+func TestMapAppServerConversationTurn_HidesRequestUserInputTransportJSON(t *testing.T) {
+	turn := appServerConversationTurn{
+		ID:     "turn-waiting",
+		Status: "inProgress",
+		Items: []map[string]any{
+			{"type": "agentMessage", "id": "commentary-1", "text": "I need one choice."},
+			{
+				"type": "dynamicToolCall", "id": "question-1", "tool": "request_user_input", "status": "completed",
+				"arguments": map[string]any{"questions": []any{map[string]any{
+					"id": "database", "question": "Which database?",
+					"options": []any{map[string]any{"label": "Postgres"}},
+				}}},
+				"contentItems": []any{map[string]any{"type": "inputText", "text": `{"answers":{"database":["Postgres"]}}`}},
+			},
+		},
+	}
+
+	mapped := mapAppServerConversationTurn(turn)
+	if len(mapped.Activities) != 0 {
+		t.Fatalf("request_user_input activities = %#v, want none", mapped.Activities)
+	}
+	if len(mapped.PresentationEvents) != 1 || mapped.PresentationEvents[0].Type != core.EventThinking || mapped.PresentationEvents[0].Content != "I need one choice." {
+		t.Fatalf("request_user_input presentation = %#v, want preceding commentary only", mapped.PresentationEvents)
+	}
+	serialized, err := json.Marshal(mapped)
+	if err != nil {
+		t.Fatalf("marshal mapped turn: %v", err)
+	}
+	for _, forbidden := range []string{"request_user_input", "Which database?", `\"answers\"`} {
+		if strings.Contains(string(serialized), forbidden) {
+			t.Fatalf("mapped turn leaked request transport %q: %s", forbidden, serialized)
+		}
+	}
+}
+
 func TestAgentGetConversation_ReadsDaemonWithoutResumingThread(t *testing.T) {
 	daemon := newFakeSharedAppServerDaemon(t)
 	workDir := t.TempDir()
@@ -116,8 +178,11 @@ func TestAgentGetConversation_ReadsDaemonWithoutResumingThread(t *testing.T) {
 	if got := snapshot.Turns[0].Messages[0].Content; got != "old prompt" {
 		t.Fatalf("stripped prompt = %q, want old prompt", got)
 	}
-	if got := snapshot.Turns[0].Activities; len(got) != 1 || got[0].Kind != "plan" || got[0].Status != "completed" {
-		t.Fatalf("completed status-less activity = %#v", got)
+	if got := snapshot.Turns[0].Activities; len(got) != 0 {
+		t.Fatalf("plan activities = %#v, want none", got)
+	}
+	if got := snapshot.Turns[0].Messages; len(got) != 4 || got[3].Phase != "proposed_plan" || got[3].Content != "private plan detail" {
+		t.Fatalf("proposed plan message = %#v", got)
 	}
 	latest := snapshot.Turns[1]
 	if latest.Status != "in_progress" || len(latest.Activities) != 1 {
@@ -143,14 +208,12 @@ func TestAgentGetConversation_ReadsDaemonWithoutResumingThread(t *testing.T) {
 		t.Fatalf("reasoning presentation = %#v", presentation[2])
 	}
 	serialized := strings.Join([]string{
-		snapshot.Turns[0].Activities[0].Kind,
-		snapshot.Turns[0].Activities[0].Status,
 		latest.Messages[0].Content,
 		latest.Messages[1].Content,
 		latest.Activities[0].Kind,
 		latest.Activities[0].Status,
 	}, "\n")
-	for _, forbidden := range []string{"cat /secret/path", "private reasoning", "private plan detail", "secret preamble"} {
+	for _, forbidden := range []string{"cat /secret/path", "private reasoning", "secret preamble"} {
 		if strings.Contains(serialized, forbidden) {
 			t.Fatalf("snapshot leaked %q: %q", forbidden, serialized)
 		}
@@ -238,6 +301,182 @@ func TestAgentWatchConversation_IsReadOnlyAndFiltersThreadEvents(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for identified observer event")
+	}
+
+	daemon.broadcastRequest(t, 72, "item/tool/requestUserInput", map[string]any{
+		"threadId": threadID, "turnId": "turn-live", "itemId": "question-passive",
+		"questions": []any{map[string]any{
+			"id": "database", "question": "Should passive watch answer?",
+			"options": []any{map[string]any{"label": "No"}},
+		}},
+	})
+	daemon.assertNoResponse(t, 100*time.Millisecond)
+}
+
+func TestAgentOpenConversationObserver_ResumesAndAnswersSharedUserInput(t *testing.T) {
+	daemon := newFakeSharedAppServerDaemon(t)
+	workDir := t.TempDir()
+	threadID := "thread-interactive-observer"
+	daemon.setConversation(workDir, threadID, "active", nil, []map[string]any{{
+		"id": "turn-live", "status": "inProgress", "items": []any{},
+	}})
+	agent := &Agent{
+		backend: "app_server", appServerTransport: appServerTransportDaemon,
+		appServerSocket: daemon.socketPath, workDir: workDir,
+	}
+	t.Cleanup(func() { _ = agent.Stop() })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	observer, err := agent.OpenConversationObserver(ctx, threadID)
+	if err != nil {
+		t.Fatalf("OpenConversationObserver() error = %v", err)
+	}
+	daemon.waitForClients(t, 1)
+	clients := daemon.snapshotClients(t)
+	if got := clients[0].resumeCalls; got != 1 {
+		t.Fatalf("interactive observer thread/resume calls = %d, want 1", got)
+	}
+
+	daemon.broadcastRequest(t, 73, "item/tool/requestUserInput", map[string]any{
+		"threadId": threadID,
+		"turnId":   "turn-live",
+		"itemId":   "question-1",
+		"questions": []any{map[string]any{
+			"id": "database", "header": "Database", "question": "Which database?",
+			"options": []any{map[string]any{"label": "Postgres"}, map[string]any{"label": "SQLite"}},
+		}},
+	})
+
+	var request core.Event
+	select {
+	case request = <-observer.Events():
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for shared requestUserInput")
+	}
+	if request.Type != core.EventPermissionRequest || request.RequestID != "73" ||
+		request.ThreadID != threadID || request.TurnID != "turn-live" || request.ItemID != "question-1" {
+		t.Fatalf("observer request event = %#v", request)
+	}
+	if len(request.Questions) != 1 || request.Questions[0].Question != "Which database?" {
+		t.Fatalf("observer questions = %#v", request.Questions)
+	}
+	if err := observer.RespondPermission(request.RequestID, core.PermissionResult{
+		Behavior: "allow",
+		UpdatedInput: map[string]any{"answers": map[string]any{
+			"Which database?": "SQLite",
+		}},
+	}); err != nil {
+		t.Fatalf("RespondPermission() error = %v", err)
+	}
+	response := daemon.waitForResponse(t, 73)
+	var result struct {
+		Answers map[string]struct {
+			Answers []string `json:"answers"`
+		} `json:"answers"`
+	}
+	if err := json.Unmarshal(response.payload["result"], &result); err != nil {
+		t.Fatalf("decode observer response: %v", err)
+	}
+	if got := result.Answers["database"].Answers; len(got) != 1 || got[0] != "SQLite" {
+		t.Fatalf("observer response answers = %#v, want [SQLite]", got)
+	}
+
+	daemon.broadcast(t, "serverRequest/resolved", map[string]any{
+		"threadId": threadID, "requestId": 73,
+	})
+	select {
+	case event := <-observer.Events():
+		if event.Type != core.EventPermissionResolved || event.RequestID != "73" || event.ThreadID != threadID {
+			t.Fatalf("observer resolution event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for shared request resolution")
+	}
+	daemon.broadcast(t, "thread/status/changed", map[string]any{
+		"threadId": threadID, "status": map[string]any{"type": "idle"},
+	})
+	select {
+	case event := <-observer.Events():
+		if event.Type != core.EventResult || !event.Done || event.ThreadID != threadID || event.TurnID != "turn-live" {
+			t.Fatalf("observer terminal event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for observer terminal event")
+	}
+
+	// Rejoining a thread only permits requestUserInput. A passive observer must
+	// never answer a command approval or otherwise become the turn writer.
+	daemon.broadcastRequest(t, 74, "item/commandExecution/requestApproval", map[string]any{
+		"threadId": threadID, "turnId": "turn-live", "itemId": "command-1", "command": "pwd",
+	})
+	daemon.assertNoResponse(t, 100*time.Millisecond)
+}
+
+func TestAgentOpenConversationObserver_ProgressFloodPreservesBlockingQuestionLifecycle(t *testing.T) {
+	daemon := newFakeSharedAppServerDaemon(t)
+	workDir := t.TempDir()
+	threadID := "thread-flooded-observer"
+	daemon.setConversation(workDir, threadID, "active", []string{"waitingOnUserInput"}, []map[string]any{{
+		"id": "turn-live", "status": "inProgress", "items": []any{},
+	}})
+	agent := &Agent{
+		backend: "app_server", appServerTransport: appServerTransportDaemon,
+		appServerSocket: daemon.socketPath, workDir: workDir,
+	}
+	t.Cleanup(func() { _ = agent.Stop() })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	observer, err := agent.OpenConversationObserver(ctx, threadID)
+	if err != nil {
+		t.Fatalf("OpenConversationObserver() error = %v", err)
+	}
+	daemon.waitForClients(t, 1)
+
+	// Do not consume observer.Events while flooding it. Before progress
+	// coalescing, the two 256-entry FIFOs filled with delta wakeups and the
+	// following requestUserInput event was silently dropped.
+	for index := 0; index < appServerConversationEventBuffer*6; index++ {
+		daemon.broadcast(t, "item/agentMessage/delta", map[string]any{
+			"threadId": threadID, "turnId": "turn-live", "itemId": fmt.Sprintf("delta-%d", index), "delta": "x",
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+	daemon.broadcastRequest(t, 75, "item/tool/requestUserInput", map[string]any{
+		"threadId": threadID, "turnId": "turn-live", "itemId": "question-flood",
+		"questions": []any{map[string]any{
+			"id": "database", "question": "Which database?",
+			"options": []any{map[string]any{"label": "Postgres"}, map[string]any{"label": "SQLite"}},
+		}},
+	})
+	daemon.broadcast(t, "serverRequest/resolved", map[string]any{
+		"threadId": threadID, "requestId": 75,
+	})
+	daemon.broadcast(t, "thread/status/changed", map[string]any{
+		"threadId": threadID, "status": map[string]any{"type": "idle"},
+	})
+
+	want := []core.EventType{core.EventPermissionRequest, core.EventPermissionResolved, core.EventResult}
+	got := make([]core.EventType, 0, len(want))
+	deadline := time.After(3 * time.Second)
+	for len(got) < len(want) {
+		select {
+		case event, ok := <-observer.Events():
+			if !ok {
+				t.Fatalf("observer closed after events %v", got)
+			}
+			if appServerObserverEventRequiresDelivery(event) {
+				got = append(got, event.Type)
+			}
+		case <-deadline:
+			t.Fatalf("blocking question lifecycle events = %v, want %v", got, want)
+		}
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("blocking question lifecycle events = %v, want %v", got, want)
+		}
 	}
 }
 

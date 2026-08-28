@@ -52,7 +52,8 @@ Codex snapshot reconcile ─────────────> 修正同一 T
 两种来源共用：
 
 - assistant commentary/final response 的累计规则；
-- thinking、tool use、tool result、plan 等活动到 `ToolStep` 的转换；
+- thinking、tool use、tool result 等活动到 `ToolStep` 的转换；
+- `plan` item 作为正式 assistant 结果，而不是内部活动或 transport JSON；
 - full/compact/quiet 等现有展示策略；
 - rich card 大小预算、Markdown 清洗、图片处理和截断；
 - `SendPreviewStart`、`MessageUpdater`、CardKit sequence、降级和 finalize；
@@ -322,9 +323,46 @@ turn。
 `turn/interrupt` 表示请求中止 Codex turn，不承诺硬杀 turn 启动后脱离生命周期的所有
 子进程；UI 和文档必须如实区分 `turn interrupted` 与 `child process exited`。
 
-external turn 的 permission/approval 仍属于启动它的客户端。mirror 可以显示“等待原
-客户端处理”，但在 daemon 没有跨客户端安全响应能力前，不复刻可点击的 approval 按钮。
-由飞书正常发起的 foreground turn 则继续使用现有 writable session 处理请求。
+当前部署的 Codex CLI `0.150.1` 已通过双 WebSocket 实测确认一个更窄但可用的跨客户端
+能力：客户端对同一运行中 thread 执行 `thread/resume` 后，会收到完全相同的
+`item/tool/requestUserInput` server request（包括同一 request ID）；任一客户端可以回答，
+daemon 随后向其他客户端发送 `serverRequest/resolved`。因此 mirror 对
+`requestUserInput` 复用原生 AskUserQuestion 卡片，并允许飞书回答。
+
+这不是泛化的 writer 权限。observer 不取得 cc-connect 的本地 turn writer lease，也不
+处理 command/file/permissions approval、dynamic tool 或 MCP elicitation。那些请求仍只由
+foreground turn owner 处理。共享问题卡还必须满足以下约束：
+
+- action 绑定不可猜测 token、destination、binding generation、thread、turn、request 和
+  原始卡片 message ID；手输 payload、复制卡片、旧卡和非管理员操作全部 fail closed；
+- observer 只对白名单 `item/tool/requestUserInput` 响应，不能用同一连接回答其他 server
+  request；
+- `isSecret` 问题只展示问题和安全提示，不在共享飞书会话收集或回显答案；用户必须在
+  其他客户端处理；
+- 飞书回答成功后原卡转为已回答并移除控件；TUI/其他客户端先回答时，根据
+  `serverRequest/resolved` 将原卡置灰并移除控件；turn 终态、`/track off` 或 binding
+  generation 变化也必须使控件失效；
+- foreground turn 的 observer 副本不另发 mirror 问题卡，避免与原生飞书问题卡重复；
+- 原生飞书问题若被 TUI 先回答，必须通过独立 resolution side channel 解除 Engine 的
+  permission wait，不能因为主事件消费循环正阻塞而卡死。
+- observer 的 `requestUserInput`、`serverRequest/resolved` 和 turn 终态属于不可丢控制
+  事件；高频 delta 只保留一个待 reconcile 唤醒，不能占满 FIFO 后挤掉问题事件；snapshot
+  中的 `request_user_input` transport item 不作为普通 tool call 渲染，避免 TUI 回答后向飞书
+  暴露一段不可操作的协议 JSON。
+
+### Plan Mode 完成态
+
+Codex 完成 Plan Mode turn 时，daemon 的权威结果是 `type=plan` 的 thread item；TUI 随后
+展示的“是否执行”是客户端本地交互，不会产生 app-server server request。mirror 因此：
+
+- 把 `plan.text` 映射为 `assistant/proposed_plan`，供终态结果、`/history` 和恢复渲染共同使用；
+- 在最新 completed external plan 的原主卡上展示“开始执行计划”，action 精确绑定 delivery、
+  原卡 message ID、destination、generation、thread、turn 和管理员身份；
+- 点击后以正常飞书 foreground turn 执行，但把 `collaborationMode=default` 与同一次
+  `turn/start` 原子发送，不能用“先改 thread mode、再发 prompt”的竞态实现；
+- action 只可 claim 一次；旧卡、复制卡、非最新 plan、活动 turn 和重复回调全部 fail closed；
+- delivery 持久化 action 状态和终态结果版本；升级后显式 `/track` 可重刷旧主卡并用新版本
+  幂等键补发此前被错误省略的计划结果。
 
 ## 必要的额外保证
 
@@ -348,7 +386,8 @@ TurnDelivery {
   card message ID / opaque recoverable handle
   stable platform idempotency keys
   render hash + terminal status
-  notification state
+  notification state + renderer version
+  plan action state
   watermark evidence
 }
 ```
@@ -373,6 +412,7 @@ at-least-once，不能在文档中宣称严格 exactly-once。
 
 - 每个 delivery 的 terminal 状态单调，迟到 delta 不能把 completed 改回 running；
 - 事件按 turn/item identity 合并，不依赖到达顺序拼接重复全文；
+- 进度唤醒可合并，交互请求、交互已解决、终态和错误必须可靠越过进度背压；
 - 更新复用当前节流和大小限制，同一 turn 同时最多一个 in-flight card update；
 - 缓冲区溢出、未知序列或持续更新失败时停止猜测，转 snapshot reconcile；
 - watcher 读取按 endpoint/thread 合并，不为每个用户启动无限 goroutine；
@@ -470,11 +510,14 @@ core 定义通用 identity、状态机和可选能力，不识别 `feishu` 或 `
 7. 活动中重启/断连 → 恢复同一 card，无重复首卡和终态通知，并补齐离线完成的 turn。
 8. `/history` 在 cc-connect 本地 History 非空、Codex 读取失败等情况下仍只服从 Codex 或
    明确失败。
+9. external Plan Mode turn 完成 → 计划作为结果可见 → `/history` 返回同一权威计划 → 原卡
+   精确 action 只启动一次 default-mode foreground turn，复制卡和重复点击均不执行。
 
 ### 现场协议验收
 
-- 用 TUI 与飞书连接同一 daemon thread，确认 observer 不 resume/start thread，也不接管
-  approval owner；
+- 用 TUI 与飞书连接同一 daemon thread，确认 passive observer 不 resume/start thread；交互
+  observer 仅为接收 `requestUserInput` 执行 `thread/resume`，但不取得本地 writer lease，
+  也不接管 command/file approval owner；
 - 验证 external 首卡会产生预期通知，而后续 Patch 原地更新不会产生额外推送；
 - 验证 `clientUserMessageId` 在 start、turn snapshot 和 daemon 重启后 round-trip；
 - 人为插入 start response/event 乱序并在响应前重启，确认无重复卡；

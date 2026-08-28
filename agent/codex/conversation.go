@@ -292,13 +292,45 @@ func (a *Agent) SteerConversationTurn(ctx context.Context, sessionID, expectedTu
 	return nil
 }
 
-// WatchConversation opens an initialize-only, read-only daemon connection and
-// scopes its notifications to sessionID. It deliberately does not call
-// thread/resume and does not acquire the local writer lease.
+type appServerConversationObserver struct {
+	events <-chan core.Event
+	client *appServerSession
+}
+
+func (o *appServerConversationObserver) Events() <-chan core.Event {
+	return o.events
+}
+
+func (o *appServerConversationObserver) RespondPermission(requestID string, result core.PermissionResult) error {
+	if o == nil || o.client == nil {
+		return fmt.Errorf("codex: conversation observer is closed")
+	}
+	return o.client.RespondPermission(requestID, result)
+}
+
+// WatchConversation opens an initialize-only, passive daemon connection and
+// scopes notifications to sessionID. Interactive mirrors should use
+// OpenConversationObserver so the daemon also routes blocking questions.
 func (a *Agent) WatchConversation(ctx context.Context, sessionID string) (<-chan core.Event, error) {
+	observer, err := a.openConversationObserver(ctx, sessionID, false)
+	if err != nil {
+		return nil, err
+	}
+	return observer.Events(), nil
+}
+
+// OpenConversationObserver rejoins the thread on a lease-free connection.
+// Codex app-server broadcasts the same server request and request ID to every
+// resumed client; the first response wins and serverRequest/resolved makes the
+// remaining clients stale.
+func (a *Agent) OpenConversationObserver(ctx context.Context, sessionID string) (core.ConversationObserver, error) {
+	return a.openConversationObserver(ctx, sessionID, true)
+}
+
+func (a *Agent) openConversationObserver(ctx context.Context, sessionID string, interactive bool) (*appServerConversationObserver, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return nil, fmt.Errorf("codex: conversation session id is empty")
+		return nil, fmt.Errorf("codex: conversation observer session id is empty")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -325,6 +357,7 @@ func (a *Agent) WatchConversation(ctx context.Context, sessionID string) (<-chan
 	if err != nil {
 		return nil, err
 	}
+	client.observerInput = interactive
 	// Validate identity and workspace on this exact connection before allowing
 	// it to relay any notification to core.
 	if _, err := readAppServerConversation(client, sessionID, workDir, 1); err != nil {
@@ -335,7 +368,25 @@ func (a *Agent) WatchConversation(ctx context.Context, sessionID string) (<-chan
 		_ = client.Close()
 		return nil, err
 	}
-	output := make(chan core.Event, appServerConversationEventBuffer)
+	if interactive {
+		var resumed threadResumeResponse
+		if err := client.requestWithTimeout("thread/resume", map[string]any{
+			"threadId":     sessionID,
+			"excludeTurns": true,
+		}, &resumed, appServerConversationReadTimeout); err != nil {
+			_ = client.Close()
+			return nil, fmt.Errorf("codex: subscribe conversation observer: %w", err)
+		}
+		if resumed.Thread.ID != sessionID {
+			_ = client.Close()
+			return nil, fmt.Errorf("codex: observer resumed thread %q, want %q", resumed.Thread.ID, sessionID)
+		}
+	}
+	// Progress notifications only wake a snapshot reconciliation, so one
+	// queued wakeup is sufficient. Keeping this relay bounded prevents token
+	// deltas from delaying a blocking question or terminal event behind
+	// hundreds of stale refreshes.
+	output := make(chan core.Event, 1)
 	go func() {
 		defer close(output)
 		defer client.Close()
@@ -349,10 +400,17 @@ func (a *Agent) WatchConversation(ctx context.Context, sessionID string) (<-chan
 				if !ok {
 					return
 				}
-				select {
-				case output <- event:
-				case <-ctx.Done():
-					return
+				if appServerObserverEventRequiresDelivery(event) {
+					select {
+					case output <- event:
+					case <-ctx.Done():
+						return
+					}
+				} else {
+					select {
+					case output <- event:
+					default:
+					}
 				}
 				if event.Type == core.EventError {
 					return
@@ -360,7 +418,7 @@ func (a *Agent) WatchConversation(ctx context.Context, sessionID string) (<-chan
 			}
 		}
 	}()
-	return output, nil
+	return &appServerConversationObserver{events: output, client: client}, nil
 }
 
 // ensureConversationClientLocked returns the initialize-only daemon control
@@ -413,6 +471,8 @@ func newAppServerConversationClientWithOptions(socketPath, workDir string, event
 		pending:          make(map[int64]chan rpcResponseEnvelope),
 		pendingMethods:   make(map[int64]string),
 		pendingApprovals: make(map[string]chan core.PermissionResult),
+		observedInputs:   make(map[string]appServerObservedRequestUserInput),
+		permissionDone:   make(chan string, 32),
 		observerProgress: observerProgress,
 	}
 	s.alive.Store(true)
@@ -595,10 +655,19 @@ func mapAppServerConversationTurn(turn appServerConversationTurn) core.Conversat
 					ID: stringMapValue(item, "id"), Role: "assistant", Content: text, Phase: stringMapValue(item, "phase"),
 				})
 			}
+		case "plan":
+			if text := stringMapValue(item, "text"); text != "" {
+				mapped.Messages = append(mapped.Messages, core.ConversationMessage{
+					ID: stringMapValue(item, "id"), Role: "assistant", Content: text, Phase: "proposed_plan",
+				})
+			}
 		case "reasoning":
 			// Keep reasoning out of history messages. Its user-visible summary is
 			// projected through PresentationEvents below, matching the live card.
 		default:
+			if appServerConversationRequestUserInputItem(itemType, item) {
+				continue
+			}
 			if activity, ok := appServerConversationActivity(itemType, item, mapped.Status); ok {
 				mapped.Activities = append(mapped.Activities, activity)
 			}
@@ -623,9 +692,9 @@ func appServerConversationPresentationEvents(items []map[string]any, turnStatus 
 		itemType := stringMapValue(item, "type")
 		itemID := stringMapValue(item, "id")
 		switch itemType {
-		case "userMessage", "plan", "hookPrompt", "contextCompaction":
+		case "userMessage", "hookPrompt", "contextCompaction":
 			continue
-		case "agentMessage":
+		case "agentMessage", "plan":
 			text, _ := item["text"].(string)
 			if strings.TrimSpace(text) != "" {
 				pendingMessages = append(pendingMessages, core.Event{ItemID: itemID, Content: text})
@@ -635,6 +704,13 @@ func appServerConversationPresentationEvents(items []map[string]any, turnStatus 
 			if text := appServerReasoningText(item); text != "" {
 				events = append(events, core.Event{Type: core.EventThinking, ItemID: itemID, Content: text})
 			}
+			continue
+		}
+		if appServerConversationRequestUserInputItem(itemType, item) {
+			// request_user_input has a dedicated interactive card. Preserve the
+			// preceding commentary boundary, but never render its transport JSON
+			// as an ordinary tool invocation or result in the mirror card.
+			flushPending(core.EventThinking)
 			continue
 		}
 
@@ -658,6 +734,15 @@ func appServerConversationPresentationEvents(items []map[string]any, turnStatus 
 		flushPending(core.EventText)
 	}
 	return events
+}
+
+func appServerConversationRequestUserInputItem(itemType string, item map[string]any) bool {
+	if itemType != "dynamicToolCall" {
+		return false
+	}
+	tool := strings.ToLower(strings.TrimSpace(stringMapValue(item, "tool")))
+	tool = strings.NewReplacer("_", "", "-", "", "/", "").Replace(tool)
+	return tool == "requestuserinput"
 }
 
 func appServerConversationItemCompleted(item map[string]any, turnStatus core.ConversationTurnStatus) bool {
@@ -727,9 +812,6 @@ func appServerConversationActivity(itemType string, item map[string]any, turnSta
 	case "collabAgentToolCall":
 		activity.Name = "Agent"
 		activity.Summary = truncate(appServerJSON(item), 4_000)
-	case "plan":
-		activity.Name = "Plan"
-		activity.Summary = truncate(appServerJSON(item), 4_000)
 	}
 	if activity.Name == "" {
 		activity.Name = kind
@@ -787,8 +869,6 @@ func appServerActivityKind(itemType string) string {
 		return "file_change"
 	case "collabAgentToolCall":
 		return "agent"
-	case "plan":
-		return "plan"
 	default:
 		return ""
 	}

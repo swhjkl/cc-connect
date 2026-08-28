@@ -430,6 +430,13 @@ func (p *Platform) ProgressStyle() string { return p.progressStyle }
 
 func (p *Platform) SupportsProgressCardPayload() bool { return true }
 
+// ProgressUpdateInterval coalesces rapid agent events into one complete card
+// frame instead of blocking the event consumer on every Feishu API request.
+func (p *Platform) ProgressUpdateInterval() time.Duration { return time.Second }
+
+// ProgressHeartbeatInterval keeps long-running single tool calls visibly live.
+func (p *Platform) ProgressHeartbeatInterval() time.Duration { return 15 * time.Second }
+
 // SupportsExactTurnCards reports whether this instance can receive verified
 // card callbacks. Plain-text mode can render progress but has no safe action
 // callback path, so exact turn controls remain hidden there.
@@ -662,6 +669,7 @@ func (p *Platform) webhookHandler(w http.ResponseWriter, r *http.Request) {
 // Three prefixes are supported:
 //   - nav:/xxx   — render a card page and update the original card in-place
 //   - act:/xxx   — execute an action, then render and update the card in-place
+//   - plan:xxx   — dispatch a verified shared-plan action without replacing the card
 //   - turn:xxx   — dispatch a verified exact-turn action without replacing the card
 //   - cmd:/xxx   — legacy: dispatch as a user command (sends a new message)
 func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
@@ -828,6 +836,30 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 	if strings.HasPrefix(actionVal, "askq:") {
 		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
 		go p.dispatchCoreMessage(&core.Message{
+			SessionKey:           sessionKey,
+			Platform:             p.platformName,
+			ReferencedMessageID:  messageID,
+			UserID:               userID,
+			UserName:             p.resolveUserName(userID),
+			ChatName:             p.resolveChatName(chatID),
+			Content:              actionVal,
+			ReplyCtx:             rctx,
+			IsPermissionResponse: true,
+			IsCardAction:         true,
+		})
+
+		// Core validates the exact token and source card, then updates the card
+		// only after Codex accepts the answer. A synchronous green response here
+		// would make stale or copied controls look successful.
+		return nil, nil
+	}
+
+	// trackq: — exact shared-conversation question answer. Unlike legacy
+	// askq callbacks, core requires the verified card-action bit plus the
+	// opaque request token and source message ID before answering Codex.
+	if strings.HasPrefix(actionVal, "trackq:") {
+		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+		go p.dispatchCoreMessage(&core.Message{
 			SessionKey:          sessionKey,
 			Platform:            p.platformName,
 			ReferencedMessageID: messageID,
@@ -836,24 +868,33 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 			ChatName:            p.resolveChatName(chatID),
 			Content:             actionVal,
 			ReplyCtx:            rctx,
+			IsCardAction:        true,
 		})
 
-		answerLabel, _ := event.Event.Action.Value["askq_label"].(string)
-		askqQuestion, _ := event.Event.Action.Value["askq_question"].(string)
-		if answerLabel == "" {
-			answerLabel = actionVal
-		}
-		cb := core.NewCard().Title("✅ "+answerLabel, "green")
-		if askqQuestion != "" {
-			cb.Markdown(askqQuestion)
-		}
-		cb.Markdown("**→ " + answerLabel + "**")
-		return &callback.CardActionTriggerResponse{
-			Card: &callback.Card{
-				Type: "raw",
-				Data: renderCardMap(cb.Build(), sessionKey),
-			},
-		}, nil
+		// Core validates the opaque token, exact source card, generation, and
+		// admin before answering the daemon. Do not paint the card green here:
+		// a synchronous after-click response would claim success before those
+		// checks and could make a stale or copied card look accepted.
+		return nil, nil
+	}
+
+	// plan: — exact shared-plan action. Core validates the delivery token,
+	// source card, destination, thread generation, latest terminal turn, and
+	// administrator identity before starting any new turn.
+	if strings.HasPrefix(actionVal, "plan:") {
+		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+		go p.dispatchCoreMessage(&core.Message{
+			SessionKey:          sessionKey,
+			Platform:            p.platformName,
+			ReferencedMessageID: messageID,
+			UserID:              userID,
+			UserName:            p.resolveUserName(userID),
+			ChatName:            p.resolveChatName(chatID),
+			Content:             actionVal,
+			ReplyCtx:            rctx,
+			IsCardAction:        true,
+		})
+		return nil, nil
 	}
 
 	// turn: — exact native turn-card action. Core validates the opaque token,
@@ -4186,6 +4227,46 @@ func progressStateMeta(state core.ProgressCardState, lang string, agent string) 
 	}
 }
 
+func progressHeartbeatFooter(elapsedSeconds int64, lang string) string {
+	if elapsedSeconds <= 0 {
+		return ""
+	}
+	minutes := elapsedSeconds / 60
+	seconds := elapsedSeconds % 60
+	duration := fmt.Sprintf("%ds", seconds)
+	if minutes > 0 {
+		duration = fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	language := strings.ToLower(strings.TrimSpace(lang))
+	switch {
+	case language == "zh-tw" || language == "zh_hk" || language == "zh-hk":
+		if minutes > 0 {
+			duration = fmt.Sprintf("%d分%d秒", minutes, seconds)
+		} else {
+			duration = fmt.Sprintf("%d秒", seconds)
+		}
+		return fmt.Sprintf("已執行 %s · 卡片持續更新", duration)
+	case strings.HasPrefix(language, "zh"):
+		if minutes > 0 {
+			duration = fmt.Sprintf("%d分%d秒", minutes, seconds)
+		} else {
+			duration = fmt.Sprintf("%d秒", seconds)
+		}
+		return fmt.Sprintf("已运行 %s · 卡片持续更新", duration)
+	case language == "ja":
+		if minutes > 0 {
+			duration = fmt.Sprintf("%d分%d秒", minutes, seconds)
+		} else {
+			duration = fmt.Sprintf("%d秒", seconds)
+		}
+		return fmt.Sprintf("実行時間 %s · カードを更新中", duration)
+	case language == "es":
+		return fmt.Sprintf("En ejecución durante %s · La tarjeta sigue actualizándose", duration)
+	default:
+		return fmt.Sprintf("Running for %s · Card is still updating", duration)
+	}
+}
+
 func progressKindLabel(kind core.ProgressCardEntryKind, lang string) string {
 	zh := isZhLikeProgressLang(lang)
 	switch kind {
@@ -4522,25 +4603,28 @@ func buildProgressPanelElements(items []core.ProgressCardEntry, lang string) []m
 	return elements
 }
 
-func appendProgressGroupedElements(elements []map[string]any, items []core.ProgressCardEntry, lang string, running bool) []map[string]any {
+func appendProgressGroupedElements(elements []map[string]any, items []core.ProgressCardEntry, counts core.ProgressCardCounts, lang string, running bool) []map[string]any {
 	reasoning, tools, others := splitProgressItemsByLane(items)
 	if len(reasoning) > 0 {
+		count := max(counts.Reasoning, len(reasoning))
 		elements = append(elements, buildProgressPanel(
-			progressPanelTitle("Reasoning", len(reasoning), lang),
+			progressPanelTitle("Reasoning", count, lang),
 			running,
 			buildProgressPanelElements(reasoning, lang),
 		))
 	}
 	if len(tools) > 0 {
+		count := max(counts.Tools, len(tools))
 		elements = append(elements, buildProgressPanel(
-			progressPanelTitle("Tools", len(tools), lang),
+			progressPanelTitle("Tools", count, lang),
 			running,
 			buildProgressPanelElements(tools, lang),
 		))
 	}
 	if len(others) > 0 {
+		count := max(counts.Updates, len(others))
 		elements = append(elements, buildProgressPanel(
-			progressPanelTitle("Updates", len(others), lang),
+			progressPanelTitle("Updates", count, lang),
 			running,
 			buildProgressPanelElements(others, lang),
 		))
@@ -4574,13 +4658,16 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 	agent := progressAgentLabel(payload.Agent)
 	title, template, footer := progressStateMeta(payload.State, payload.Lang, agent)
 	running := payload.State == core.ProgressCardStateRunning
+	if running {
+		footer = progressHeartbeatFooter(payload.ElapsedSeconds, payload.Lang)
+	}
 
 	elements := make([]map[string]any, 0, len(items)+3)
 	if payload.Truncated {
 		elements = appendProgressTruncatedNotice(elements, payload.Lang)
 	}
 
-	elements = appendProgressGroupedElements(elements, items, payload.Lang, running)
+	elements = appendProgressGroupedElements(elements, items, payload.Counts, payload.Lang, running)
 	if running && strings.TrimSpace(payload.Hint) != "" {
 		elements = append(elements, map[string]any{"tag": "hr"})
 		elements = append(elements, map[string]any{
@@ -6900,7 +6987,7 @@ func buildRichCardJSONBytesWithOptions(options core.RichCardRenderOptions) ([]by
 			progressElements = appendProgressTruncatedNotice(progressElements, string(options.Language))
 		}
 		progressElements = appendProgressGroupedElements(
-			progressElements, options.ProgressItems, string(options.Language), streaming,
+			progressElements, options.ProgressItems, options.ProgressCounts, string(options.Language), streaming,
 		)
 	} else {
 		reasoningSteps, toolSteps := splitRichStepsByLane(steps)

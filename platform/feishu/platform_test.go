@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"reflect"
@@ -373,6 +374,111 @@ func TestInteractivePlatform_NativeTurnCardActionCarriesExactCardIdentity(t *tes
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected native turn card action message")
+	}
+}
+
+func TestInteractivePlatform_SharedPlanActionCarriesExactCardIdentity(t *testing.T) {
+	platformAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	msgCh := make(chan *core.Message, 1)
+	ip.handler = func(_ core.Platform, msg *core.Message) { msgCh <- msg }
+
+	action := "plan:execute:opaque-delivery"
+	resp, err := ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_test_user"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action": action, "session_key": "feishu:oc_test_chat:ou_test_user",
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_plan_card"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("plan callback claimed success before core validation: %#v", resp)
+	}
+	select {
+	case msg := <-msgCh:
+		if !msg.IsCardAction || msg.Content != action || msg.ReferencedMessageID != "om_plan_card" || msg.SessionKey != "feishu:oc_test_chat:ou_test_user" {
+			t.Fatalf("shared plan action message = %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected shared plan card action message")
+	}
+}
+
+func TestInteractivePlatform_TrackedQuestionActionCarriesExactCardIdentityWithoutPrematureSuccess(t *testing.T) {
+	platformAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	msgCh := make(chan *core.Message, 1)
+	ip.handler = func(_ core.Platform, msg *core.Message) { msgCh <- msg }
+
+	action := "trackq:opaque-token:0:2"
+	resp, err := ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_test_user"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action": action, "askq_label": "SQLite", "askq_question": "Which database?",
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_question_card"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("tracked question callback claimed success before core validation: %#v", resp)
+	}
+	select {
+	case msg := <-msgCh:
+		if !msg.IsCardAction || msg.Content != action || msg.ReferencedMessageID != "om_question_card" {
+			t.Fatalf("tracked question action message = %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected tracked question card action message")
+	}
+}
+
+func TestInteractivePlatform_NativeQuestionActionWaitsForCoreAcceptance(t *testing.T) {
+	platformAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	msgCh := make(chan *core.Message, 1)
+	ip.handler = func(_ core.Platform, msg *core.Message) { msgCh <- msg }
+
+	action := "askq:opaque-token:0:2"
+	resp, err := ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_test_user"},
+			Action: &callback.CallBackAction{Value: map[string]any{
+				"action": action, "askq_label": "SQLite", "askq_question": "Which database?",
+			}},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_native_question"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("native question callback claimed success before core validation: %#v", resp)
+	}
+	select {
+	case msg := <-msgCh:
+		if !msg.IsCardAction || !msg.IsPermissionResponse || msg.Content != action || msg.ReferencedMessageID != "om_native_question" {
+			t.Fatalf("native question action message = %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected native question card action message")
 	}
 }
 
@@ -1199,6 +1305,33 @@ func TestBuildPreviewCardJSON_ProgressPayloadSeparatesReasoningAndTools(t *testi
 	}
 	if !panelContains(t, panels[0], "mindmap_outlined") {
 		t.Fatalf("reasoning panel should render a reasoning icon: %#v", panels[0])
+	}
+}
+
+func TestBuildPreviewCardJSON_ProgressUsesCumulativeCountAndHeartbeat(t *testing.T) {
+	items := make([]core.ProgressCardEntry, 0, 10)
+	for i := 0; i < 10; i++ {
+		items = append(items, core.ProgressCardEntry{
+			Kind: core.ProgressEntryToolUse, Tool: "Bash", Text: fmt.Sprintf("command-%02d", i+7),
+		})
+	}
+	payload := core.ProgressCardPayload{
+		Version: 2, Agent: "Codex", Lang: string(core.LangChinese), State: core.ProgressCardStateRunning,
+		Items: items, Counts: core.ProgressCardCounts{Tools: 17}, ElapsedSeconds: 75, Truncated: true,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal progress payload: %v", err)
+	}
+	cardJSON := buildPreviewCardJSON(core.ProgressCardPayloadPrefix + string(raw))
+	panels := collectCardPanels(t, cardJSON)
+	if len(panels) != 1 || cardPanelTitle(panels[0]) != "工具 (17)" {
+		t.Fatalf("cumulative progress panels = %#v", panels)
+	}
+	for _, want := range []string{"仅显示最近更新。", "已运行 1分15秒 · 卡片持续更新"} {
+		if !strings.Contains(cardJSON, want) {
+			t.Fatalf("progress card should contain %q: %s", want, cardJSON)
+		}
 	}
 }
 

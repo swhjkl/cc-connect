@@ -91,6 +91,11 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	}
 	s.mux.HandleFunc("/send", s.handleSend)
 	s.mux.HandleFunc("/sessions", s.handleSessions)
+	s.mux.HandleFunc("/lifecycle/workspace/status", s.handleWorkspaceStatus)
+	s.mux.HandleFunc("/lifecycle/workspace/route", s.handleWorkspaceRoute)
+	s.mux.HandleFunc("/lifecycle/workspace/unbind", s.handleWorkspaceUnbind)
+	s.mux.HandleFunc("/lifecycle/sessions/status", s.handleLifecycleSessionsStatus)
+	s.mux.HandleFunc("/lifecycle/sessions/attach", s.handleLifecycleSessionsAttach)
 	s.mux.HandleFunc("/cron/add", s.handleCronAdd)
 	s.mux.HandleFunc("/cron/list", s.handleCronList)
 	s.mux.HandleFunc("/cron/info", s.handleCronInfo)
@@ -107,6 +112,165 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	s.mux.HandleFunc("/relay/binding", s.handleRelayBinding)
 
 	return s, nil
+}
+
+type lifecycleRequest struct {
+	Project                string `json:"project"`
+	Session                string `json:"session"`
+	Worktree               string `json:"worktree,omitempty"`
+	ExpectedAgentSessionID string `json:"expected_agent_session_id,omitempty"`
+	AgentSessionID         string `json:"agent_session_id,omitempty"`
+}
+
+type lifecycleEnvelope struct {
+	SchemaVersion int                `json:"schema_version"`
+	OK            bool               `json:"ok"`
+	Result        any                `json:"result,omitempty"`
+	Error         *lifecycleAPIError `json:"error,omitempty"`
+}
+
+type lifecycleAPIError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func (s *APIServer) lifecycleEngine(project string) (*Engine, error) {
+	if strings.TrimSpace(project) == "" {
+		return nil, lifecycleError("invalid_argument", "project is required")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e := s.engines[project]
+	if e == nil {
+		return nil, lifecycleError("not_found", "project %q not found", project)
+	}
+	return e, nil
+}
+
+func writeLifecycleError(w http.ResponseWriter, err error) {
+	code, status := "internal_error", http.StatusInternalServerError
+	var controlErr *LifecycleError
+	if errors.As(err, &controlErr) {
+		code = controlErr.Code
+		switch code {
+		case "invalid_argument":
+			status = http.StatusBadRequest
+		case "not_found":
+			status = http.StatusNotFound
+		case "state_conflict":
+			status = http.StatusConflict
+		}
+	}
+	apiJSON(w, status, lifecycleEnvelope{SchemaVersion: 1, OK: false, Error: &lifecycleAPIError{Code: code, Message: err.Error()}})
+}
+
+func decodeLifecycleRequest(w http.ResponseWriter, r *http.Request) (*lifecycleRequest, bool) {
+	if r.Method != http.MethodPost {
+		writeLifecycleError(w, lifecycleError("invalid_argument", "POST only"))
+		return nil, false
+	}
+	var req lifecycleRequest
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeLifecycleError(w, lifecycleError("invalid_argument", "invalid JSON: %v", err))
+		return nil, false
+	}
+	if req.Session == "" {
+		writeLifecycleError(w, lifecycleError("invalid_argument", "session is required"))
+		return nil, false
+	}
+	return &req, true
+}
+
+func (s *APIServer) handleWorkspaceStatus(w http.ResponseWriter, r *http.Request) {
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	e, err := s.lifecycleEngine(req.Project)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	result, err := e.WorkspaceStatus(req.Session)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	apiJSON(w, http.StatusOK, lifecycleEnvelope{SchemaVersion: 1, OK: true, Result: result})
+}
+
+func (s *APIServer) handleWorkspaceRoute(w http.ResponseWriter, r *http.Request) {
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	e, err := s.lifecycleEngine(req.Project)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	result, err := e.WorkspaceRoute(req.Session, req.Worktree)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	apiJSON(w, http.StatusOK, lifecycleEnvelope{SchemaVersion: 1, OK: true, Result: result})
+}
+
+func (s *APIServer) handleWorkspaceUnbind(w http.ResponseWriter, r *http.Request) {
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	e, err := s.lifecycleEngine(req.Project)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	result, err := e.WorkspaceUnbind(req.Session, req.Worktree, req.ExpectedAgentSessionID)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	apiJSON(w, http.StatusOK, lifecycleEnvelope{SchemaVersion: 1, OK: true, Result: result})
+}
+
+func (s *APIServer) handleLifecycleSessionsStatus(w http.ResponseWriter, r *http.Request) {
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	e, err := s.lifecycleEngine(req.Project)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	result, err := e.SessionsStatus(req.Session)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	apiJSON(w, http.StatusOK, lifecycleEnvelope{SchemaVersion: 1, OK: true, Result: result})
+}
+
+func (s *APIServer) handleLifecycleSessionsAttach(w http.ResponseWriter, r *http.Request) {
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	e, err := s.lifecycleEngine(req.Project)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	result, err := e.SessionsAttach(req.Session, req.AgentSessionID)
+	if err != nil {
+		writeLifecycleError(w, err)
+		return
+	}
+	apiJSON(w, http.StatusOK, lifecycleEnvelope{SchemaVersion: 1, OK: true, Result: result})
 }
 
 func (s *APIServer) SocketPath() string {

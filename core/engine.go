@@ -459,6 +459,7 @@ type Engine struct {
 	workspaceInitAllowLocalPaths bool
 	workspaceBindings            *WorkspaceBindingManager
 	workspacePool                *workspacePool
+	lifecycleControlMu           sync.Mutex
 	initFlows                    map[string]*workspaceInitFlow // workspace channel key → init state
 	initFlowsMu                  sync.Mutex
 	sendWorkDirMu                sync.RWMutex

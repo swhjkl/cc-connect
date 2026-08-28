@@ -18,11 +18,11 @@ const ContinueSession = "__continue__"
 
 // Session tracks one conversation between a user and the agent.
 type Session struct {
-	ID                  string         `json:"id"`
-	Name                string         `json:"name"`
-	AgentSessionID      string         `json:"agent_session_id"`
-	AgentType           string         `json:"agent_type,omitempty"`
-	PastAgentSessionIDs []string       `json:"past_agent_session_ids,omitempty"`
+	ID                  string   `json:"id"`
+	Name                string   `json:"name"`
+	AgentSessionID      string   `json:"agent_session_id"`
+	AgentType           string   `json:"agent_type,omitempty"`
+	PastAgentSessionIDs []string `json:"past_agent_session_ids,omitempty"`
 	// ActiveProvider is the agent provider name that was active when this
 	// session last took a turn. It is restored before --resume so that a
 	// cc-connect process restart does not silently drop a user's
@@ -422,6 +422,51 @@ func (sm *SessionManager) SwitchToAgentSession(userKey, agentSID, agentName, sum
 	return s
 }
 
+// SwitchToAgentSessionChecked is the persistence-aware variant used by local
+// lifecycle automation. It rolls the in-memory index back if the new active
+// mapping cannot be durably saved.
+func (sm *SessionManager) SwitchToAgentSessionChecked(userKey, agentSID, agentName, summary string) (*Session, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	oldActive, hadActive := sm.activeSession[userKey]
+	for _, sid := range sm.userSessions[userKey] {
+		s := sm.sessions[sid]
+		if s != nil && s.GetAgentSessionID() == agentSID {
+			sm.activeSession[userKey] = s.ID
+			if err := sm.persistLocked(); err != nil {
+				if hadActive {
+					sm.activeSession[userKey] = oldActive
+				} else {
+					delete(sm.activeSession, userKey)
+				}
+				return nil, err
+			}
+			return s, nil
+		}
+	}
+	oldCounter := sm.counter
+	s := sm.createLocked(userKey, summary)
+	s.SetAgentInfo(agentSID, agentName, summary)
+	if err := sm.persistLocked(); err != nil {
+		delete(sm.sessions, s.ID)
+		ids := sm.userSessions[userKey]
+		if len(ids) > 0 {
+			sm.userSessions[userKey] = ids[:len(ids)-1]
+		}
+		if len(sm.userSessions[userKey]) == 0 {
+			delete(sm.userSessions, userKey)
+		}
+		if hadActive {
+			sm.activeSession[userKey] = oldActive
+		} else {
+			delete(sm.activeSession, userKey)
+		}
+		sm.counter = oldCounter
+		return nil, err
+	}
+	return s, nil
+}
+
 func (sm *SessionManager) ListSessions(userKey string) []*Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -440,6 +485,13 @@ func (sm *SessionManager) ActiveSessionID(userKey string) string {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.activeSession[userKey]
+}
+
+// ActiveSession returns the existing active session without creating one.
+func (sm *SessionManager) ActiveSession(userKey string) *Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.sessions[sm.activeSession[userKey]]
 }
 
 // SetSessionName sets a custom display name for an agent session.
@@ -623,8 +675,14 @@ func (sm *SessionManager) Save() {
 }
 
 func (sm *SessionManager) saveLocked() {
+	if err := sm.persistLocked(); err != nil {
+		slog.Error("session: failed to persist", "path", sm.storePath, "error", err)
+	}
+}
+
+func (sm *SessionManager) persistLocked() error {
 	if sm.storePath == "" {
-		return
+		return nil
 	}
 
 	// Build a deep-copy snapshot to avoid racing with concurrent Session mutations.
@@ -677,16 +735,15 @@ func (sm *SessionManager) saveLocked() {
 	}
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		slog.Error("session: failed to marshal", "error", err)
-		return
+		return fmt.Errorf("session: marshal: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(sm.storePath), 0o755); err != nil {
-		slog.Error("session: failed to create dir", "error", err)
-		return
+		return fmt.Errorf("session: create dir: %w", err)
 	}
 	if err := AtomicWriteFile(sm.storePath, data, 0o644); err != nil {
-		slog.Error("session: failed to write", "path", sm.storePath, "error", err)
+		return fmt.Errorf("session: write: %w", err)
 	}
+	return nil
 }
 
 func (sm *SessionManager) load() {
@@ -828,7 +885,7 @@ func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult 
 	defer sm.mu.Unlock()
 
 	// Group sessions by baseChat
-	chatSessions := make(map[string][]*Session) // baseChat -> sessions
+	chatSessions := make(map[string][]*Session)  // baseChat -> sessions
 	sessionToBaseChat := make(map[string]string) // session.ID -> baseChat
 
 	for userKey, sessionIDs := range sm.userSessions {

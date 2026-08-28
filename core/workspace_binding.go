@@ -2,6 +2,8 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -10,6 +12,8 @@ import (
 )
 
 const sharedWorkspaceBindingsKey = "shared"
+
+var ErrWorkspaceBindingConflict = errors.New("workspace binding conflict")
 
 // FlexTime wraps time.Time with lenient JSON unmarshaling.
 type FlexTime struct{ time.Time }
@@ -115,6 +119,84 @@ func (m *WorkspaceBindingManager) Bind(projectKey, channelKey, channelName, work
 	m.saveLocked()
 }
 
+// BindCAS persists a binding only when it is currently absent or already
+// points at workspace. It is the checked mutation used by local automation.
+func (m *WorkspaceBindingManager) BindCAS(projectKey, channelKey, channelName, workspace string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.refreshLocked()
+	if current := m.lookupLocked(projectKey, channelKey); current != nil {
+		if normalizeWorkspacePath(current.Workspace) == normalizeWorkspacePath(workspace) {
+			return false, nil
+		}
+		return false, fmt.Errorf("%w: currently %q", ErrWorkspaceBindingConflict, current.Workspace)
+	}
+	if m.bindings[projectKey] == nil {
+		m.bindings[projectKey] = make(map[string]*WorkspaceBinding)
+	}
+	m.bindings[projectKey][channelKey] = &WorkspaceBinding{ChannelName: channelName, Workspace: workspace, BoundAt: FlexTime{time.Now()}}
+	if err := m.saveCheckedLocked(); err != nil {
+		delete(m.bindings[projectKey], channelKey)
+		if len(m.bindings[projectKey]) == 0 {
+			delete(m.bindings, projectKey)
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// UnbindCAS removes only an exact project-scoped binding. The expected
+// workspace guard prevents a stale closeout from deleting a newer route.
+func (m *WorkspaceBindingManager) UnbindCAS(projectKey, channelKey, expectedWorkspace string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.refreshLocked()
+	proj := m.bindings[projectKey]
+	if proj == nil {
+		return false, nil
+	}
+	var key string
+	var current *WorkspaceBinding
+	for _, candidate := range workspaceChannelKeyCandidates(channelKey) {
+		if b := proj[candidate]; b != nil {
+			key, current = candidate, b
+			break
+		}
+	}
+	if current == nil {
+		return false, nil
+	}
+	if normalizeWorkspacePath(current.Workspace) != normalizeWorkspacePath(expectedWorkspace) {
+		return false, fmt.Errorf("%w: currently %q", ErrWorkspaceBindingConflict, current.Workspace)
+	}
+	delete(proj, key)
+	if len(proj) == 0 {
+		delete(m.bindings, projectKey)
+	}
+	if err := m.saveCheckedLocked(); err != nil {
+		if m.bindings[projectKey] == nil {
+			m.bindings[projectKey] = make(map[string]*WorkspaceBinding)
+		}
+		m.bindings[projectKey][key] = current
+		return false, err
+	}
+	return true, nil
+}
+
+// LookupExact returns a copy of a project-scoped binding without falling back
+// to the shared route layer.
+func (m *WorkspaceBindingManager) LookupExact(projectKey, channelKey string) *WorkspaceBinding {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.refreshLocked()
+	b := m.lookupLocked(projectKey, channelKey)
+	if b == nil {
+		return nil
+	}
+	copy := *b
+	return &copy
+}
+
 // MigrateChannelKey copies an existing default binding from oldChannelKey to
 // newChannelKey. It never overwrites an existing destination and deliberately
 // preserves the default binding for other channels and older versions.
@@ -200,22 +282,27 @@ func (m *WorkspaceBindingManager) ListByProject(projectKey string) map[string]*W
 }
 
 func (m *WorkspaceBindingManager) saveLocked() {
+	if err := m.saveCheckedLocked(); err != nil {
+		slog.Error("workspace bindings: save error", "err", err)
+	}
+}
+
+func (m *WorkspaceBindingManager) saveCheckedLocked() error {
 	if m.storePath == "" {
-		return
+		return nil
 	}
 	data, err := json.MarshalIndent(m.bindings, "", "  ")
 	if err != nil {
-		slog.Error("workspace bindings: marshal error", "err", err)
-		return
+		return fmt.Errorf("workspace bindings: marshal: %w", err)
 	}
 	if err := AtomicWriteFile(m.storePath, data, 0o644); err != nil {
-		slog.Error("workspace bindings: save error", "err", err)
-		return
+		return fmt.Errorf("workspace bindings: save: %w", err)
 	}
 	if info, err := os.Stat(m.storePath); err == nil {
 		m.lastLoadedModTime = info.ModTime()
 		m.lastLoadedSize = info.Size()
 	}
+	return nil
 }
 
 func (m *WorkspaceBindingManager) load() {

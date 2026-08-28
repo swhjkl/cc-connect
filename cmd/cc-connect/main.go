@@ -220,6 +220,7 @@ var topLevelCommandHandlers = map[string]func([]string){
 	"at":        runTimer,
 	"relay":     runRelay,
 	"sessions":  runSessions,
+	"workspace": runWorkspace,
 	"agent-sid": runAgentSID,
 	"daemon":    runDaemon,
 	"feishu":    runFeishu,

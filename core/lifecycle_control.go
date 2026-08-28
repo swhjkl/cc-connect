@@ -251,7 +251,10 @@ func (e *Engine) WorkspaceUnbind(sessionKey, worktree, expectedAgentSessionID st
 	return &WorkspaceMutationResult{Project: e.name, Session: sessionKey, Worktree: worktree, Changed: changed, Status: status, CloseoutGuard: guard}, nil
 }
 
-func (e *Engine) lifecycleWorkspaceContext(sessionKey string) (string, Agent, *SessionManager, error) {
+// lifecycleWorkspaceContextLocked resolves a project route while the caller
+// holds lifecycleControlMu, keeping route validation and subsequent mutation
+// in one critical section.
+func (e *Engine) lifecycleWorkspaceContextLocked(sessionKey string) (string, Agent, *SessionManager, error) {
 	channelKey, err := e.validateLifecycleSession(sessionKey)
 	if err != nil {
 		return "", nil, nil, err
@@ -275,10 +278,16 @@ func (e *Engine) lifecycleWorkspaceContext(sessionKey string) (string, Agent, *S
 }
 
 func (e *Engine) SessionsStatus(sessionKey string) (*SessionControlResult, error) {
-	worktree, _, sessions, err := e.lifecycleWorkspaceContext(sessionKey)
+	e.lifecycleControlMu.Lock()
+	defer e.lifecycleControlMu.Unlock()
+	worktree, _, sessions, err := e.lifecycleWorkspaceContextLocked(sessionKey)
 	if err != nil {
 		return nil, err
 	}
+	return e.sessionsStatusLocked(sessionKey, worktree, sessions), nil
+}
+
+func (e *Engine) sessionsStatusLocked(sessionKey, worktree string, sessions *SessionManager) *SessionControlResult {
 	result := &SessionControlResult{Project: e.name, Session: sessionKey, Worktree: worktree}
 	if active := sessions.ActiveSession(sessionKey); active != nil {
 		result.InternalID = active.ID
@@ -294,26 +303,24 @@ func (e *Engine) SessionsStatus(sessionKey string) (*SessionControlResult, error
 		state.mu.Unlock()
 	}
 	e.interactiveMu.Unlock()
-	return result, nil
+	return result
 }
 
 func (e *Engine) SessionsAttach(sessionKey, agentSessionID string) (*SessionControlResult, error) {
 	if strings.TrimSpace(agentSessionID) == "" {
 		return nil, lifecycleError("invalid_argument", "agent_session_id is required")
 	}
-	worktree, agent, sessions, err := e.lifecycleWorkspaceContext(sessionKey)
+	e.lifecycleControlMu.Lock()
+	defer e.lifecycleControlMu.Unlock()
+	worktree, agent, sessions, err := e.lifecycleWorkspaceContextLocked(sessionKey)
 	if err != nil {
 		return nil, err
 	}
-	e.lifecycleControlMu.Lock()
-	defer e.lifecycleControlMu.Unlock()
 	active := sessions.ActiveSession(sessionKey)
 	if active != nil && active.GetAgentSessionID() == agentSessionID {
-		result, statusErr := e.SessionsStatus(sessionKey)
-		if result != nil {
-			result.Changed = false
-		}
-		return result, statusErr
+		result := e.sessionsStatusLocked(sessionKey, worktree, sessions)
+		result.Changed = false
+		return result, nil
 	}
 	if active != nil && active.Busy() {
 		return nil, lifecycleError("state_conflict", "session is busy")

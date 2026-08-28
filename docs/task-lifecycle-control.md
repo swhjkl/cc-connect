@@ -5,6 +5,12 @@ Every command requires an explicit project, platform session key, and JSON
 output. Responses use `schema_version: 1` and contain either `result` or a
 stable `error.code`.
 
+The envelope is identical for workspace and sessions operations:
+`{"schema_version":1,"ok":true,"result":{...}}` on success, or
+`{"schema_version":1,"ok":false,"error":{"code":"...","message":"..."}}`
+on failure. `closeout_guard` is nested under `result` only for workspace
+unbind responses.
+
 ```sh
 cc-connect workspace status --project <project> --session <platform:chat:user> --json
 cc-connect workspace route --project <project> --session <platform:chat:user> \

@@ -542,16 +542,9 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 	case progressStyleCard:
 		w.items = append(w.items, item)
 		w.entries = append(w.entries, fallback)
-		if w.maxEntries > 0 && len(w.items) > w.maxEntries {
-			w.items = w.items[len(w.items)-w.maxEntries:]
-			if len(w.entries) > w.maxEntries {
-				w.entries = w.entries[len(w.entries)-w.maxEntries:]
-			}
-			w.truncated = true
-		} else if w.maxEntries > 0 && len(w.entries) > w.maxEntries {
-			w.entries = w.entries[len(w.entries)-w.maxEntries:]
-			w.truncated = true
-		}
+		var truncated bool
+		w.items, w.entries, truncated = trimProgressCardEntriesByLane(w.items, w.entries, w.maxEntries)
+		w.truncated = w.truncated || truncated
 		if !w.rebuildCardContentLocked() {
 			slog.Warn("progress writer: failed to build structured payload", "platform", w.platform.Name())
 			w.markFailedLocked()
@@ -762,6 +755,57 @@ func (w *compactProgressWriter) flushLocked(force bool) (bool, func(any), any) {
 	}
 	w.recordSuccessfulUpdateLocked()
 	return true, nil, nil
+}
+
+func trimProgressCardEntriesByLane(items []ProgressCardEntry, entries []string, perLaneLimit int) ([]ProgressCardEntry, []string, bool) {
+	if perLaneLimit <= 0 || len(items) == 0 {
+		return items, entries, false
+	}
+
+	const (
+		reasoningLane = iota
+		toolLane
+		otherLane
+	)
+	laneFor := func(kind ProgressCardEntryKind) int {
+		switch kind {
+		case ProgressEntryThinking:
+			return reasoningLane
+		case ProgressEntryToolUse, ProgressEntryToolResult:
+			return toolLane
+		default:
+			return otherLane
+		}
+	}
+
+	keep := make([]bool, len(items))
+	var counts [3]int
+	truncated := false
+	for i := len(items) - 1; i >= 0; i-- {
+		lane := laneFor(items[i].Kind)
+		if counts[lane] >= perLaneLimit {
+			truncated = true
+			continue
+		}
+		counts[lane]++
+		keep[i] = true
+	}
+	if !truncated {
+		return items, entries, false
+	}
+
+	trimmedItems := make([]ProgressCardEntry, 0, counts[reasoningLane]+counts[toolLane]+counts[otherLane])
+	trimmedEntries := make([]string, 0, cap(trimmedItems))
+	for i, item := range items {
+		if !keep[i] {
+			continue
+		}
+		trimmedItems = append(trimmedItems, item)
+		if i < len(entries) {
+			trimmedEntries = append(trimmedEntries, entries[i])
+		}
+	}
+	return trimmedItems, trimmedEntries, true
 }
 
 func (w *compactProgressWriter) recordSuccessfulUpdateLocked() {

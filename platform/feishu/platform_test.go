@@ -1297,6 +1297,12 @@ func TestBuildPreviewCardJSON_ProgressPayloadSeparatesReasoningAndTools(t *testi
 	if got := cardPanelTitle(panels[1]); got != "Tools (2)" {
 		t.Fatalf("second panel title = %q, want Tools (2)", got)
 	}
+	if expanded, _ := panels[0]["expanded"].(bool); !expanded {
+		t.Fatalf("reasoning panel should be expanded by default: %#v", panels[0])
+	}
+	if expanded, _ := panels[1]["expanded"].(bool); expanded {
+		t.Fatalf("tools panel should be collapsed by default: %#v", panels[1])
+	}
 	if panelContains(t, panels[0], "pwd") {
 		t.Fatalf("reasoning panel should not include tool content: %#v", panels[0])
 	}
@@ -1739,6 +1745,12 @@ func TestBuildRichCard_SeparatesReasoningAndTools(t *testing.T) {
 	}
 	if got := cardPanelTitle(panels[1]); got != "Tools (1)" {
 		t.Fatalf("second panel title = %q, want Tools (1)", got)
+	}
+	if expanded, _ := panels[0]["expanded"].(bool); !expanded {
+		t.Fatalf("reasoning panel should be expanded by default: %#v", panels[0])
+	}
+	if expanded, _ := panels[1]["expanded"].(bool); expanded {
+		t.Fatalf("tools panel should be collapsed by default: %#v", panels[1])
 	}
 	if panelContains(t, panels[0], "pwd") {
 		t.Fatalf("reasoning panel should not include tool content: %#v", panels[0])

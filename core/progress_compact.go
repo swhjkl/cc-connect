@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -25,6 +26,9 @@ const (
 	// Bound each platform progress-card API call so a hung upstream request
 	// does not block the whole turn forever.
 	compactProgressAPITimeout = 15 * time.Second
+
+	progressRetryInitialDelay = 2 * time.Second
+	progressRetryMaxDelay     = 30 * time.Second
 )
 
 type ProgressCardState string
@@ -318,7 +322,9 @@ type compactProgressWriter struct {
 	handle  any
 
 	enabled    bool
+	degraded   bool
 	failed     bool
+	stopped    bool
 	style      string
 	usePayload bool
 
@@ -344,6 +350,8 @@ type compactProgressWriter struct {
 	flushTimer        *time.Timer
 	heartbeatInterval time.Duration
 	heartbeatTimer    *time.Timer
+	retryTimer        *time.Timer
+	nextRetryDelay    time.Duration
 }
 
 func normalizeProgressStyle(style string) string {
@@ -407,16 +415,17 @@ func SuppressStandaloneToolResultEvent(p Platform) bool {
 
 func newCompactProgressWriter(ctx context.Context, p Platform, replyCtx any, agentName string, lang Language, transform func(string) string) *compactProgressWriter {
 	w := &compactProgressWriter{
-		ctx:        ctx,
-		platform:   p,
-		replyCtx:   replyCtx,
-		transform:  transform,
-		style:      progressStyleForTarget(p, replyCtx),
-		state:      ProgressCardStateRunning,
-		agentName:  normalizeProgressAgentLabel(agentName),
-		lang:       lang,
-		maxEntries: 10,
-		startedAt:  time.Now(),
+		ctx:            ctx,
+		platform:       p,
+		replyCtx:       replyCtx,
+		transform:      transform,
+		style:          progressStyleForTarget(p, replyCtx),
+		state:          ProgressCardStateRunning,
+		agentName:      normalizeProgressAgentLabel(agentName),
+		lang:           lang,
+		maxEntries:     10,
+		startedAt:      time.Now(),
+		nextRetryDelay: progressRetryInitialDelay,
 	}
 	if throttler, ok := p.(ProgressUpdateThrottler); ok {
 		w.minUpdateInterval = throttler.ProgressUpdateInterval()
@@ -650,6 +659,7 @@ func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
 // Close stops background refreshes without changing the card's visible state.
 func (w *compactProgressWriter) Close() {
 	w.mu.Lock()
+	w.stopped = true
 	w.stopTimersLocked()
 	w.closed = true
 	w.mu.Unlock()
@@ -688,6 +698,12 @@ func (w *compactProgressWriter) flushLocked(force bool) (bool, func(any), any) {
 		w.scheduleHeartbeatLocked()
 		return true, nil, nil
 	}
+	// Once card-style progress has been selected, transport failures must not
+	// make individual tool events fall back to standalone chat messages. Keep
+	// buffering while the delayed retry catches the card up to the latest state.
+	if w.degraded {
+		return true, nil, nil
+	}
 
 	if w.handle == nil {
 		if w.starter != nil {
@@ -696,6 +712,10 @@ func (w *compactProgressWriter) flushLocked(force bool) (bool, func(any), any) {
 			cancel()
 			if err != nil || handle == nil {
 				slog.Warn("progress writer: SendPreviewStart failed", "platform", w.platform.Name(), "style", w.style, "error", err, "handle_nil", handle == nil)
+				if w.style == progressStyleCard {
+					w.scheduleRetryLocked()
+					return true, nil, nil
+				}
 				w.markFailedLocked()
 				return false, nil, nil
 			}
@@ -706,6 +726,10 @@ func (w *compactProgressWriter) flushLocked(force bool) (bool, func(any), any) {
 			cancel()
 			if err != nil {
 				slog.Warn("progress writer: initial Send failed", "platform", w.platform.Name(), "style", w.style, "error", err)
+				if w.style == progressStyleCard {
+					w.scheduleRetryLocked()
+					return true, nil, nil
+				}
 				w.markFailedLocked()
 				return false, nil, nil
 			}
@@ -729,6 +753,10 @@ func (w *compactProgressWriter) flushLocked(force bool) (bool, func(any), any) {
 	cancel()
 	if err != nil {
 		slog.Warn("progress writer: UpdateMessage failed", "platform", w.platform.Name(), "style", w.style, "error", err)
+		if w.style == progressStyleCard {
+			w.scheduleRetryLocked()
+			return true, nil, nil
+		}
 		w.markFailedLocked()
 		return false, nil, nil
 	}
@@ -739,6 +767,7 @@ func (w *compactProgressWriter) flushLocked(force bool) (bool, func(any), any) {
 func (w *compactProgressWriter) recordSuccessfulUpdateLocked() {
 	w.lastSent = w.content
 	w.lastUpdateAt = time.Now()
+	w.degraded = false
 	w.scheduleHeartbeatLocked()
 }
 
@@ -814,11 +843,98 @@ func (w *compactProgressWriter) stopTimersLocked() {
 		w.heartbeatTimer.Stop()
 		w.heartbeatTimer = nil
 	}
+	w.stopRetryLocked()
 }
 
 func (w *compactProgressWriter) markFailedLocked() {
 	w.failed = true
 	w.stopTimersLocked()
+}
+
+// Stop cancels any delayed retry owned by this turn.
+func (w *compactProgressWriter) Stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.stopped = true
+	w.closed = true
+	w.stopTimersLocked()
+}
+
+func (w *compactProgressWriter) scheduleRetryLocked() {
+	w.degraded = true
+	if w.stopped || w.closed || w.retryTimer != nil {
+		return
+	}
+	delay := w.nextRetryDelay
+	if delay <= 0 {
+		delay = progressRetryInitialDelay
+	}
+	w.retryTimer = time.AfterFunc(delay, w.retry)
+}
+
+func (w *compactProgressWriter) stopRetryLocked() {
+	if w.retryTimer != nil {
+		w.retryTimer.Stop()
+		w.retryTimer = nil
+	}
+}
+
+func (w *compactProgressWriter) retry() {
+	w.mu.Lock()
+	w.retryTimer = nil
+	if w.stopped || w.closed || !w.enabled || w.failed || !w.degraded || w.content == "" {
+		w.mu.Unlock()
+		return
+	}
+	select {
+	case <-w.ctx.Done():
+		w.stopped = true
+		w.mu.Unlock()
+		return
+	default:
+	}
+
+	callCtx, cancel := w.withAPITimeout()
+	var err error
+	if w.handle == nil {
+		if w.starter != nil {
+			var handle any
+			handle, err = w.starter.SendPreviewStart(callCtx, w.replyCtx, w.content)
+			if err == nil && handle == nil {
+				err = errors.New("preview start returned nil handle")
+			}
+			if err == nil {
+				w.handle = handle
+			}
+		} else {
+			err = w.platform.Send(callCtx, w.replyCtx, w.content)
+			if err == nil {
+				w.handle = w.replyCtx
+			}
+		}
+	} else {
+		err = w.updater.UpdateMessage(callCtx, w.handle, w.content)
+	}
+	cancel()
+	if err != nil {
+		slog.Warn("progress writer: delayed retry failed", "platform", w.platform.Name(), "style", w.style, "retry_delay", w.nextRetryDelay, "error", err)
+		w.nextRetryDelay *= 2
+		if w.nextRetryDelay > progressRetryMaxDelay {
+			w.nextRetryDelay = progressRetryMaxDelay
+		}
+		w.scheduleRetryLocked()
+		w.mu.Unlock()
+		return
+	}
+
+	w.recordSuccessfulUpdateLocked()
+	w.nextRetryDelay = progressRetryInitialDelay
+	observer, handle := w.takeHandleObserverLocked()
+	w.mu.Unlock()
+	slog.Info("progress writer: delayed retry recovered", "platform", w.platform.Name(), "style", w.style)
+	if observer != nil {
+		observer(handle)
+	}
 }
 
 func (w *compactProgressWriter) withAPITimeout() (context.Context, context.CancelFunc) {

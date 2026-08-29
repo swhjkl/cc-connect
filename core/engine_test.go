@@ -386,11 +386,13 @@ func (p *stubCardPlatform) getRefreshedCards() []*Card {
 
 type stubCompactProgressPlatform struct {
 	stubPlatformEngine
-	style          string
-	supportPayload bool
-	previewMu      sync.Mutex
-	previewStarts  []string
-	previewEdits   []string
+	style            string
+	supportPayload   bool
+	previewStartErrs []error
+	previewEditErrs  []error
+	previewMu        sync.Mutex
+	previewStarts    []string
+	previewEdits     []string
 }
 
 func (p *stubCompactProgressPlatform) ProgressStyle() string {
@@ -406,15 +408,23 @@ func (p *stubCompactProgressPlatform) SupportsProgressCardPayload() bool {
 
 func (p *stubCompactProgressPlatform) SendPreviewStart(_ context.Context, _ any, content string) (any, error) {
 	p.previewMu.Lock()
+	defer p.previewMu.Unlock()
 	p.previewStarts = append(p.previewStarts, content)
-	p.previewMu.Unlock()
+	index := len(p.previewStarts) - 1
+	if index < len(p.previewStartErrs) && p.previewStartErrs[index] != nil {
+		return nil, p.previewStartErrs[index]
+	}
 	return "preview-handle", nil
 }
 
 func (p *stubCompactProgressPlatform) UpdateMessage(_ context.Context, _ any, content string) error {
 	p.previewMu.Lock()
+	defer p.previewMu.Unlock()
 	p.previewEdits = append(p.previewEdits, content)
-	p.previewMu.Unlock()
+	index := len(p.previewEdits) - 1
+	if index < len(p.previewEditErrs) {
+		return p.previewEditErrs[index]
+	}
 	return nil
 }
 
@@ -1937,6 +1947,52 @@ func TestProcessInteractiveEvents_CardProgressUsesStructuredPayloadWhenSupported
 	}
 	if finalPayload.State != ProgressCardStateCompleted {
 		t.Fatalf("final payload state = %q, want %q", finalPayload.State, ProgressCardStateCompleted)
+	}
+}
+
+func TestProcessInteractiveEvents_CardProgressUpdateFailureDoesNotLeakStandaloneEvents(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              "card",
+		supportPayload:     true,
+		previewEditErrs:    []error{errors.New("context deadline exceeded"), nil},
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "feishu:user-card-update-failure"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-card-update-failure")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-card-update-failure",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventThinking, Content: "Plan first"}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo hi"}
+	success := true
+	agentSession.events <- Event{Type: EventToolResult, ToolName: "Bash", ToolResult: "hi", ToolSuccess: &success}
+	agentSession.events <- Event{Type: EventText, Content: "done"}
+	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-card-update-failure", time.Now(), nil, nil, state.replyCtx)
+
+	if sent := p.getSent(); len(sent) != 1 || sent[0] != "done" {
+		t.Fatalf("standalone sends = %#v, want only final response", sent)
+	}
+	edits := p.getPreviewEdits()
+	if len(edits) != 2 {
+		t.Fatalf("preview edits = %d, want failed update plus one final catch-up", len(edits))
+	}
+	finalPayload, ok := ParseProgressCardPayload(edits[1])
+	if !ok {
+		t.Fatalf("final catch-up should be structured payload, got %q", edits[1])
+	}
+	if finalPayload.State != ProgressCardStateCompleted {
+		t.Fatalf("final state = %q, want %q", finalPayload.State, ProgressCardStateCompleted)
+	}
+	if len(finalPayload.Items) != 3 {
+		t.Fatalf("final items = %#v, want thinking, tool use, and tool result", finalPayload.Items)
 	}
 }
 

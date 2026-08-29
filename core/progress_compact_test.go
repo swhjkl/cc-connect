@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -145,6 +146,137 @@ func TestCompactProgressWriter_UsesReplyContextHints(t *testing.T) {
 	if parsed.State != ProgressCardStateCompleted {
 		t.Fatalf("state = %q, want %q", parsed.State, ProgressCardStateCompleted)
 	}
+}
+
+func TestCompactProgressWriter_UpdateFailureRetriesDuringTurn(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              progressStyleCard,
+		supportPayload:     true,
+		previewEditErrs:    []error{errors.New("update timeout"), nil},
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "codex", LangEnglish, nil)
+	w.nextRetryDelay = 10 * time.Millisecond
+	defer w.Stop()
+
+	if !w.AppendEvent(ProgressEntryThinking, "plan", "", "plan") {
+		t.Fatal("initial append should be handled")
+	}
+	if !w.AppendEvent(ProgressEntryToolUse, "echo hi", "Bash", "tool") {
+		t.Fatal("failed update should remain handled")
+	}
+	if !w.AppendEvent(ProgressEntryToolResult, "hi", "Bash", "result") {
+		t.Fatal("degraded append should remain handled")
+	}
+	waitForProgressCondition(t, func() bool { return len(p.getPreviewEdits()) >= 2 })
+	edits := p.getPreviewEdits()
+	runningPayload, ok := ParseProgressCardPayload(edits[1])
+	if !ok {
+		t.Fatalf("delayed retry payload = %q, want structured payload", edits[1])
+	}
+	if runningPayload.State != ProgressCardStateRunning || len(runningPayload.Items) != 3 {
+		t.Fatalf("delayed retry payload = %#v, want running with 3 buffered items", runningPayload)
+	}
+	if !w.Finalize(ProgressCardStateCompleted) {
+		t.Fatal("final update should succeed")
+	}
+
+	edits = p.getPreviewEdits()
+	if len(edits) != 3 {
+		t.Fatalf("preview edits = %d, want failed update, delayed retry, and final update", len(edits))
+	}
+	payload, ok := ParseProgressCardPayload(edits[2])
+	if !ok {
+		t.Fatalf("final payload = %q, want structured payload", edits[2])
+	}
+	if payload.State != ProgressCardStateCompleted || len(payload.Items) != 3 {
+		t.Fatalf("final payload = %#v, want completed with 3 buffered items", payload)
+	}
+}
+
+func TestCompactProgressWriter_StartFailureRetriesDuringTurn(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              progressStyleCard,
+		supportPayload:     true,
+		previewStartErrs:   []error{errors.New("start timeout"), nil},
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "codex", LangEnglish, nil)
+	w.nextRetryDelay = 10 * time.Millisecond
+	defer w.Stop()
+
+	if !w.AppendEvent(ProgressEntryToolUse, "echo first", "Bash", "first") {
+		t.Fatal("failed preview start should remain handled")
+	}
+	if !w.AppendEvent(ProgressEntryToolUse, "echo second", "Bash", "second") {
+		t.Fatal("degraded append should remain handled")
+	}
+	waitForProgressCondition(t, func() bool { return len(p.getPreviewStarts()) >= 2 })
+	starts := p.getPreviewStarts()
+	payload, ok := ParseProgressCardPayload(starts[1])
+	if !ok {
+		t.Fatalf("delayed start payload = %q, want structured payload", starts[1])
+	}
+	if payload.State != ProgressCardStateRunning || len(payload.Items) != 2 {
+		t.Fatalf("delayed start payload = %#v, want running with 2 buffered items", payload)
+	}
+	if !w.Finalize(ProgressCardStateCompleted) {
+		t.Fatal("final update after delayed start should succeed")
+	}
+	if got := len(p.getPreviewEdits()); got != 1 {
+		t.Fatalf("preview edits = %d, want final update after retry recovery", got)
+	}
+}
+
+func TestCompactProgressWriter_StopCancelsDelayedRetry(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              progressStyleCard,
+		supportPayload:     true,
+		previewStartErrs:   []error{errors.New("start timeout")},
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "codex", LangEnglish, nil)
+	w.nextRetryDelay = 40 * time.Millisecond
+
+	if !w.AppendEvent(ProgressEntryToolUse, "echo first", "Bash", "first") {
+		t.Fatal("failed preview start should remain handled")
+	}
+	w.Stop()
+	time.Sleep(80 * time.Millisecond)
+	if got := len(p.getPreviewStarts()); got != 1 {
+		t.Fatalf("preview starts after stop = %d, want delayed retry canceled", got)
+	}
+}
+
+func TestCompactProgressWriter_CompactUpdateFailureKeepsLegacyFallback(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              progressStyleCompact,
+		previewEditErrs:    []error{errors.New("update timeout")},
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "codex", LangEnglish, nil)
+
+	if !w.Append("first") {
+		t.Fatal("initial compact append should be handled")
+	}
+	if w.Append("second") {
+		t.Fatal("failed compact update should preserve legacy fallback")
+	}
+	if w.Append("third") {
+		t.Fatal("failed compact writer should keep using legacy fallback")
+	}
+}
+
+func waitForProgressCondition(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for progress retry")
 }
 
 func TestBuildAndParseProgressCardPayloadV2(t *testing.T) {

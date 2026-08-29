@@ -610,3 +610,80 @@ func TestCompactProgressWriter_DoesNotTransformToolResults(t *testing.T) {
 		t.Fatalf("tool result text = %q, want raw %q", got, raw)
 	}
 }
+
+func TestCompactProgressWriter_CardRetainsThinkingWhenToolsOverflow(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              "card",
+		supportPayload:     true,
+	}
+	w := newCompactProgressWriter(context.Background(), p, "ctx", "codex", LangEnglish, nil)
+
+	w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryThinking, Text: "keep this reasoning"}, "keep this reasoning")
+	for i := 0; i < 12; i++ {
+		text := fmt.Sprintf("tool-%d", i)
+		w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryToolUse, Tool: "Bash", Text: text}, text)
+	}
+
+	payload, ok := ParseProgressCardPayload(w.content)
+	if !ok {
+		t.Fatalf("ParseProgressCardPayload(%q) failed", w.content)
+	}
+	if !payload.Truncated {
+		t.Fatal("payload.Truncated = false, want true")
+	}
+	if len(payload.Items) != 11 {
+		t.Fatalf("items = %d, want 1 reasoning + 10 tools", len(payload.Items))
+	}
+	if got := payload.Items[0]; got.Kind != ProgressEntryThinking || got.Text != "keep this reasoning" {
+		t.Fatalf("items[0] = %#v, want retained reasoning", got)
+	}
+	if got := payload.Items[1].Text; got != "tool-2" {
+		t.Fatalf("oldest retained tool = %q, want tool-2", got)
+	}
+	if got := payload.Items[len(payload.Items)-1].Text; got != "tool-11" {
+		t.Fatalf("latest retained tool = %q, want tool-11", got)
+	}
+
+	w.AppendStructured(ProgressCardEntry{Kind: ProgressEntryInfo, Text: "still running"}, "still running")
+	payload, ok = ParseProgressCardPayload(w.content)
+	if !ok {
+		t.Fatalf("ParseProgressCardPayload(%q) failed after info update", w.content)
+	}
+	if !payload.Truncated {
+		t.Fatal("payload.Truncated should remain true after appending an unfilled lane")
+	}
+}
+
+func TestTrimProgressCardEntriesByLane_KeepsLatestTenPerLaneInOrder(t *testing.T) {
+	var items []ProgressCardEntry
+	var entries []string
+	for i := 0; i < 12; i++ {
+		for _, kind := range []ProgressCardEntryKind{ProgressEntryThinking, ProgressEntryToolResult, ProgressEntryError} {
+			text := fmt.Sprintf("%s-%d", kind, i)
+			items = append(items, ProgressCardEntry{Kind: kind, Text: text})
+			entries = append(entries, text)
+		}
+	}
+
+	gotItems, gotEntries, truncated := trimProgressCardEntriesByLane(items, entries, 10)
+	if !truncated {
+		t.Fatal("truncated = false, want true")
+	}
+	if len(gotItems) != 30 || len(gotEntries) != 30 {
+		t.Fatalf("trimmed lengths = (%d, %d), want (30, 30)", len(gotItems), len(gotEntries))
+	}
+	for i, item := range gotItems {
+		if item.Text != gotEntries[i] {
+			t.Fatalf("entry alignment at %d: item=%q entry=%q", i, item.Text, gotEntries[i])
+		}
+		if strings.HasSuffix(item.Text, "-0") || strings.HasSuffix(item.Text, "-1") {
+			t.Fatalf("old lane entry should be trimmed, got %q", item.Text)
+		}
+	}
+	for i, want := range []string{"thinking-2", "tool_result-2", "error-2"} {
+		if gotItems[i].Text != want {
+			t.Fatalf("items[%d] = %q, want %q", i, gotItems[i].Text, want)
+		}
+	}
+}

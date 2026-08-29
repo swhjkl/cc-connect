@@ -4609,7 +4609,7 @@ func appendProgressGroupedElements(elements []map[string]any, items []core.Progr
 		count := max(counts.Reasoning, len(reasoning))
 		elements = append(elements, buildProgressPanel(
 			progressPanelTitle("Reasoning", count, lang),
-			running,
+			true,
 			buildProgressPanelElements(reasoning, lang),
 		))
 	}
@@ -4617,7 +4617,7 @@ func appendProgressGroupedElements(elements []map[string]any, items []core.Progr
 		count := max(counts.Tools, len(tools))
 		elements = append(elements, buildProgressPanel(
 			progressPanelTitle("Tools", count, lang),
-			running,
+			false,
 			buildProgressPanelElements(tools, lang),
 		))
 	}
@@ -6994,14 +6994,14 @@ func buildRichCardJSONBytesWithOptions(options core.RichCardRenderOptions) ([]by
 		if len(reasoningSteps) > 0 {
 			progressElements = append(progressElements, buildRichPanel(
 				richLaneTitle("Reasoning", len(reasoningSteps)),
-				streaming,
+				true,
 				richPanelElements(reasoningSteps, "Thinking..."),
 			))
 		}
 		if len(toolSteps) > 0 {
 			progressElements = append(progressElements, buildRichPanel(
 				richLaneTitle("Tools", len(toolSteps)),
-				streaming,
+				false,
 				richPanelElements(toolSteps, "No tool steps"),
 			))
 		}

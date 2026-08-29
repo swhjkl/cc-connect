@@ -701,7 +701,7 @@ func (w *compactProgressWriter) flushLocked(force bool) (bool, func(any), any) {
 	// Once card-style progress has been selected, transport failures must not
 	// make individual tool events fall back to standalone chat messages. Keep
 	// buffering while the delayed retry catches the card up to the latest state.
-	if w.degraded {
+	if w.degraded && !force {
 		return true, nil, nil
 	}
 

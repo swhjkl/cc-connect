@@ -515,7 +515,7 @@ func readAppServerConversationWindow(client *appServerSession, sessionID, workDi
 	var turnsErr error
 	for len(turnData) < maxTurns {
 		remaining := maxTurns - len(turnData)
-		pageLimit := min(100, remaining)
+		pageLimit := min(10, remaining)
 		params := map[string]any{
 			"threadId": sessionID, "sortDirection": "desc", "itemsView": "full", "limit": pageLimit,
 		}

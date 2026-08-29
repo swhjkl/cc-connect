@@ -216,6 +216,7 @@ const (
 	MsgError                     MsgKey = "error"
 	MsgSessionNotFound           MsgKey = "session_not_found"
 	MsgFailedToStartAgentSession MsgKey = "failed_to_start_agent_session"
+	MsgResumeFailed              MsgKey = "failed_to_resume_agent_session"
 	MsgFailedToDeleteSession     MsgKey = "failed_to_delete_session"
 	MsgEmptyResponse             MsgKey = "empty_response"
 	MsgPermissionPrompt          MsgKey = "permission_prompt"
@@ -932,6 +933,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 錯誤: 啟動 Agent 會話失敗",
 		LangJapanese:           "❌ エラー: Agentセッションの起動に失敗しました",
 		LangSpanish:            "❌ Error: error al iniciar la sesión del agente",
+	},
+	MsgResumeFailed: {
+		LangEnglish:            "❌ Could not resume session %s: %v\nThe session remains selected. Send another message to retry, or use /new to start a new conversation.",
+		LangChinese:            "❌ 无法恢复会话 %s：%v\n该会话仍保持选中。请再次发送消息重试，或使用 /new 创建新会话。",
+		LangTraditionalChinese: "❌ 無法恢復會話 %s：%v\n該會話仍保持選中。請再次傳送訊息重試，或使用 /new 建立新會話。",
+		LangJapanese:           "❌ セッション %s を再開できませんでした: %v\nこのセッションは選択されたままです。もう一度メッセージを送信して再試行するか、/new で新しい会話を開始してください。",
+		LangSpanish:            "❌ No se pudo reanudar la sesión %s: %v\nLa sesión sigue seleccionada. Envía otro mensaje para reintentarlo o usa /new para iniciar una conversación nueva.",
 	},
 	MsgFailedToDeleteSession: {
 		LangEnglish:            "❌ %s: %v",
@@ -3678,11 +3686,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "🗑️ Sesión eliminada: %s",
 	},
 	MsgSwitchSuccess: {
-		LangEnglish:            "✅ Switched to: %s (%s, %d msgs)",
-		LangChinese:            "✅ 已切换到：%s（%s，%d 条消息）",
-		LangTraditionalChinese: "✅ 已切換到：%s（%s，%d 則訊息）",
-		LangJapanese:           "✅ 切り替え：%s（%s、%d件）",
-		LangSpanish:            "✅ Cambiado a: %s (%s, %d mensajes)",
+		LangEnglish:            "✅ Selected: %s (%s, %d msgs). It will resume when you send your next message.",
+		LangChinese:            "✅ 已选中：%s（%s，%d 条消息）。将在你发送下一条消息时恢复。",
+		LangTraditionalChinese: "✅ 已選中：%s（%s，%d 則訊息）。將在你傳送下一則訊息時恢復。",
+		LangJapanese:           "✅ 選択しました：%s（%s、%d件）。次のメッセージ送信時に再開します。",
+		LangSpanish:            "✅ Seleccionada: %s (%s, %d mensajes). Se reanudará cuando envíes el próximo mensaje.",
 	},
 	MsgSwitchNoMatch: {
 		LangEnglish:            "❌ No session matching %q",

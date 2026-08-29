@@ -478,6 +478,107 @@ func TestCUJ_B3_SwitchPreservesHistoryEndToEnd(t *testing.T) {
 	}
 }
 
+type cujResumeFailureAgent struct {
+	mu       sync.Mutex
+	targetID string
+	failNext bool
+	calls    []string
+}
+
+func (a *cujResumeFailureAgent) Name() string { return "cuj-resume" }
+func (a *cujResumeFailureAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	return []AgentSessionInfo{{ID: a.targetID, Summary: "large persisted session", MessageCount: 14}}, nil
+}
+func (a *cujResumeFailureAgent) StartSession(_ context.Context, sessionID string) (AgentSession, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls = append(a.calls, sessionID)
+	if a.failNext {
+		a.failNext = false
+		return nil, errors.New("websocket resume failed")
+	}
+	if sessionID != a.targetID {
+		return nil, fmt.Errorf("unexpected session %q", sessionID)
+	}
+	return &cujResumeFailureSession{cujAgentSession: newCUJAgentSession(), sessionID: sessionID}, nil
+}
+func (a *cujResumeFailureAgent) Stop() error { return nil }
+func (a *cujResumeFailureAgent) snapshotCalls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.calls...)
+}
+
+type cujResumeFailureSession struct {
+	*cujAgentSession
+	sessionID string
+}
+
+func (s *cujResumeFailureSession) CurrentSessionID() string { return s.sessionID }
+
+func TestCUJ_B13_SwitchResumeFailurePreservesSelectionAndRetries(t *testing.T) {
+	const targetID = "01a04f33-7582-7170-a805-e8300fd86675"
+	p := &stubPlatformEngine{n: "test"}
+	agent := &cujResumeFailureAgent{targetID: targetID}
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	defer e.cancel()
+	key := "test:alice"
+
+	// Action 1: selecting a thread is explicitly pending until the next message.
+	e.ReceiveMessage(p, &Message{SessionKey: key, Platform: p.Name(), MessageID: "switch", UserID: "alice", Content: "/switch 1", ReplyCtx: "ctx"})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "Selected:") || !strings.Contains(got, "next message") {
+		t.Fatalf("/switch reply = %q, want pending-resume wording", got)
+	}
+	p.clearSent()
+
+	// Action 2: a genuine resume failure is visible and does not start fresh.
+	agent.mu.Lock()
+	agent.failNext = true
+	agent.mu.Unlock()
+	e.ReceiveMessage(p, &Message{SessionKey: key, Platform: p.Name(), MessageID: "resume-fail", UserID: "alice", Content: "continue the selected work", ReplyCtx: "ctx"})
+	waitForCUJSentCount(t, p, 1)
+	visible := strings.Join(p.getSent(), "\n")
+	if !strings.Contains(visible, "Could not resume session 01a04f33-758") || !strings.Contains(visible, "remains selected") {
+		t.Fatalf("resume failure reply = %q", visible)
+	}
+	if got := e.sessions.GetOrCreateActive(key).GetAgentSessionID(); got != targetID {
+		t.Fatalf("AgentSessionID after failure = %q, want %q", got, targetID)
+	}
+	if calls := agent.snapshotCalls(); len(calls) != 1 || calls[0] != targetID {
+		t.Fatalf("StartSession calls after failure = %#v, want one exact resume", calls)
+	}
+
+	// Action 3: /current still reports the selected native thread.
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{SessionKey: key, Platform: p.Name(), MessageID: "current", UserID: "alice", Content: "/current", ReplyCtx: "ctx"})
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, targetID) {
+		t.Fatalf("/current reply = %q, want selected thread %q", got, targetID)
+	}
+
+	// Action 4: a later explicit message retries that exact thread and succeeds.
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{SessionKey: key, Platform: p.Name(), MessageID: "resume-retry", UserID: "alice", Content: "retry the selected work", ReplyCtx: "ctx"})
+	waitForCUJSentCount(t, p, 1)
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "ok") {
+		t.Fatalf("retry reply = %q, want successful agent result", got)
+	}
+	if calls := agent.snapshotCalls(); len(calls) != 2 || calls[0] != targetID || calls[1] != targetID {
+		t.Fatalf("StartSession calls = %#v, want two exact resumes and no fresh start", calls)
+	}
+
+	history := e.sessions.GetOrCreateActive(key).GetHistory(0)
+	foundFailedPrompt := false
+	for _, entry := range history {
+		if entry.Role == "user" && entry.Content == "continue the selected work" {
+			foundFailedPrompt = true
+			break
+		}
+	}
+	if !foundFailedPrompt {
+		t.Fatalf("failed resume prompt was not preserved in history: %#v", history)
+	}
+}
+
 // ===========================================================================
 // CUJ-C4 · /cancel stops current turn AND creates a fresh session
 //
@@ -2828,8 +2929,8 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 			UserID: "contender", Content: "contender text", ReplyCtx: "contender-ctx",
 		})
 		waitForCUJSentCount(t, pContender, 1)
-		if got := strings.Join(pContender.getSent(), "\n"); !strings.Contains(got, "failed to start agent session") {
-			t.Fatalf("contender saw %q, want writer-conflict start failure", got)
+		if got := strings.Join(pContender.getSent(), "\n"); !strings.Contains(got, "Could not resume session") || !strings.Contains(got, "active writer") {
+			t.Fatalf("contender saw %q, want explicit writer-conflict resume failure", got)
 		}
 
 		// Action 3: the original group remains attached and can continue safely.

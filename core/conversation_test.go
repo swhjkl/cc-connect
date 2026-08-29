@@ -657,6 +657,44 @@ func firstCardActionWithPrefix(card *Card, prefix string) string {
 	return ""
 }
 
+func TestConversationMirror_ForegroundDeliveryWithoutBusySessionShowsRecoveredQuestion(t *testing.T) {
+	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	defer e.cancel()
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	session := e.sessions.GetOrCreateActive(key)
+	session.SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatalf("bindConversationMirror() error = %v", err)
+	}
+	if _, _, err := e.trackStore.claimDelivery(binding, "turn-lifecycle", "primary", "foreground", "task-message"); err != nil {
+		t.Fatalf("claim foreground delivery: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+	mirror := &conversationMirror{
+		cancel: cancel, destination: binding.Destination, sessionKey: binding.SessionKey,
+		threadID: binding.ThreadID, generation: binding.Generation, wake: make(chan struct{}, 1),
+		platform: p, handles: make(map[string]any),
+	}
+	question := Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-lifecycle", ItemID: "question-1",
+		RequestID: "request-1", ToolName: "AskUserQuestion",
+		Questions: []UserQuestion{{Question: "Which database?", Options: []UserQuestionOption{{Label: "Postgres"}}}},
+	}
+	e.handleConversationElicitation(ctx, mirror, e.sessions, p, newMirrorQuestionObserver(), question)
+	e.handleConversationElicitation(ctx, mirror, e.sessions, p, newMirrorQuestionObserver(), question)
+
+	starts, _ := p.questionSnapshot()
+	if len(starts) != 1 || !strings.Contains(starts[0].RenderText(), "Which database?") {
+		t.Fatalf("recovered lifecycle question cards = %#v, want one actionable question", starts)
+	}
+}
+
 func TestConversationMirror_BlockingQuestionIsVisibleAnswerableAndInvalidated(t *testing.T) {
 	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
 	p := newMirrorQuestionPlatform()

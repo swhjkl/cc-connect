@@ -676,12 +676,15 @@ func (e *Engine) handleConversationElicitation(ctx context.Context, mirror *conv
 	if binding == nil || binding.ThreadID != mirror.threadID || binding.Generation != mirror.generation || !e.effectiveTrackEnabled(binding) {
 		return
 	}
-	if delivery := e.trackStore.delivery(binding.Destination, binding.ThreadID, event.TurnID, "primary"); delivery != nil && delivery.Source == "foreground" {
-		return
-	}
 	// The foreground AgentSession receives the same daemon request and already
-	// renders the native prompt. The mirror must stay silent for that turn.
+	// renders the native prompt. The mirror must stay silent for that turn. A
+	// foreground delivery record alone is not sufficient proof: lifecycle task
+	// turns can carry the foreground marker while only the conversation observer
+	// is available to render their blocking question.
 	if session := sessions.GetOrCreateActive(binding.SessionKey); session.GetAgentSessionID() == event.ThreadID && session.Busy() {
+		slog.Debug("track: suppressing observer question owned by foreground session",
+			"platform", p.Name(), "thread_id", event.ThreadID, "turn_id", event.TurnID,
+		)
 		return
 	}
 

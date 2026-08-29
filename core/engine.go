@@ -542,6 +542,8 @@ type queuedMessage struct {
 // interactiveState tracks a running interactive agent session and its permission state.
 type interactiveState struct {
 	agentSession               AgentSession
+	startError                 error
+	resumeSessionID            string
 	platform                   Platform
 	replyCtx                   any
 	currentMessageID           string
@@ -3991,7 +3993,15 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	defer stopRecallMonitor()
 
 	if state.agentSession == nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
+		if state.resumeSessionID != "" && state.startError != nil {
+			shortID := state.resumeSessionID
+			if len(shortID) > 12 {
+				shortID = shortID[:12]
+			}
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgResumeFailed, shortID, state.startError))
+		} else {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
+		}
 		return
 	}
 	e.cancelAgentSessionIdleClose(state)
@@ -4355,53 +4365,40 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// Cross-project session leakage guard (issue #599): if a session ID was
 	// inherited from a different project's workspace (e.g. another
 	// cc-connect project that happens to share a Session row), the agent
-	// can detect the mismatch and we should clear the ID rather than
-	// resume a conversation that has nothing to do with this project.
+	// can detect the mismatch. Preserve the selection and surface an error;
+	// silently starting fresh would route the next prompt to the wrong thread.
+	var validationErr error
 	if startSessionID != "" {
 		if validator, ok := agent.(SessionIDValidator); ok && !validator.ValidateSessionID(e.ctx, startSessionID) {
-			slog.Warn("session ID does not belong to this project, clearing it",
+			validationErr = fmt.Errorf("saved agent session does not belong to this project")
+			slog.Warn("session ID does not belong to this project, preserving selection",
 				"session_key", sessionKey, "invalid_session_id", startSessionID)
-			session.SetAgentSessionID("", agent.Name())
-			sessions.Save()
-			startSessionID = ""
 		}
 	}
 	isResume := startSessionID != ""
 	startAt := time.Now()
-	agentSession, err := agent.StartSession(e.ctx, startSessionID)
+	var agentSession AgentSession
+	err := validationErr
+	if err == nil {
+		agentSession, err = agent.StartSession(e.ctx, startSessionID)
+	}
 	startElapsed := time.Since(startAt)
 	if err != nil {
-		// If resume/continue failed, try a fresh session as fallback.
-		if startSessionID != "" && !errors.Is(err, ErrAgentSessionWriterBusy) {
-			slog.Error("session resume failed, falling back to fresh session",
-				"session_key", sessionKey, "failed_session_id", startSessionID,
-				"error", err, "elapsed", startElapsed)
-			// Clear the stale session ID so CompareAndSetAgentSessionID can
-			// write the new ID, matching the relay fallback at line 12640.
-			session.SetAgentSessionID("", agent.Name())
-			sessions.Save()
-			startAt = time.Now()
-			agentSession, err = agent.StartSession(e.ctx, "")
-			startElapsed = time.Since(startAt)
-			if err == nil {
-				slog.Info("fresh session started after resume failure",
-					"session_key", sessionKey, "elapsed", startElapsed)
-			}
+		slog.Error("failed to start interactive session", "session_id", startSessionID, "error", err, "elapsed", startElapsed)
+		e.hooks.Emit(HookEvent{
+			Event:      HookEventError,
+			SessionKey: sessionKey,
+			Platform:   p.Name(),
+			Error:      fmt.Sprintf("failed to start session: %v", err),
+		})
+		newState := &interactiveState{
+			platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true,
+			startError: err, resumeSessionID: startSessionID,
 		}
-		if err != nil {
-			slog.Error("failed to start interactive session", "error", err, "elapsed", startElapsed)
-			e.hooks.Emit(HookEvent{
-				Event:      HookEventError,
-				SessionKey: sessionKey,
-				Platform:   p.Name(),
-				Error:      fmt.Sprintf("failed to start session: %v", err),
-			})
-			newState := &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true}
-			adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
-			state = newState
-			e.interactiveStates[sessionKey] = state
-			return state
-		}
+		adoptPendingFromPlaceholder(e.interactiveStates[sessionKey], newState)
+		state = newState
+		e.interactiveStates[sessionKey] = state
+		return state
 	}
 	if startElapsed >= slowAgentStart {
 		slog.Warn("slow agent session start", "elapsed", startElapsed, "agent", agent.Name(), "session_id", startSessionID)
@@ -16376,18 +16373,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	// timeout only controls how long we *wait* for the response.
 	agentSession, err := agent.StartSession(e.ctx, session.GetAgentSessionID())
 	if err != nil {
-		// Resume failed — fall back to a fresh session so the relay is not
-		// permanently broken by a corrupted/stale session ID.
-		if session.GetAgentSessionID() != "" && !errors.Is(err, ErrAgentSessionWriterBusy) {
-			slog.Warn("relay: session resume failed, trying fresh session",
-				"relay_key", relaySessionKey, "error", err)
-			session.SetAgentSessionID("", agent.Name())
-			sessions.Save()
-			agentSession, err = agent.StartSession(e.ctx, "")
-		}
-		if err != nil {
-			return "", fmt.Errorf("start relay session: %w", err)
-		}
+		return "", fmt.Errorf("start relay session: %w", err)
 	}
 
 	saveRelaySessionID := func(id string, force bool) {

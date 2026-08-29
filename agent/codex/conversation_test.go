@@ -337,6 +337,9 @@ func TestAgentOpenConversationObserver_ResumesAndAnswersSharedUserInput(t *testi
 	if got := clients[0].resumeCalls; got != 1 {
 		t.Fatalf("interactive observer thread/resume calls = %d, want 1", got)
 	}
+	if !clients[0].resumeExcludesTurns {
+		t.Fatal("interactive observer thread/resume excludeTurns = false, want true")
+	}
 
 	daemon.broadcastRequest(t, 73, "item/tool/requestUserInput", map[string]any{
 		"threadId": threadID,
@@ -541,6 +544,17 @@ func TestAgentGetConversationWindow_PagesUntilWatermark(t *testing.T) {
 	}
 	if len(snapshot.Turns) != 151 || snapshot.Turns[0].ID != "turn-150" || snapshot.Turns[len(snapshot.Turns)-1].ID != "turn-000" {
 		t.Fatalf("paged turn window = len %d, first %q, last %q", len(snapshot.Turns), snapshot.Turns[0].ID, snapshot.Turns[len(snapshot.Turns)-1].ID)
+	}
+	daemon.mu.Lock()
+	limits := append([]int(nil), daemon.turnListLimits...)
+	daemon.mu.Unlock()
+	if len(limits) < 2 {
+		t.Fatalf("thread/turns/list calls = %d, want paginated reads", len(limits))
+	}
+	for _, limit := range limits {
+		if limit > 10 {
+			t.Fatalf("thread/turns/list limit = %d, want at most 10", limit)
+		}
 	}
 
 	_, covered, err = agent.GetConversationWindow(context.Background(), "thread-paged", "turn-missing", 120)

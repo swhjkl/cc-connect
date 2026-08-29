@@ -62,8 +62,13 @@ func TestAppServerSession_ConnectsWithWebSocketFramesOverUnixSocket(t *testing.T
 			return
 		}
 		if err := conn.WriteJSON(map[string]any{
-			"id":     initialize["id"],
-			"result": map[string]any{"userAgent": "test-app-server"},
+			"id": initialize["id"],
+			"result": map[string]any{
+				"userAgent": "test-app-server",
+				// Regression: the daemon WebSocket used to reject any frame over
+				// 10 MiB, preventing large persisted sessions from resuming.
+				"padding": strings.Repeat("x", 10*1024*1024+1024),
+			},
 		}); err != nil {
 			serverResult <- fmt.Errorf("write initialize response: %w", err)
 			return
@@ -701,6 +706,12 @@ func TestAppServerSession_ThreadResumePrebindsBeforeResponse(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.ensureThread("thread-A") }()
 	request := waitForAppServerClientRequest(t, stdin, "thread/resume")
+	if got, _ := request.Params["excludeTurns"].(bool); !got {
+		t.Fatalf("thread/resume excludeTurns = %#v, want true", request.Params["excludeTurns"])
+	}
+	if got, _ := request.Params["persistExtendedHistory"].(bool); got {
+		t.Fatalf("thread/resume persistExtendedHistory = true, want history excluded")
+	}
 	if got := s.CurrentSessionID(); got != "thread-A" {
 		t.Fatalf("CurrentSessionID() before response = %q, want expected thread-A", got)
 	}
@@ -1248,9 +1259,10 @@ type fakeSharedAppServerClient struct {
 	daemon *fakeSharedAppServerDaemon
 	conn   *websocket.Conn
 
-	writeMu     sync.Mutex
-	threadID    string
-	resumeCalls int
+	writeMu             sync.Mutex
+	threadID            string
+	resumeCalls         int
+	resumeExcludesTurns bool
 }
 
 type fakeSharedAppServerSteer struct {
@@ -1272,6 +1284,7 @@ type fakeSharedAppServerDaemon struct {
 	conversationStatus string
 	conversationFlags  []string
 	conversationTurns  map[string][]map[string]any
+	turnListLimits     []int
 	interrupts         chan appServerThreadIdentity
 	steers             chan fakeSharedAppServerSteer
 
@@ -1383,7 +1396,8 @@ func (c *fakeSharedAppServerClient) readLoop() {
 			c.writeResponse(rawID, map[string]any{"protocolVersion": "2"})
 		case "thread/resume":
 			var params struct {
-				ThreadID string `json:"threadId"`
+				ThreadID     string `json:"threadId"`
+				ExcludeTurns bool   `json:"excludeTurns"`
 			}
 			if err := json.Unmarshal(message["params"], &params); err != nil || params.ThreadID == "" {
 				c.daemon.reportError(fmt.Errorf("decode thread/resume params: %v", err))
@@ -1392,6 +1406,7 @@ func (c *fakeSharedAppServerClient) readLoop() {
 			c.daemon.mu.Lock()
 			c.threadID = params.ThreadID
 			c.resumeCalls++
+			c.resumeExcludesTurns = params.ExcludeTurns
 			c.daemon.mu.Unlock()
 			c.writeResponse(rawID, map[string]any{
 				"thread": map[string]any{"id": params.ThreadID},
@@ -1455,6 +1470,7 @@ func (c *fakeSharedAppServerClient) readLoop() {
 				continue
 			}
 			c.daemon.mu.Lock()
+			c.daemon.turnListLimits = append(c.daemon.turnListLimits, params.Limit)
 			turns := append([]map[string]any(nil), c.daemon.conversationTurns[params.ThreadID]...)
 			c.daemon.mu.Unlock()
 			start := 0

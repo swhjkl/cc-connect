@@ -6,9 +6,7 @@ import (
 )
 
 // validatingAgent wraps a controllableAgent and adds an opt-in
-// SessionIDValidator so we can pin the engine's behavior for issue #599:
-// when the stored session ID is rejected by the agent, the engine must
-// start a fresh session instead of resuming the wrong one.
+// SessionIDValidator so we can pin the engine's behavior for issue #599.
 type validatingAgent struct {
 	controllableAgent
 	validateFunc func(ctx context.Context, sessionID string) bool
@@ -23,12 +21,11 @@ func (a *validatingAgent) ValidateSessionID(ctx context.Context, sessionID strin
 
 var _ SessionIDValidator = (*validatingAgent)(nil)
 
-// TestIssue599_InvalidSessionIDClearedBeforeResume pins the regression for
-// cross-project session leakage: when the agent rejects the stored
-// session ID, the engine must clear the ID and call StartSession with
-// "" (fresh start) rather than passing the bad ID through.
-func TestIssue599_InvalidSessionIDClearedBeforeResume(t *testing.T) {
-	var startedWith string
+// TestIssue599_InvalidSessionIDPreservedWithoutFreshStart pins both safety
+// requirements: never resume a cross-project ID, and never silently abandon
+// the selected conversation by starting a fresh thread.
+func TestIssue599_InvalidSessionIDPreservedWithoutFreshStart(t *testing.T) {
+	startCalls := 0
 	sess := newControllableSession("fresh-id")
 	agent := &validatingAgent{
 		controllableAgent: controllableAgent{nextSession: sess},
@@ -39,7 +36,7 @@ func TestIssue599_InvalidSessionIDClearedBeforeResume(t *testing.T) {
 		},
 	}
 	agent.startSessionFn = func(_ context.Context, sessionID string) (AgentSession, error) {
-		startedWith = sessionID
+		startCalls++
 		return sess, nil
 	}
 
@@ -50,10 +47,16 @@ func TestIssue599_InvalidSessionIDClearedBeforeResume(t *testing.T) {
 	// Simulate a stored cross-project session ID.
 	s := &Session{AgentSessionID: "leaked-id-from-other-project"}
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "")
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", s, e.sessions, nil, "")
 
-	if startedWith != "" {
-		t.Errorf("StartSession called with %q, want \"\" (fresh start; leaked id must NOT be passed through)", startedWith)
+	if startCalls != 0 {
+		t.Errorf("StartSession calls = %d, want 0 for rejected session ID", startCalls)
+	}
+	if state.agentSession != nil || state.startError == nil {
+		t.Fatalf("state = %#v, want visible startup failure without agent session", state)
+	}
+	if got := s.GetAgentSessionID(); got != "leaked-id-from-other-project" {
+		t.Errorf("AgentSessionID = %q, want rejected selection preserved", got)
 	}
 }
 

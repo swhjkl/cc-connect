@@ -234,12 +234,15 @@ type appServerSession struct {
 }
 
 const (
-	appServerTransportProcess      = "process"
-	appServerTransportDaemon       = "daemon"
-	appServerRequestTimeout        = 120 * time.Second
-	appServerInitializeTimeout     = 15 * time.Second
-	appServerUsageRefreshTimeout   = 1500 * time.Millisecond
-	appServerMaxMessageSize        = 10 * 1024 * 1024
+	appServerTransportProcess    = "process"
+	appServerTransportDaemon     = "daemon"
+	appServerRequestTimeout      = 120 * time.Second
+	appServerInitializeTimeout   = 15 * time.Second
+	appServerUsageRefreshTimeout = 1500 * time.Millisecond
+	// Keep App Server RPC reads bounded while allowing large persisted turns.
+	// Resume requests exclude historical turns, so this mainly protects the
+	// occasional large notification or paginated conversation response.
+	appServerMaxMessageSize        = 64 * 1024 * 1024
 	appServerNotificationBufferTTL = 5 * time.Second
 	appServerNotificationBufferMax = 64
 	appServerPermissionResolved    = "__cc_connect_external_resolved__"
@@ -483,7 +486,7 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 
 		params := s.threadRequestParams()
 		params["threadId"] = resumeID
-		params["persistExtendedHistory"] = true
+		params["excludeTurns"] = true
 
 		var resp threadResumeResponse
 		if err := s.request("thread/resume", params, &resp); err != nil {
@@ -1568,7 +1571,7 @@ func (s *appServerSession) readLoop(r io.Reader) {
 	defer s.wg.Done()
 	scanner := bufio.NewScanner(r)
 	scanBuf := make([]byte, 0, 64*1024)
-	const maxLineSize = 10 * 1024 * 1024
+	const maxLineSize = appServerMaxMessageSize
 	scanner.Buffer(scanBuf, maxLineSize)
 
 	for scanner.Scan() {

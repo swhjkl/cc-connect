@@ -1378,11 +1378,13 @@ func TestBuildPreviewCardJSON_VerifiedHealthMergesElapsedAndConfirmation(t *test
 		t.Fatalf("marshal progress payload: %v", err)
 	}
 	cardJSON := buildPreviewCardJSON(core.ProgressCardPayloadPrefix + string(raw))
-	if want := "已运行 10分47秒 · 任务状态已于 23:19:28 确认"; !strings.Contains(cardJSON, want) {
+	if want := "已运行 10分47秒 · 23:19:28"; !strings.Contains(cardJSON, want) {
 		t.Fatalf("verified progress card should contain %q: %s", want, cardJSON)
 	}
-	if strings.Contains(cardJSON, "卡片持续更新") {
-		t.Fatalf("verified progress card retained redundant heartbeat text: %s", cardJSON)
+	for _, redundant := range []string{"卡片持续更新", "任务状态", "确认"} {
+		if strings.Contains(cardJSON, redundant) {
+			t.Fatalf("verified progress card retained redundant text %q: %s", redundant, cardJSON)
+		}
 	}
 }
 

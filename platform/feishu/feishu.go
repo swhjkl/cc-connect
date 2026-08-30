@@ -4285,21 +4285,27 @@ func progressHealthMeta(payload *core.ProgressCardPayload, agent, defaultTitle, 
 		}
 		return defaultFooter + "\n" + health
 	}
+	withVerified := func(heartbeatSuffix, status string) string {
+		if elapsed := strings.TrimSuffix(defaultFooter, heartbeatSuffix); elapsed != defaultFooter {
+			return elapsed + " · " + status
+		}
+		return withElapsed(status)
+	}
 	switch payload.Health {
 	case core.ProgressCardHealthVerified:
 		if traditional {
-			return defaultTitle, defaultTemplate, withElapsed(fmt.Sprintf("任務狀態已於 %s 確認", verified))
+			return defaultTitle, defaultTemplate, withVerified(" · 卡片持續更新", fmt.Sprintf("任務狀態已於 %s 確認", verified))
 		}
 		if zh {
-			return defaultTitle, defaultTemplate, withElapsed(fmt.Sprintf("任务状态已于 %s 确认", verified))
+			return defaultTitle, defaultTemplate, withVerified(" · 卡片持续更新", fmt.Sprintf("任务状态已于 %s 确认", verified))
 		}
 		if language == "ja" {
-			return defaultTitle, defaultTemplate, withElapsed(fmt.Sprintf("タスク状態を %s に確認", verified))
+			return defaultTitle, defaultTemplate, withVerified(" · カードを更新中", fmt.Sprintf("タスク状態を %s に確認", verified))
 		}
 		if language == "es" {
-			return defaultTitle, defaultTemplate, withElapsed(fmt.Sprintf("Estado confirmado a las %s", verified))
+			return defaultTitle, defaultTemplate, withVerified(" · La tarjeta sigue actualizándose", fmt.Sprintf("Estado confirmado a las %s", verified))
 		}
-		return defaultTitle, defaultTemplate, withElapsed(fmt.Sprintf("Task status confirmed at %s", verified))
+		return defaultTitle, defaultTemplate, withVerified(" · Card is still updating", fmt.Sprintf("Task status confirmed at %s", verified))
 	case core.ProgressCardHealthReconnecting:
 		if traditional {
 			return fmt.Sprintf("%s · 重新連線中", agent), "orange", withElapsed(fmt.Sprintf("暫時無法確認任務狀態 · 最後確認 %s", verified))

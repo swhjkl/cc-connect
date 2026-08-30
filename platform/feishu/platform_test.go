@@ -1366,6 +1366,26 @@ func TestBuildPreviewCardJSON_ProgressHealthIsVisibleAndFailClosed(t *testing.T)
 	}
 }
 
+func TestBuildPreviewCardJSON_VerifiedHealthMergesElapsedAndConfirmation(t *testing.T) {
+	payload := core.ProgressCardPayload{
+		Version: 2, Agent: "Codex", Lang: string(core.LangChinese), State: core.ProgressCardStateRunning,
+		Items:  []core.ProgressCardEntry{{Kind: core.ProgressEntryThinking, Text: "检查中"}},
+		Health: core.ProgressCardHealthVerified, LastVerifiedAt: time.Date(2026, 8, 30, 23, 19, 28, 0, time.Local).Unix(),
+		ElapsedSeconds: 647,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal progress payload: %v", err)
+	}
+	cardJSON := buildPreviewCardJSON(core.ProgressCardPayloadPrefix + string(raw))
+	if want := "已运行 10分47秒 · 任务状态已于 23:19:28 确认"; !strings.Contains(cardJSON, want) {
+		t.Fatalf("verified progress card should contain %q: %s", want, cardJSON)
+	}
+	if strings.Contains(cardJSON, "卡片持续更新") {
+		t.Fatalf("verified progress card retained redundant heartbeat text: %s", cardJSON)
+	}
+}
+
 func TestBuildPreviewCardJSON_ProgressPayloadUsesToolDescriptors(t *testing.T) {
 	payload := core.BuildProgressCardPayloadV2([]core.ProgressCardEntry{
 		{Kind: core.ProgressEntryToolUse, Tool: "web_fetch", Text: "https://example.com/docs?token=secret"},

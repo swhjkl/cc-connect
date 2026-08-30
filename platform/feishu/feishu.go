@@ -4267,6 +4267,77 @@ func progressHeartbeatFooter(elapsedSeconds int64, lang string) string {
 	}
 }
 
+func progressHealthMeta(payload *core.ProgressCardPayload, agent, defaultTitle, defaultTemplate, defaultFooter string) (string, string, string) {
+	if payload == nil || payload.State != core.ProgressCardStateRunning || payload.Health == "" {
+		return defaultTitle, defaultTemplate, defaultFooter
+	}
+	language := strings.ToLower(strings.TrimSpace(payload.Lang))
+	verified := "—"
+	if payload.LastVerifiedAt > 0 {
+		verified = time.Unix(payload.LastVerifiedAt, 0).Local().Format("15:04:05")
+	}
+	zh := strings.HasPrefix(language, "zh")
+	traditional := language == "zh-tw" || language == "zh_hk" || language == "zh-hk"
+	switch payload.Health {
+	case core.ProgressCardHealthVerified:
+		if traditional {
+			return defaultTitle, defaultTemplate, fmt.Sprintf("任務狀態已於 %s 確認 · 卡片持續更新", verified)
+		}
+		if zh {
+			return defaultTitle, defaultTemplate, fmt.Sprintf("任务状态已于 %s 确认 · 卡片持续更新", verified)
+		}
+		if language == "ja" {
+			return defaultTitle, defaultTemplate, fmt.Sprintf("タスク状態を %s に確認 · カードを更新中", verified)
+		}
+		if language == "es" {
+			return defaultTitle, defaultTemplate, fmt.Sprintf("Estado confirmado a las %s · La tarjeta sigue actualizándose", verified)
+		}
+		return defaultTitle, defaultTemplate, fmt.Sprintf("Task status confirmed at %s · Card is still updating", verified)
+	case core.ProgressCardHealthReconnecting:
+		if traditional {
+			return fmt.Sprintf("%s · 重新連線中", agent), "orange", fmt.Sprintf("暫時無法確認任務狀態 · 最後確認 %s", verified)
+		}
+		if zh {
+			return fmt.Sprintf("%s · 重新连接中", agent), "orange", fmt.Sprintf("暂时无法确认任务状态 · 最后确认 %s", verified)
+		}
+		if language == "ja" {
+			return fmt.Sprintf("%s · 再接続中", agent), "orange", fmt.Sprintf("状態を一時的に確認できません · 最終確認 %s", verified)
+		}
+		if language == "es" {
+			return fmt.Sprintf("%s · Reconectando", agent), "orange", fmt.Sprintf("No se puede confirmar temporalmente · Última confirmación %s", verified)
+		}
+		return fmt.Sprintf("%s · Reconnecting", agent), "orange", fmt.Sprintf("Task status temporarily unavailable · Last confirmed %s", verified)
+	case core.ProgressCardHealthUnknown:
+		if traditional {
+			return fmt.Sprintf("%s · 狀態未知", agent), "grey", fmt.Sprintf("目前無法確認任務是否仍在執行 · 最後確認 %s", verified)
+		}
+		if zh {
+			return fmt.Sprintf("%s · 状态未知", agent), "grey", fmt.Sprintf("目前无法确认任务是否仍在运行 · 最后确认 %s", verified)
+		}
+		if language == "ja" {
+			return fmt.Sprintf("%s · 状態不明", agent), "grey", fmt.Sprintf("タスクの実行状態を確認できません · 最終確認 %s", verified)
+		}
+		if language == "es" {
+			return fmt.Sprintf("%s · Estado desconocido", agent), "grey", fmt.Sprintf("No se puede confirmar si la tarea sigue activa · Última confirmación %s", verified)
+		}
+		return fmt.Sprintf("%s · Status unknown", agent), "grey", fmt.Sprintf("Unable to confirm whether the task is still running · Last confirmed %s", verified)
+	default:
+		if traditional {
+			return defaultTitle, defaultTemplate, "正在確認任務狀態"
+		}
+		if zh {
+			return defaultTitle, defaultTemplate, "正在确认任务状态"
+		}
+		if language == "ja" {
+			return defaultTitle, defaultTemplate, "タスク状態を確認中"
+		}
+		if language == "es" {
+			return defaultTitle, defaultTemplate, "Comprobando el estado de la tarea"
+		}
+		return defaultTitle, defaultTemplate, "Checking task status"
+	}
+}
+
 func progressKindLabel(kind core.ProgressCardEntryKind, lang string) string {
 	zh := isZhLikeProgressLang(lang)
 	switch kind {
@@ -4660,6 +4731,7 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 	running := payload.State == core.ProgressCardStateRunning
 	if running {
 		footer = progressHeartbeatFooter(payload.ElapsedSeconds, payload.Lang)
+		title, template, footer = progressHealthMeta(payload, agent, title, template, footer)
 	}
 
 	elements := make([]map[string]any, 0, len(items)+3)
@@ -4668,7 +4740,8 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 	}
 
 	elements = appendProgressGroupedElements(elements, items, payload.Counts, payload.Lang, running)
-	if running && strings.TrimSpace(payload.Hint) != "" {
+	controlsVisible := running && payload.Health != core.ProgressCardHealthReconnecting && payload.Health != core.ProgressCardHealthUnknown
+	if controlsVisible && strings.TrimSpace(payload.Hint) != "" {
 		elements = append(elements, map[string]any{"tag": "hr"})
 		elements = append(elements, map[string]any{
 			"tag": "div",
@@ -4711,7 +4784,7 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 	}
 	b, _ := json.Marshal(card)
 	cardJSON := string(b)
-	if running && len(payload.Buttons) > 0 {
+	if controlsVisible && len(payload.Buttons) > 0 {
 		if withActions, err := appendRichCardActions(cardJSON, payload.Buttons); err == nil {
 			return withActions
 		}

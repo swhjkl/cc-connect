@@ -1894,6 +1894,53 @@ func TestConversationMirror_KnownExternalMarkerCannotConsumeForegroundReservatio
 	}
 }
 
+func TestConversationMirror_HealthFailureIsVisibleOnExistingCard(t *testing.T) {
+	p := newMirrorTestPlatform()
+	e := NewEngine("test", newMirrorTestAgent(nil), []Platform{p}, "", LangChinese)
+	binding, err := e.trackStore.bind("mirror:chat", "mirror:chat:admin", p.Name(), "thread-1")
+	if err != nil {
+		t.Fatalf("bind() error = %v", err)
+	}
+	delivery, _, err := e.trackStore.claimDelivery(binding, "turn-1", "primary", "external", "")
+	if err != nil {
+		t.Fatalf("claimDelivery() error = %v", err)
+	}
+	delivery, err = e.trackStore.setDeliveryHandle(delivery.Key, "card-1", "card-1")
+	if err != nil {
+		t.Fatalf("setDeliveryHandle() error = %v", err)
+	}
+	running := ConversationTurn{
+		ID: "turn-1", Status: ConversationTurnInProgress,
+		Messages: []ConversationMessage{{Role: "user", Content: "long task"}},
+	}
+	verifiedAt := time.Now().Add(-time.Minute)
+	snapshot := mirrorTestSnapshot("thread-1", running)
+	mirror := &conversationMirror{
+		destination: binding.Destination, sessionKey: binding.SessionKey, threadID: binding.ThreadID,
+		generation: binding.Generation, handles: map[string]any{delivery.Key: "card-1"},
+		health: ProgressCardHealthVerified, lastVerifiedAt: verifiedAt, lastSnapshot: snapshot,
+	}
+	e.markConversationMirrorUnverifiedLocked(e.ctx, mirror, binding, p)
+	p.trackMu.Lock()
+	updates := append([]string(nil), p.updates...)
+	p.trackMu.Unlock()
+	if len(updates) != 1 || !strings.Contains(updates[0], "正在重新连接任务状态") {
+		t.Fatalf("reconnecting external card updates = %#v", updates)
+	}
+	if strings.Contains(updates[0], e.i18n.T(MsgTrackInterruptButton)) {
+		t.Fatalf("unverified external card retained interrupt action: %q", updates[0])
+	}
+
+	mirror.firstFailureAt = time.Now().Add(-cardHealthUnknownAfter)
+	e.markConversationMirrorUnverifiedLocked(e.ctx, mirror, binding, p)
+	p.trackMu.Lock()
+	updates = append([]string(nil), p.updates...)
+	p.trackMu.Unlock()
+	if len(updates) != 2 || !strings.Contains(updates[1], "任务状态未知") {
+		t.Fatalf("unknown external card updates = %#v", updates)
+	}
+}
+
 func TestConversationMirror_TerminalCardFailureStillSendsResultOnce(t *testing.T) {
 	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
 	p := newMirrorTestPlatform()

@@ -1341,6 +1341,30 @@ func TestBuildPreviewCardJSON_ProgressUsesCumulativeCountAndHeartbeat(t *testing
 	}
 }
 
+func TestBuildPreviewCardJSON_ProgressHealthIsVisibleAndFailClosed(t *testing.T) {
+	payload := core.ProgressCardPayload{
+		Version: 2, Agent: "Codex", Lang: string(core.LangChinese), State: core.ProgressCardStateRunning,
+		Items:  []core.ProgressCardEntry{{Kind: core.ProgressEntryThinking, Text: "检查中"}},
+		Health: core.ProgressCardHealthUnknown, LastVerifiedAt: time.Date(2026, 8, 30, 12, 34, 56, 0, time.Local).Unix(),
+		Hint: "回复此卡片可追加指令", Buttons: []core.CardButton{{Text: "中止", Value: "turn:interrupt:token"}},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal progress payload: %v", err)
+	}
+	cardJSON := buildPreviewCardJSON(core.ProgressCardPayloadPrefix + string(raw))
+	for _, want := range []string{"Codex · 状态未知", "目前无法确认任务是否仍在运行", "12:34:56"} {
+		if !strings.Contains(cardJSON, want) {
+			t.Fatalf("unknown progress card should contain %q: %s", want, cardJSON)
+		}
+	}
+	for _, absent := range []string{"回复此卡片可追加指令", "turn:interrupt:token"} {
+		if strings.Contains(cardJSON, absent) {
+			t.Fatalf("unknown progress card retained %q: %s", absent, cardJSON)
+		}
+	}
+}
+
 func TestBuildPreviewCardJSON_ProgressPayloadUsesToolDescriptors(t *testing.T) {
 	payload := core.BuildProgressCardPayloadV2([]core.ProgressCardEntry{
 		{Kind: core.ProgressEntryToolUse, Tool: "web_fetch", Text: "https://example.com/docs?token=secret"},

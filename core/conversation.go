@@ -34,9 +34,13 @@ type conversationMirror struct {
 	wake        chan struct{}
 	platform    Platform
 
-	mu      sync.Mutex
-	handles map[string]any
-	pending *conversationElicitation
+	mu             sync.Mutex
+	handles        map[string]any
+	pending        *conversationElicitation
+	health         ProgressCardHealth
+	lastVerifiedAt time.Time
+	firstFailureAt time.Time
+	lastSnapshot   *ConversationSnapshot
 }
 
 type conversationElicitation struct {
@@ -837,11 +841,21 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 	}
 	cancel()
 	if err != nil {
+		e.markConversationMirrorUnverifiedLocked(ctx, mirror, binding, p)
 		return err
 	}
 	if snapshot == nil || snapshot.SessionID != mirror.threadID {
+		e.markConversationMirrorUnverifiedLocked(ctx, mirror, binding, p)
 		return fmt.Errorf("track: backend returned an unexpected conversation")
 	}
+	verifiedAt := snapshot.RetrievedAt
+	if verifiedAt.IsZero() {
+		verifiedAt = time.Now()
+	}
+	mirror.health = ProgressCardHealthVerified
+	mirror.lastVerifiedAt = verifiedAt
+	mirror.firstFailureAt = time.Time{}
+	mirror.lastSnapshot = snapshot
 	if pending := mirror.pending; pending != nil && !pending.resolved {
 		for _, turn := range snapshot.Turns {
 			if turn.ID == pending.turnID && conversationTurnTerminal(turn.Status) {
@@ -915,6 +929,34 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 		}
 	}
 	return e.deliverConversationCandidates(ctx, mirror, binding, snapshot, candidates, sessions, p)
+}
+
+func (e *Engine) markConversationMirrorUnverifiedLocked(ctx context.Context, mirror *conversationMirror, binding *trackBindingState, p Platform) {
+	if mirror == nil || binding == nil {
+		return
+	}
+	now := time.Now()
+	if mirror.firstFailureAt.IsZero() {
+		mirror.firstFailureAt = now
+	}
+	health := ProgressCardHealthReconnecting
+	if now.Sub(mirror.firstFailureAt) >= cardHealthUnknownAfter {
+		health = ProgressCardHealthUnknown
+	}
+	if mirror.health == health || mirror.lastSnapshot == nil {
+		mirror.health = health
+		return
+	}
+	mirror.health = health
+	for _, turn := range mirror.lastSnapshot.Turns {
+		delivery := e.trackStore.delivery(binding.Destination, binding.ThreadID, turn.ID, "primary")
+		if delivery == nil || delivery.Source != "external" || delivery.Terminal {
+			continue
+		}
+		if err := e.updateExternalConversationCard(ctx, mirror, binding, mirror.lastSnapshot, turn, delivery, p); err != nil {
+			slog.Warn("track: render mirror health failed", "turn_id", turn.ID, "error", err)
+		}
+	}
 }
 
 func containsConversationTurn(turns []ConversationTurn, turnID string) bool {
@@ -1033,7 +1075,7 @@ func (e *Engine) updateExternalConversationCard(ctx context.Context, mirror *con
 	separateResult := terminal && e.shouldNotifyTrackTerminal(turn.Status)
 	includeResponse := terminal && !separateResult
 	markdown := e.renderTrackMarkdownWithResponse(snapshot, turn, includeResponse)
-	payload := e.renderTrackPayloadWithResponse(p, snapshot, turn, markdown, binding.SessionKey, includeResponse)
+	payload := e.renderTrackPayloadWithHealth(p, snapshot, turn, markdown, binding.SessionKey, includeResponse, mirror.health, mirror.lastVerifiedAt)
 	renderHash := trackRenderHash(payload)
 	cardFailed := strings.HasPrefix(delivery.LastError, "terminal_card_")
 
@@ -1707,6 +1749,24 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackNoTurns))
 		return
 	}
+	destination, _ := mirrorDestinationKey(p, msg.SessionKey)
+	if card := e.turnCards.byTurn(p.Name(), msg.SessionKey, destination, sessionID, turn.ID); card != nil {
+		monitor := e.nativeTurnCardMonitor(card.Token)
+		if monitor == nil {
+			if card.Terminal && strings.EqualFold(card.Status, string(turn.Status)) {
+				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackNativeCardExists, e.trackStatusLabel(string(turn.Status))))
+				return
+			}
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackNativeCardMonitorInactive))
+			return
+		}
+		if _, _, syncErr := e.checkNativeTurnCardMonitor(e.ctx, monitor, snapshot); syncErr != nil {
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackReadFailed, syncErr))
+			return
+		}
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackNativeCardSynced, e.trackStatusLabel(string(turn.Status))))
+		return
+	}
 	if destination, destinationErr := mirrorDestinationKey(p, msg.SessionKey); destinationErr == nil {
 		if delivery := e.trackStore.delivery(destination, sessionID, turn.ID, "primary"); delivery != nil && delivery.Source == "external" && delivery.CardHandle != "" {
 			binding := e.trackStore.binding(destination)
@@ -2217,6 +2277,10 @@ func (e *Engine) renderTrackPayload(p Platform, snapshot *ConversationSnapshot, 
 }
 
 func (e *Engine) renderTrackPayloadWithResponse(p Platform, snapshot *ConversationSnapshot, turn ConversationTurn, markdown, sessionKey string, includeResponse bool) string {
+	return e.renderTrackPayloadWithHealth(p, snapshot, turn, markdown, sessionKey, includeResponse, "", time.Time{})
+}
+
+func (e *Engine) renderTrackPayloadWithHealth(p Platform, snapshot *ConversationSnapshot, turn ConversationTurn, markdown, sessionKey string, includeResponse bool, health ProgressCardHealth, lastVerifiedAt time.Time) string {
 	_, ok := p.(RichCardSupporter)
 	_, hasOptions := p.(RichCardOptionsSupporter)
 	if !ok && !hasOptions {
@@ -2234,10 +2298,24 @@ func (e *Engine) renderTrackPayloadWithResponse(p Platform, snapshot *Conversati
 	if !includeResponse && (conversationTurnTerminal(turn.Status) || turn.Status == ConversationTurnUnknown) {
 		footer += "\n" + e.i18n.T(MsgTrackMirrorResultFollows)
 	}
+	if !conversationTurnTerminal(turn.Status) && turn.Status != ConversationTurnUnknown && health != "" {
+		verified := "—"
+		if !lastVerifiedAt.IsZero() {
+			verified = lastVerifiedAt.Local().Format("15:04:05")
+		}
+		switch health {
+		case ProgressCardHealthVerified:
+			footer += "\n" + e.i18n.Tf(MsgTrackHealthVerified, verified)
+		case ProgressCardHealthReconnecting:
+			footer += "\n" + e.i18n.Tf(MsgTrackHealthReconnecting, verified)
+		case ProgressCardHealthUnknown:
+			footer += "\n" + e.i18n.Tf(MsgTrackHealthUnknown, verified)
+		}
+	}
 	status := trackCardStatus(turn.Status)
 	streaming := !conversationTurnTerminal(turn.Status) && turn.Status != ConversationTurnUnknown
 	var buttons []CardButton
-	if streaming {
+	if streaming && health != ProgressCardHealthReconnecting && health != ProgressCardHealthUnknown {
 		action := "cmd:/track stop " + snapshot.SessionID + " " + turn.ID
 		if destination, err := mirrorDestinationKey(p, sessionKey); err == nil {
 			if delivery := e.trackStore.delivery(destination, snapshot.SessionID, turn.ID, "primary"); delivery != nil && delivery.Source == "external" {

@@ -9,7 +9,21 @@ import (
 func testTurnCardState(token string) turnCardState {
 	return turnCardState{
 		Token: token, Platform: "feishu", SessionKey: "feishu:chat:user", InteractiveKey: "workspace:feishu:chat:user",
-		ThreadID: "thread-1", TurnID: "turn-1", Generation: 1, CardMessageID: "om-card-1",
+		Destination: "feishu:chat", ThreadID: "thread-1", TurnID: "turn-1", Generation: 1, CardMessageID: "om-card-1",
+	}
+}
+
+func TestTurnCardStore_ByTurnMatchesStableDestination(t *testing.T) {
+	store := newTurnCardStore("")
+	card := testTurnCardState("token-destination")
+	if err := store.register(card); err != nil {
+		t.Fatalf("register() error = %v", err)
+	}
+	if got := store.byTurn("feishu", "feishu:chat:other-user", "feishu:chat", "thread-1", "turn-1"); got == nil || got.Token != card.Token {
+		t.Fatalf("same-destination lookup = %#v", got)
+	}
+	if got := store.byTurn("feishu", "feishu:other:other-user", "feishu:other", "thread-1", "turn-1"); got != nil {
+		t.Fatalf("cross-destination lookup = %#v", got)
 	}
 }
 

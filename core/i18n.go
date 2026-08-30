@@ -741,6 +741,12 @@ const (
 	MsgTrackStatusReport                  MsgKey = "track_status_report"
 	MsgTrackPersistFailed                 MsgKey = "track_persist_failed"
 	MsgTrackRefreshed                     MsgKey = "track_refreshed"
+	MsgTrackNativeCardSynced              MsgKey = "track_native_card_synced"
+	MsgTrackNativeCardExists              MsgKey = "track_native_card_exists"
+	MsgTrackNativeCardMonitorInactive     MsgKey = "track_native_card_monitor_inactive"
+	MsgTrackHealthVerified                MsgKey = "track_health_verified"
+	MsgTrackHealthReconnecting            MsgKey = "track_health_reconnecting"
+	MsgTrackHealthUnknown                 MsgKey = "track_health_unknown"
 	MsgTrackMirrorCompletedNotification   MsgKey = "track_mirror_completed_notification"
 	MsgTrackMirrorFailedNotification      MsgKey = "track_mirror_failed_notification"
 	MsgTrackMirrorInterruptedNotification MsgKey = "track_mirror_interrupted_notification"
@@ -1817,6 +1823,48 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "✅ 已重新整理現有任務卡片。",
 		LangJapanese:           "✅ 既存のターンカードを更新しました。",
 		LangSpanish:            "✅ Se actualizó la tarjeta existente.",
+	},
+	MsgTrackNativeCardSynced: {
+		LangEnglish:            "✅ Existing native task card synchronized. Current status: %s.",
+		LangChinese:            "✅ 已同步现有原生任务卡片，当前状态：%s。",
+		LangTraditionalChinese: "✅ 已同步現有原生任務卡片，目前狀態：%s。",
+		LangJapanese:           "✅ 既存のネイティブタスクカードを同期しました。現在の状態: %s。",
+		LangSpanish:            "✅ Se sincronizó la tarjeta de tarea nativa. Estado actual: %s.",
+	},
+	MsgTrackNativeCardExists: {
+		LangEnglish:            "ℹ️ An existing native task card already reflects the current status: %s. No duplicate card was created.",
+		LangChinese:            "ℹ️ 现有原生任务卡片已是当前状态：%s；未创建重复卡片。",
+		LangTraditionalChinese: "ℹ️ 現有原生任務卡片已是目前狀態：%s；未建立重複卡片。",
+		LangJapanese:           "ℹ️ 既存のネイティブタスクカードは現在の状態（%s）を反映済みです。重複カードは作成しませんでした。",
+		LangSpanish:            "ℹ️ La tarjeta de tarea nativa existente ya refleja el estado actual: %s. No se creó una tarjeta duplicada.",
+	},
+	MsgTrackNativeCardMonitorInactive: {
+		LangEnglish:            "⚠️ An existing native task card was found, but its in-process status monitor is no longer active. No duplicate card was created.",
+		LangChinese:            "⚠️ 已找到现有原生任务卡片，但其进程内状态监测已停止；未创建重复卡片。",
+		LangTraditionalChinese: "⚠️ 已找到現有原生任務卡片，但其程序內狀態監測已停止；未建立重複卡片。",
+		LangJapanese:           "⚠️ 既存のネイティブタスクカードは見つかりましたが、プロセス内状態モニターは停止しています。重複カードは作成しませんでした。",
+		LangSpanish:            "⚠️ Se encontró una tarjeta de tarea nativa, pero su monitor de estado en proceso ya no está activo. No se creó una tarjeta duplicada.",
+	},
+	MsgTrackHealthVerified: {
+		LangEnglish:            "Task status confirmed at %s",
+		LangChinese:            "任务状态已于 %s 确认",
+		LangTraditionalChinese: "任務狀態已於 %s 確認",
+		LangJapanese:           "タスク状態を %s に確認",
+		LangSpanish:            "Estado de la tarea confirmado a las %s",
+	},
+	MsgTrackHealthReconnecting: {
+		LangEnglish:            "Reconnecting to task status · Last confirmed %s",
+		LangChinese:            "正在重新连接任务状态 · 最后确认 %s",
+		LangTraditionalChinese: "正在重新連線任務狀態 · 最後確認 %s",
+		LangJapanese:           "タスク状態に再接続中 · 最終確認 %s",
+		LangSpanish:            "Reconectando al estado de la tarea · Última confirmación %s",
+	},
+	MsgTrackHealthUnknown: {
+		LangEnglish:            "Task status unknown · Last confirmed %s",
+		LangChinese:            "任务状态未知 · 最后确认 %s",
+		LangTraditionalChinese: "任務狀態未知 · 最後確認 %s",
+		LangJapanese:           "タスク状態不明 · 最終確認 %s",
+		LangSpanish:            "Estado de la tarea desconocido · Última confirmación %s",
 	},
 	MsgTrackMirrorCompletedNotification: {
 		LangEnglish:            "✅ The shared Codex task finished.",

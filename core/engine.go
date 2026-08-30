@@ -479,7 +479,9 @@ type Engine struct {
 	trackCfg            TrackCfg
 	trackStore          *trackStateStore
 	turnCards           *turnCardStore
-	conversationMirrors map[string]*conversationMirror // key = stable proactive destination
+	turnCardMonitorMu   sync.Mutex
+	turnCardMonitors    map[string]*nativeTurnCardMonitor // key = native card action token
+	conversationMirrors map[string]*conversationMirror    // key = stable proactive destination
 	trackClientSeq      atomic.Uint64
 
 	platformLifecycleMu sync.Mutex
@@ -788,6 +790,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		trackCfg:              DefaultTrackCfg(),
 		trackStore:            newTrackStateStore(trackStatePath(sessionStorePath)),
 		turnCards:             newTurnCardStore(turnCardStatePath(sessionStorePath)),
+		turnCardMonitors:      make(map[string]*nativeTurnCardMonitor),
 		conversationMirrors:   make(map[string]*conversationMirror),
 		sendWorkDirs:          make(map[string]string),
 		platformReady:         make(map[Platform]bool),

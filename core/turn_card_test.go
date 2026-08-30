@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -161,6 +162,146 @@ func (f *activeNativeTurnCardFixture) finish(t *testing.T, status string) {
 		t.Fatal("native turn event loop did not finish")
 	}
 	f.session.Unlock()
+}
+
+func latestNativeTurnPayload(t *testing.T, p *nativeTurnCardPlatform) *ProgressCardPayload {
+	t.Helper()
+	edits := p.getPreviewEdits()
+	if len(edits) == 0 {
+		t.Fatal("native card has no updates")
+	}
+	payload, ok := ParseProgressCardPayload(edits[len(edits)-1])
+	if !ok {
+		t.Fatalf("latest native card payload did not parse: %q", edits[len(edits)-1])
+	}
+	return payload
+}
+
+func TestNativeTurnCard_HealthMonitorAndTrackReuseExistingCard(t *testing.T) {
+	f := startActiveNativeTurnCard(t)
+	f.e.SetAdminFrom("admin")
+	waitTurnCardTest(t, "verified native card health", func() bool {
+		payload := latestNativeTurnPayload(t, f.p)
+		return payload.Health == ProgressCardHealthVerified && payload.LastVerifiedAt > 0
+	})
+	startsBefore := len(f.p.getPreviewStarts())
+	readsBefore := f.agent.readCount()
+	f.e.handleCommand(f.p, &Message{
+		SessionKey: f.key, Platform: f.p.Name(), MessageID: "track-native",
+		UserID: "admin", Content: "/track", ReplyCtx: "track-ctx",
+	}, "/track")
+	if startsAfter := len(f.p.getPreviewStarts()); startsAfter != startsBefore {
+		t.Fatalf("/track created a duplicate native card: before=%d after=%d", startsBefore, startsAfter)
+	}
+	if f.agent.readCount() <= readsBefore {
+		t.Fatal("/track did not perform an authoritative status check")
+	}
+	if got := strings.Join(f.p.getSent(), "\n"); !strings.Contains(got, "已同步现有原生任务卡片") {
+		t.Fatalf("/track native-card reply = %q", got)
+	}
+	f.finish(t, "completed")
+}
+
+func TestNativeTurnCard_HealthMonitorShowsFailureAndRecovery(t *testing.T) {
+	f := startActiveNativeTurnCard(t)
+	token := strings.TrimPrefix(f.action, turnCardInterruptActionPrefix)
+	monitor := f.e.nativeTurnCardMonitor(token)
+	if monitor == nil {
+		t.Fatal("native turn monitor not registered")
+	}
+
+	f.agent.mu.Lock()
+	f.agent.readErr = errors.New("injected authoritative read failure")
+	f.agent.mu.Unlock()
+	health, _, err := f.e.checkNativeTurnCardMonitor(f.e.ctx, monitor, nil)
+	if err == nil || health != ProgressCardHealthReconnecting {
+		t.Fatalf("first failed check = health %q error %v", health, err)
+	}
+	payload := latestNativeTurnPayload(t, f.p)
+	if payload.Health != ProgressCardHealthReconnecting || len(payload.Buttons) == 0 {
+		t.Fatalf("reconnecting payload = health %q buttons %#v", payload.Health, payload.Buttons)
+	}
+
+	monitor.checkMu.Lock()
+	monitor.failedAt = time.Now().Add(-cardHealthUnknownAfter)
+	monitor.checkMu.Unlock()
+	health, _, err = f.e.checkNativeTurnCardMonitor(f.e.ctx, monitor, nil)
+	if err == nil || health != ProgressCardHealthUnknown {
+		t.Fatalf("expired failed check = health %q error %v", health, err)
+	}
+	payload = latestNativeTurnPayload(t, f.p)
+	if payload.Health != ProgressCardHealthUnknown {
+		t.Fatalf("unknown payload health = %q", payload.Health)
+	}
+
+	f.agent.mu.Lock()
+	f.agent.readErr = nil
+	f.agent.mu.Unlock()
+	health, status, err := f.e.checkNativeTurnCardMonitor(f.e.ctx, monitor, nil)
+	if err != nil || health != ProgressCardHealthVerified || status != ConversationTurnInProgress {
+		t.Fatalf("recovered check = health %q status %q error %v", health, status, err)
+	}
+	payload = latestNativeTurnPayload(t, f.p)
+	if payload.Health != ProgressCardHealthVerified || len(payload.Buttons) != 1 {
+		t.Fatalf("recovered payload = health %q buttons %#v", payload.Health, payload.Buttons)
+	}
+	f.finish(t, "completed")
+}
+
+func TestNativeTurnCard_HealthMonitorSynchronizesTerminalState(t *testing.T) {
+	f := startActiveNativeTurnCard(t)
+	token := strings.TrimPrefix(f.action, turnCardInterruptActionPrefix)
+	monitor := f.e.nativeTurnCardMonitor(token)
+	if monitor == nil {
+		t.Fatal("native turn monitor not registered")
+	}
+
+	f.agent.setSnapshot(&ConversationSnapshot{
+		SessionID: "thread-1",
+		Turns:     []ConversationTurn{{ID: "turn-1", Status: ConversationTurnCompleted}},
+	})
+	health, status, err := f.e.checkNativeTurnCardMonitor(f.e.ctx, monitor, nil)
+	if err != nil || health != ProgressCardHealthVerified || status != ConversationTurnCompleted {
+		t.Fatalf("terminal check = health %q status %q error %v", health, status, err)
+	}
+	payload := latestNativeTurnPayload(t, f.p)
+	if payload.State != ProgressCardStateCompleted {
+		t.Fatalf("terminal payload state = %q", payload.State)
+	}
+	stored := f.e.turnCards.byToken(token)
+	if stored == nil || !stored.Terminal || stored.Status != string(ConversationTurnCompleted) {
+		t.Fatalf("terminal stored identity = %#v", stored)
+	}
+	if got := f.e.nativeTurnCardMonitor(token); got != nil {
+		t.Fatalf("terminal monitor still registered: %#v", got)
+	}
+
+	// Let the foreground event loop unwind as it normally would; the terminal
+	// update is idempotent when the delayed result event finally arrives.
+	f.finish(t, "completed")
+}
+
+func TestNativeTurnCard_TrackDoesNotClaimStaleCardWasSynchronized(t *testing.T) {
+	f := startActiveNativeTurnCard(t)
+	f.e.SetAdminFrom("admin")
+	token := strings.TrimPrefix(f.action, turnCardInterruptActionPrefix)
+	f.e.stopNativeTurnCardMonitor(token)
+	if err := f.e.turnCards.markTerminal(token, "stale"); err != nil {
+		t.Fatalf("markTerminal(stale) error = %v", err)
+	}
+	startsBefore := len(f.p.getPreviewStarts())
+	f.e.ReceiveMessage(f.p, &Message{
+		SessionKey: f.key, Platform: f.p.Name(), MessageID: "track-stale-native",
+		UserID: "admin", Content: "/track", ReplyCtx: "track-ctx",
+	})
+	if startsAfter := len(f.p.getPreviewStarts()); startsAfter != startsBefore {
+		t.Fatalf("/track created a duplicate stale native card: before=%d after=%d", startsBefore, startsAfter)
+	}
+	got := strings.Join(f.p.getSent(), "\n")
+	if !strings.Contains(got, "状态监测已停止") || strings.Contains(got, "已同步") {
+		t.Fatalf("stale native /track reply = %q", got)
+	}
+	f.finish(t, "completed")
 }
 
 func TestNativeTurnCard_ReplySteersAndInterruptIsSilentAndExact(t *testing.T) {

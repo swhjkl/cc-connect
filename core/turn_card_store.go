@@ -27,6 +27,7 @@ type turnCardState struct {
 	Token              string    `json:"token"`
 	Platform           string    `json:"platform"`
 	SessionKey         string    `json:"session_key"`
+	Destination        string    `json:"destination,omitempty"`
 	InteractiveKey     string    `json:"interactive_key"`
 	ThreadID           string    `json:"thread_id"`
 	TurnID             string    `json:"turn_id"`
@@ -260,6 +261,33 @@ func (s *turnCardStore) byMessage(platform, sessionKey, messageID string) *turnC
 	for _, card := range s.state.Cards {
 		if card == nil || !strings.EqualFold(card.Platform, platform) ||
 			(sessionKey != "" && card.SessionKey != sessionKey) || card.CardMessageID != messageID {
+			continue
+		}
+		if matched == nil || card.UpdatedAt.After(matched.UpdatedAt) {
+			matched = card
+		}
+	}
+	return cloneTurnCardState(matched)
+}
+
+func (s *turnCardStore) byTurn(platform, sessionKey, destination, threadID, turnID string) *turnCardState {
+	platform = strings.TrimSpace(platform)
+	sessionKey = strings.TrimSpace(sessionKey)
+	destination = strings.TrimSpace(destination)
+	threadID = strings.TrimSpace(threadID)
+	turnID = strings.TrimSpace(turnID)
+	if platform == "" || threadID == "" || turnID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var matched *turnCardState
+	for _, card := range s.state.Cards {
+		if card == nil || !strings.EqualFold(card.Platform, platform) || card.ThreadID != threadID || card.TurnID != turnID {
+			continue
+		}
+		sameDestination := destination != "" && card.Destination != "" && card.Destination == destination
+		if card.SessionKey != sessionKey && !sameDestination {
 			continue
 		}
 		if matched == nil || card.UpdatedAt.After(matched.UpdatedAt) {

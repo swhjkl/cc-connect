@@ -40,6 +40,18 @@ const (
 	ProgressCardStateInterrupted ProgressCardState = "interrupted"
 )
 
+// ProgressCardHealth describes whether a running card's authoritative turn
+// state can currently be verified. It is intentionally independent from
+// ProgressCardState: a turn may still be running while its observer reconnects.
+type ProgressCardHealth string
+
+const (
+	ProgressCardHealthChecking     ProgressCardHealth = "checking"
+	ProgressCardHealthVerified     ProgressCardHealth = "verified"
+	ProgressCardHealthReconnecting ProgressCardHealth = "reconnecting"
+	ProgressCardHealthUnknown      ProgressCardHealth = "unknown"
+)
+
 type ProgressCardEntryKind string
 
 const (
@@ -115,6 +127,8 @@ type ProgressCardPayload struct {
 	Items          []ProgressCardEntry `json:"items,omitempty"`   // ordered typed events
 	Counts         ProgressCardCounts  `json:"counts,omitempty"`
 	ElapsedSeconds int64               `json:"elapsed_seconds,omitempty"`
+	Health         ProgressCardHealth  `json:"health,omitempty"`
+	LastVerifiedAt int64               `json:"last_verified_at,omitempty"`
 	Truncated      bool                `json:"truncated"`
 	Hint           string              `json:"hint,omitempty"`
 	Buttons        []CardButton        `json:"buttons,omitempty"`
@@ -158,11 +172,11 @@ func BuildProgressCardPayloadWithControls(items []ProgressCardEntry, truncated b
 func buildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState, hint string, buttons []CardButton) string {
 	return buildProgressCardPayloadV2WithMeta(
 		items, truncated, agent, lang, state, hint, buttons,
-		progressCardCountsFromItems(items), 0,
+		progressCardCountsFromItems(items), 0, "", 0,
 	)
 }
 
-func buildProgressCardPayloadV2WithMeta(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState, hint string, buttons []CardButton, counts ProgressCardCounts, elapsedSeconds int64) string {
+func buildProgressCardPayloadV2WithMeta(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState, hint string, buttons []CardButton, counts ProgressCardCounts, elapsedSeconds int64, health ProgressCardHealth, lastVerifiedAt int64) string {
 	cleaned := make([]ProgressCardEntry, 0, len(items))
 	for _, item := range items {
 		text := strings.TrimSpace(item.Text)
@@ -196,6 +210,8 @@ func buildProgressCardPayloadV2WithMeta(items []ProgressCardEntry, truncated boo
 		Items:          cleaned,
 		Counts:         counts.withVisibleMinimum(cleaned),
 		ElapsedSeconds: max(elapsedSeconds, 0),
+		Health:         health,
+		LastVerifiedAt: max(lastVerifiedAt, 0),
 		Truncated:      truncated,
 		Hint:           strings.TrimSpace(hint),
 		Buttons:        cloneProgressCardButtons(buttons),
@@ -255,6 +271,14 @@ func ParseProgressCardPayload(content string) (*ProgressCardPayload, bool) {
 	payload.Counts = payload.Counts.withVisibleMinimum(items)
 	if payload.ElapsedSeconds < 0 {
 		payload.ElapsedSeconds = 0
+	}
+	switch payload.Health {
+	case "", ProgressCardHealthChecking, ProgressCardHealthVerified, ProgressCardHealthReconnecting, ProgressCardHealthUnknown:
+	default:
+		payload.Health = ProgressCardHealthUnknown
+	}
+	if payload.LastVerifiedAt < 0 {
+		payload.LastVerifiedAt = 0
 	}
 	payload.Entries = legacy
 	payload.Hint = strings.TrimSpace(payload.Hint)
@@ -350,6 +374,9 @@ type compactProgressWriter struct {
 	flushTimer        *time.Timer
 	heartbeatInterval time.Duration
 	heartbeatTimer    *time.Timer
+	health            ProgressCardHealth
+	lastVerifiedAt    time.Time
+	healthMonitoring  bool
 	retryTimer        *time.Timer
 	nextRetryDelay    time.Duration
 }
@@ -425,6 +452,7 @@ func newCompactProgressWriter(ctx context.Context, p Platform, replyCtx any, age
 		lang:           lang,
 		maxEntries:     10,
 		startedAt:      time.Now(),
+		health:         ProgressCardHealthChecking,
 		nextRetryDelay: progressRetryInitialDelay,
 	}
 	if throttler, ok := p.(ProgressUpdateThrottler); ok {
@@ -617,6 +645,41 @@ func (w *compactProgressWriter) SetControls(hint string, buttons []CardButton) b
 	return handled
 }
 
+// EnableHealthMonitoring lets an authoritative turn monitor keep updating a
+// running card after the foreground event stream has disconnected.
+func (w *compactProgressWriter) EnableHealthMonitoring() {
+	w.mu.Lock()
+	w.healthMonitoring = true
+	w.mu.Unlock()
+}
+
+func (w *compactProgressWriter) DisableHealthMonitoring() {
+	w.mu.Lock()
+	w.healthMonitoring = false
+	w.mu.Unlock()
+}
+
+// SetHealth updates only the observable liveness metadata of a running card.
+func (w *compactProgressWriter) SetHealth(health ProgressCardHealth, lastVerifiedAt time.Time) bool {
+	w.mu.Lock()
+	if !w.enabled || w.failed || w.style != progressStyleCard || !w.usePayload || w.state != ProgressCardStateRunning || w.handle == nil {
+		w.mu.Unlock()
+		return false
+	}
+	w.health = health
+	w.lastVerifiedAt = lastVerifiedAt
+	if !w.rebuildCardContentLocked() {
+		w.mu.Unlock()
+		return false
+	}
+	handled, observer, handle := w.flushLocked(true)
+	w.mu.Unlock()
+	if observer != nil {
+		observer(handle)
+	}
+	return handled
+}
+
 // Finalize updates card progress state (running/completed/failed) without
 // appending a new progress entry.
 func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
@@ -652,6 +715,11 @@ func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
 // Close stops background refreshes without changing the card's visible state.
 func (w *compactProgressWriter) Close() {
 	w.mu.Lock()
+	if w.healthMonitoring && w.state == ProgressCardStateRunning {
+		w.stopTimersLocked()
+		w.mu.Unlock()
+		return
+	}
 	w.stopped = true
 	w.stopTimersLocked()
 	w.closed = true
@@ -666,7 +734,7 @@ func (w *compactProgressWriter) rebuildCardContentLocked() bool {
 		elapsedSeconds := int64(time.Since(w.startedAt) / time.Second)
 		w.content = buildProgressCardPayloadV2WithMeta(
 			w.items, w.truncated, w.agentName, w.lang, w.state, w.hint, w.buttons,
-			w.counts, elapsedSeconds,
+			w.counts, elapsedSeconds, w.health, w.lastVerifiedAt.Unix(),
 		)
 	} else {
 		w.content = renderCardProgressMarkdownFallback(w.entries, w.truncated)

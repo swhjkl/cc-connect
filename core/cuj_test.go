@@ -1853,6 +1853,7 @@ func TestCUJ_I8_NativeTurnCardExactControlLifecycle(t *testing.T) {
 	p := newNativeTurnCardPlatform()
 	p.cardMessageID = "om-cuj-native-card"
 	e := NewEngine("test", agent, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	e.SetAdminFrom("member")
 	defer e.Stop()
 	key := "feishu:group:member"
 
@@ -1891,8 +1892,24 @@ func TestCUJ_I8_NativeTurnCardExactControlLifecycle(t *testing.T) {
 		t.Fatalf("native interrupt action = %q", action)
 	}
 
-	// Action 2: reply to the card. User-visible acknowledgement and backend
+	// Action 2: /track synchronizes the authoritative state into the existing
+	// native card instead of creating a second progress card.
+	startsBeforeTrack := len(p.getPreviewStarts())
+	p.clearSent()
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i8-track", UserID: "member",
+		Content: "/track", ReplyCtx: "track-ctx",
+	})
+	if startsAfterTrack := len(p.getPreviewStarts()); startsAfterTrack != startsBeforeTrack {
+		t.Fatalf("/track created a duplicate native card: before=%d after=%d", startsBeforeTrack, startsAfterTrack)
+	}
+	if got := strings.Join(p.getSent(), "\n"); !strings.Contains(got, "Existing native task card synchronized") {
+		t.Fatalf("native /track reply = %q", got)
+	}
+
+	// Action 3: reply to the card. User-visible acknowledgement and backend
 	// evidence both confirm exact-turn steer rather than next-turn queueing.
+	p.clearSent()
 	e.ReceiveMessage(p, &Message{
 		SessionKey: key, Platform: p.Name(), MessageID: "i8-steer", ReferencedMessageID: p.cardMessageID,
 		UserID: "member", Content: "also run the focused tests", ReplyCtx: "steer-ctx",
@@ -1907,7 +1924,7 @@ func TestCUJ_I8_NativeTurnCardExactControlLifecycle(t *testing.T) {
 		t.Fatalf("native steer acknowledgement = %q", got)
 	}
 
-	// Action 3: click stop. Successful acceptance is intentionally silent;
+	// Action 4: click stop. Successful acceptance is intentionally silent;
 	// only Codex's terminal event changes the original process card.
 	p.clearSent()
 	e.ReceiveMessage(p, &Message{
@@ -1924,7 +1941,7 @@ func TestCUJ_I8_NativeTurnCardExactControlLifecycle(t *testing.T) {
 		t.Fatalf("successful native interrupt sent a standalone message: %#v", sent)
 	}
 
-	// Action 4: Codex confirms interruption. The process card keeps its
+	// Action 5: Codex confirms interruption. The process card keeps its
 	// progress, turns orange, and drops both its hint and action button.
 	terminal := running
 	terminal.Status = ConversationTurnInterrupted
@@ -1942,7 +1959,7 @@ func TestCUJ_I8_NativeTurnCardExactControlLifecycle(t *testing.T) {
 		t.Fatalf("native terminal card = %#v", last)
 	}
 
-	// Action 5: replying to the old card cannot start or queue a new turn.
+	// Action 6: replying to the old card cannot start or queue a new turn.
 	p.clearSent()
 	e.ReceiveMessage(p, &Message{
 		SessionKey: key, Platform: p.Name(), MessageID: "i8-late", ReferencedMessageID: p.cardMessageID,

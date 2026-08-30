@@ -5,16 +5,35 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 )
 
 const turnCardInterruptActionPrefix = "turn:interrupt:"
 
+const (
+	nativeTurnCardHealthInterval = 15 * time.Second
+	cardHealthUnknownAfter       = time.Minute
+)
+
 type activeTurnCard struct {
 	identity     turnCardState
+	provider     ConversationProvider
 	canInterrupt bool
 	canSteer     bool
 	registered   bool
+}
+
+type nativeTurnCardMonitor struct {
+	token    string
+	threadID string
+	turnID   string
+	provider ConversationProvider
+	writer   *compactProgressWriter
+	cancel   context.CancelFunc
+	checkMu  sync.Mutex
+	lastOK   time.Time
+	failedAt time.Time
 }
 
 func (e *Engine) beginActiveTurnCard(state *interactiveState, p Platform, sessionKey, interactiveKey, threadID, turnID string, agent Agent) *activeTurnCard {
@@ -59,7 +78,7 @@ func (e *Engine) beginActiveTurnCard(state *interactiveState, p Platform, sessio
 		slog.Warn("turn card: controls disabled because token generation failed", "platform", p.Name(), "error", err)
 		return nil
 	}
-	return &activeTurnCard{
+	card := &activeTurnCard{
 		identity: turnCardState{
 			Token: token, Platform: p.Name(), SessionKey: sessionKey, InteractiveKey: interactiveKey,
 			ThreadID: threadID, TurnID: turnID, Generation: generation, Status: string(ConversationTurnInProgress),
@@ -67,6 +86,13 @@ func (e *Engine) beginActiveTurnCard(state *interactiveState, p Platform, sessio
 		canInterrupt: canInterrupt,
 		canSteer:     canSteer,
 	}
+	if destination, err := mirrorDestinationKey(p, sessionKey); err == nil {
+		card.identity.Destination = destination
+	}
+	if provider, ok := agent.(ConversationProvider); ok {
+		card.provider = provider
+	}
+	return card
 }
 
 func (e *Engine) activateTurnCard(p Platform, writer *compactProgressWriter, card *activeTurnCard, handle any) {
@@ -101,6 +127,137 @@ func (e *Engine) activateTurnCard(p Platform, writer *compactProgressWriter, car
 	if !writer.SetControls(hint, buttons) {
 		slog.Warn("turn card: failed to render exact turn controls", "platform", p.Name(), "turn_id", card.identity.TurnID)
 	}
+	if card.provider != nil {
+		e.startNativeTurnCardMonitor(card, writer)
+	}
+}
+
+func (e *Engine) startNativeTurnCardMonitor(card *activeTurnCard, writer *compactProgressWriter) {
+	if card == nil || writer == nil || card.provider == nil || card.identity.Token == "" {
+		return
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	monitor := &nativeTurnCardMonitor{
+		token: card.identity.Token, threadID: card.identity.ThreadID, turnID: card.identity.TurnID,
+		provider: card.provider, writer: writer, cancel: cancel,
+	}
+	writer.EnableHealthMonitoring()
+	e.turnCardMonitorMu.Lock()
+	if previous := e.turnCardMonitors[monitor.token]; previous != nil {
+		previous.cancel()
+	}
+	e.turnCardMonitors[monitor.token] = monitor
+	e.turnCardMonitorMu.Unlock()
+	go e.runNativeTurnCardMonitor(ctx, monitor)
+}
+
+func (e *Engine) runNativeTurnCardMonitor(ctx context.Context, monitor *nativeTurnCardMonitor) {
+	defer func() {
+		e.turnCardMonitorMu.Lock()
+		if e.turnCardMonitors[monitor.token] == monitor {
+			delete(e.turnCardMonitors, monitor.token)
+		}
+		e.turnCardMonitorMu.Unlock()
+		monitor.writer.DisableHealthMonitoring()
+	}()
+	e.checkNativeTurnCardMonitor(ctx, monitor, nil)
+	ticker := time.NewTicker(nativeTurnCardHealthInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.checkNativeTurnCardMonitor(ctx, monitor, nil)
+		}
+	}
+}
+
+func (e *Engine) nativeTurnCardMonitor(token string) *nativeTurnCardMonitor {
+	e.turnCardMonitorMu.Lock()
+	defer e.turnCardMonitorMu.Unlock()
+	return e.turnCardMonitors[strings.TrimSpace(token)]
+}
+
+func (e *Engine) stopNativeTurnCardMonitor(token string) {
+	token = strings.TrimSpace(token)
+	e.turnCardMonitorMu.Lock()
+	monitor := e.turnCardMonitors[token]
+	if monitor != nil {
+		delete(e.turnCardMonitors, token)
+	}
+	e.turnCardMonitorMu.Unlock()
+	if monitor != nil {
+		monitor.writer.DisableHealthMonitoring()
+		monitor.cancel()
+	}
+}
+
+func (e *Engine) checkNativeTurnCardMonitor(ctx context.Context, monitor *nativeTurnCardMonitor, snapshot *ConversationSnapshot) (ProgressCardHealth, ConversationTurnStatus, error) {
+	if monitor == nil {
+		return ProgressCardHealthUnknown, ConversationTurnUnknown, fmt.Errorf("native turn card monitor not found")
+	}
+	monitor.checkMu.Lock()
+	defer monitor.checkMu.Unlock()
+	now := time.Now()
+	var err error
+	if snapshot == nil {
+		readCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		snapshot, err = monitor.provider.GetConversation(readCtx, monitor.threadID, 8)
+		cancel()
+	}
+	if err == nil && (snapshot == nil || snapshot.SessionID != monitor.threadID) {
+		err = fmt.Errorf("unexpected conversation snapshot")
+	}
+	var turn ConversationTurn
+	var found bool
+	if err == nil {
+		turn, found = conversationTurnByID(snapshot, monitor.turnID)
+		if !found {
+			err = fmt.Errorf("turn not found in conversation snapshot")
+		}
+	}
+	if err != nil {
+		if monitor.failedAt.IsZero() {
+			monitor.failedAt = now
+		}
+		health := ProgressCardHealthReconnecting
+		if now.Sub(monitor.failedAt) >= cardHealthUnknownAfter {
+			health = ProgressCardHealthUnknown
+		}
+		monitor.writer.SetHealth(health, monitor.lastOK)
+		return health, ConversationTurnUnknown, err
+	}
+
+	verifiedAt := snapshot.RetrievedAt
+	if verifiedAt.IsZero() {
+		verifiedAt = now
+	}
+	monitor.lastOK = verifiedAt
+	monitor.failedAt = time.Time{}
+	if conversationTurnTerminal(turn.Status) {
+		state := ProgressCardStateCompleted
+		switch turn.Status {
+		case ConversationTurnFailed:
+			state = ProgressCardStateFailed
+		case ConversationTurnInterrupted:
+			state = ProgressCardStateInterrupted
+		}
+		monitor.writer.SetHealth(ProgressCardHealthVerified, verifiedAt)
+		monitor.writer.DisableHealthMonitoring()
+		monitor.writer.Finalize(state)
+		if err := e.turnCards.markTerminal(monitor.token, string(turn.Status)); err != nil {
+			slog.Warn("turn card: persist monitored terminal state failed", "turn_id", monitor.turnID, "error", err)
+		}
+		e.stopNativeTurnCardMonitor(monitor.token)
+		return ProgressCardHealthVerified, turn.Status, nil
+	}
+	if turn.Status == ConversationTurnUnknown {
+		monitor.writer.SetHealth(ProgressCardHealthUnknown, verifiedAt)
+		return ProgressCardHealthUnknown, turn.Status, nil
+	}
+	monitor.writer.SetHealth(ProgressCardHealthVerified, verifiedAt)
+	return ProgressCardHealthVerified, turn.Status, nil
 }
 
 func progressStateConversationStatus(state ProgressCardState) string {
@@ -121,6 +278,7 @@ func (e *Engine) finishActiveTurnCard(state *interactiveState, writer *compactPr
 		terminal = ProgressCardStateCompleted
 	}
 	if card != nil && card.registered && e.turnCards != nil {
+		e.stopNativeTurnCardMonitor(card.identity.Token)
 		if err := e.turnCards.markTerminal(card.identity.Token, progressStateConversationStatus(terminal)); err != nil {
 			slog.Error("turn card: persist terminal identity failed", "turn_id", card.identity.TurnID, "error", err)
 		}
@@ -132,6 +290,11 @@ func (e *Engine) finishActiveTurnCard(state *interactiveState, writer *compactPr
 }
 
 func (e *Engine) expireActiveTurnCard(state *interactiveState, card *activeTurnCard) {
+	if card != nil {
+		if monitor := e.nativeTurnCardMonitor(card.identity.Token); monitor != nil {
+			monitor.writer.SetControls("", nil)
+		}
+	}
 	if card != nil && card.registered && e.turnCards != nil {
 		if err := e.turnCards.markTerminal(card.identity.Token, "stale"); err != nil {
 			slog.Error("turn card: persist stale identity failed", "turn_id", card.identity.TurnID, "error", err)

@@ -60,7 +60,7 @@ func (p *interactivePlatform) SendTrackedCard(ctx context.Context, rctx any, car
 	if !ok {
 		return nil, fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
 	}
-	return p.sendPreviewStart(ctx, rctx, renderCallbackCard(card, rc.sessionKey), "")
+	return p.sendPreviewStart(ctx, rctx, renderCallbackCard(card, rc.sessionKey), "", false)
 }
 
 func (p *interactivePlatform) UpdateTrackedCard(ctx context.Context, handle any, sessionKey string, card *core.Card) error {

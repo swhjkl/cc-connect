@@ -58,8 +58,9 @@ func (a *authoritativeConversationAgent) callCount() int {
 
 type trackPreviewPlatform struct {
 	stubPlatformEngine
-	starts  chan string
-	updates chan string
+	starts          chan string
+	updates         chan string
+	replyableStarts int
 }
 
 type trackActionPlatform struct {
@@ -942,6 +943,11 @@ func newTrackPreviewPlatform() *trackPreviewPlatform {
 func (p *trackPreviewPlatform) SendPreviewStart(_ context.Context, _ any, content string) (any, error) {
 	p.starts <- content
 	return "track-card", nil
+}
+
+func (p *trackPreviewPlatform) SendReplyablePreviewStart(ctx context.Context, replyCtx any, content string) (any, error) {
+	p.replyableStarts++
+	return p.SendPreviewStart(ctx, replyCtx, content)
 }
 
 func (p *trackPreviewPlatform) UpdateMessage(_ context.Context, _ any, content string) error {

@@ -1765,6 +1765,9 @@ func TestCUJ_I5_TrackDoesNotBlockFeishuConversation(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("replacement /track did not create a card")
 		}
+		if replacementPlatform.replyableStarts != 1 {
+			t.Fatalf("replacement /track replyable starts = %d, want 1", replacementPlatform.replyableStarts)
+		}
 
 		// Action 2: replying to that card steers the bound turn, not a new turn.
 		accepted := 0

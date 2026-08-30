@@ -174,6 +174,62 @@ func TestSendTrackedCard_UsesV2CallbacksOnCreateAndUpdate(t *testing.T) {
 	}
 }
 
+func TestSendReplyablePreviewStart_KeepsV2CardInline(t *testing.T) {
+	const (
+		appID     = "cli_replyable_preview"
+		appSecret = "secret"
+		messageID = "om_replyable_card"
+	)
+	cardJSON := `{"schema":"2.0","config":{"update_multi":true},"body":{"elements":[]}}`
+	var sentContent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{"code": 0, "expire": 7200, "tenant_access_token": "token"})
+		case strings.HasSuffix(r.URL.Path, "/reply") && r.Method == http.MethodPost:
+			var req struct {
+				MsgType string `json:"msg_type"`
+				Content string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode reply request: %v", err)
+			}
+			if req.MsgType != larkim.MsgTypeInteractive {
+				t.Fatalf("reply msg_type = %q, want interactive", req.MsgType)
+			}
+			sentContent = req.Content
+			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": messageID}})
+		case r.URL.Path == "/open-apis/cardkit/v1/cards":
+			t.Fatal("replyable preview unexpectedly created a CardKit entity")
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	p := &Platform{
+		platformName: "feishu", domain: srv.URL, appID: appID, appSecret: appSecret,
+		useInteractiveCard: true,
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+		replayClient: lark.NewClient(appID, appSecret, lark.WithEnableTokenCache(false),
+			lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+	}
+	handle, err := p.SendReplyablePreviewStart(context.Background(), replyContext{
+		messageID: "om_track_command", chatID: "oc_chat",
+	}, cardJSON)
+	if err != nil {
+		t.Fatalf("SendReplyablePreviewStart() error = %v", err)
+	}
+	if sentContent != cardJSON {
+		t.Fatalf("reply content = %s, want inline card JSON %s", sentContent, cardJSON)
+	}
+	if got, err := p.PreviewMessageID(handle); err != nil || got != messageID {
+		t.Fatalf("PreviewMessageID() = %q, %v; want %q", got, err, messageID)
+	}
+}
+
 func TestDispatchMessageDropsRecalledMessageBeforeHandler(t *testing.T) {
 	called := false
 	p := &Platform{

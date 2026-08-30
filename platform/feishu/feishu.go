@@ -4830,15 +4830,22 @@ func buildPreviewCardJSON(content string) string {
 // cardID stays empty in that case and the engine routes EventText through the
 // full-card Patch path (= original #657 behavior, no typewriter).
 func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content string) (any, error) {
-	return p.sendPreviewStart(ctx, rctx, content, "")
+	return p.sendPreviewStart(ctx, rctx, content, "", false)
+}
+
+// SendReplyablePreviewStart keeps the card JSON inline in the IM message.
+// CardKit entity-reference messages are updatable but cannot be selected as a
+// quote target in some Feishu clients, which prevents reply-based steering.
+func (p *Platform) SendReplyablePreviewStart(ctx context.Context, rctx any, content string) (any, error) {
+	return p.sendPreviewStart(ctx, rctx, content, "", true)
 }
 
 // SendPreviewStartIdempotent implements core.IdempotentPreviewStarter.
 func (p *Platform) SendPreviewStartIdempotent(ctx context.Context, rctx any, content, idempotencyKey string) (any, error) {
-	return p.sendPreviewStart(ctx, rctx, content, idempotencyKey)
+	return p.sendPreviewStart(ctx, rctx, content, idempotencyKey, false)
 }
 
-func (p *Platform) sendPreviewStart(ctx context.Context, rctx any, content, idempotencyKey string) (any, error) {
+func (p *Platform) sendPreviewStart(ctx context.Context, rctx any, content, idempotencyKey string, forceInline bool) (any, error) {
 	if !p.useInteractiveCard {
 		return nil, core.ErrNotSupported
 	}
@@ -4860,7 +4867,7 @@ func (p *Platform) sendPreviewStart(ctx context.Context, rctx any, content, idem
 	cardKind := classifyCardJSON(content)
 	if cardKind != feishuCardJSONNone {
 		cardJSON = content
-		if cardKind == feishuCardJSONV1 || strings.TrimSpace(idempotencyKey) != "" {
+		if forceInline || cardKind == feishuCardJSONV1 || strings.TrimSpace(idempotencyKey) != "" {
 			// Legacy v1 cards are sent inline and later updated with Message.Patch.
 			// Keep CardKit entities exclusive to schema 2.0 cards, whose element
 			// model is compatible with the CardKit update APIs.

@@ -294,6 +294,14 @@ type PreviewStarter interface {
 	SendPreviewStart(ctx context.Context, replyCtx any, content string) (previewHandle any, err error)
 }
 
+// ReplyablePreviewStarter creates an updatable preview as a normal platform
+// message that users can directly quote or reply to. Platforms whose native
+// streaming-card transport is not replyable can opt into a different backing
+// representation for this call.
+type ReplyablePreviewStarter interface {
+	SendReplyablePreviewStart(ctx context.Context, replyCtx any, content string) (previewHandle any, err error)
+}
+
 // IdempotentPreviewStarter is the crash-safe form of PreviewStarter. Reusing
 // idempotencyKey must not create a second message within the platform's native
 // deduplication window.

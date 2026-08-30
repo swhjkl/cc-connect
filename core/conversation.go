@@ -1847,7 +1847,12 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 	if err := e.waitOutgoing(p); err != nil {
 		return
 	}
-	handle, err := starter.SendPreviewStart(e.ctx, msg.ReplyCtx, payload)
+	var handle any
+	if replyable, ok := p.(ReplyablePreviewStarter); ok {
+		handle, err = replyable.SendReplyablePreviewStart(e.ctx, msg.ReplyCtx, payload)
+	} else {
+		handle, err = starter.SendPreviewStart(e.ctx, msg.ReplyCtx, payload)
+	}
 	if err != nil || handle == nil {
 		if err != nil && !errors.Is(err, ErrNotSupported) {
 			slog.Warn("track: start preview failed", "platform", p.Name(), "error", err)

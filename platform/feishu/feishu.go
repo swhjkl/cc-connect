@@ -4278,63 +4278,70 @@ func progressHealthMeta(payload *core.ProgressCardPayload, agent, defaultTitle, 
 	}
 	zh := strings.HasPrefix(language, "zh")
 	traditional := language == "zh-tw" || language == "zh_hk" || language == "zh-hk"
+	withElapsed := func(health string) string {
+		health = strings.TrimSpace(health)
+		if health == "" {
+			return defaultFooter
+		}
+		return defaultFooter + "\n" + health
+	}
 	switch payload.Health {
 	case core.ProgressCardHealthVerified:
 		if traditional {
-			return defaultTitle, defaultTemplate, fmt.Sprintf("任務狀態已於 %s 確認 · 卡片持續更新", verified)
+			return defaultTitle, defaultTemplate, withElapsed(fmt.Sprintf("任務狀態已於 %s 確認", verified))
 		}
 		if zh {
-			return defaultTitle, defaultTemplate, fmt.Sprintf("任务状态已于 %s 确认 · 卡片持续更新", verified)
+			return defaultTitle, defaultTemplate, withElapsed(fmt.Sprintf("任务状态已于 %s 确认", verified))
 		}
 		if language == "ja" {
-			return defaultTitle, defaultTemplate, fmt.Sprintf("タスク状態を %s に確認 · カードを更新中", verified)
+			return defaultTitle, defaultTemplate, withElapsed(fmt.Sprintf("タスク状態を %s に確認", verified))
 		}
 		if language == "es" {
-			return defaultTitle, defaultTemplate, fmt.Sprintf("Estado confirmado a las %s · La tarjeta sigue actualizándose", verified)
+			return defaultTitle, defaultTemplate, withElapsed(fmt.Sprintf("Estado confirmado a las %s", verified))
 		}
-		return defaultTitle, defaultTemplate, fmt.Sprintf("Task status confirmed at %s · Card is still updating", verified)
+		return defaultTitle, defaultTemplate, withElapsed(fmt.Sprintf("Task status confirmed at %s", verified))
 	case core.ProgressCardHealthReconnecting:
 		if traditional {
-			return fmt.Sprintf("%s · 重新連線中", agent), "orange", fmt.Sprintf("暫時無法確認任務狀態 · 最後確認 %s", verified)
+			return fmt.Sprintf("%s · 重新連線中", agent), "orange", withElapsed(fmt.Sprintf("暫時無法確認任務狀態 · 最後確認 %s", verified))
 		}
 		if zh {
-			return fmt.Sprintf("%s · 重新连接中", agent), "orange", fmt.Sprintf("暂时无法确认任务状态 · 最后确认 %s", verified)
+			return fmt.Sprintf("%s · 重新连接中", agent), "orange", withElapsed(fmt.Sprintf("暂时无法确认任务状态 · 最后确认 %s", verified))
 		}
 		if language == "ja" {
-			return fmt.Sprintf("%s · 再接続中", agent), "orange", fmt.Sprintf("状態を一時的に確認できません · 最終確認 %s", verified)
+			return fmt.Sprintf("%s · 再接続中", agent), "orange", withElapsed(fmt.Sprintf("状態を一時的に確認できません · 最終確認 %s", verified))
 		}
 		if language == "es" {
-			return fmt.Sprintf("%s · Reconectando", agent), "orange", fmt.Sprintf("No se puede confirmar temporalmente · Última confirmación %s", verified)
+			return fmt.Sprintf("%s · Reconectando", agent), "orange", withElapsed(fmt.Sprintf("No se puede confirmar temporalmente · Última confirmación %s", verified))
 		}
-		return fmt.Sprintf("%s · Reconnecting", agent), "orange", fmt.Sprintf("Task status temporarily unavailable · Last confirmed %s", verified)
+		return fmt.Sprintf("%s · Reconnecting", agent), "orange", withElapsed(fmt.Sprintf("Task status temporarily unavailable · Last confirmed %s", verified))
 	case core.ProgressCardHealthUnknown:
 		if traditional {
-			return fmt.Sprintf("%s · 狀態未知", agent), "grey", fmt.Sprintf("目前無法確認任務是否仍在執行 · 最後確認 %s", verified)
+			return fmt.Sprintf("%s · 狀態未知", agent), "grey", withElapsed(fmt.Sprintf("目前無法確認任務是否仍在執行 · 最後確認 %s", verified))
 		}
 		if zh {
-			return fmt.Sprintf("%s · 状态未知", agent), "grey", fmt.Sprintf("目前无法确认任务是否仍在运行 · 最后确认 %s", verified)
+			return fmt.Sprintf("%s · 状态未知", agent), "grey", withElapsed(fmt.Sprintf("目前无法确认任务是否仍在运行 · 最后确认 %s", verified))
 		}
 		if language == "ja" {
-			return fmt.Sprintf("%s · 状態不明", agent), "grey", fmt.Sprintf("タスクの実行状態を確認できません · 最終確認 %s", verified)
+			return fmt.Sprintf("%s · 状態不明", agent), "grey", withElapsed(fmt.Sprintf("タスクの実行状態を確認できません · 最終確認 %s", verified))
 		}
 		if language == "es" {
-			return fmt.Sprintf("%s · Estado desconocido", agent), "grey", fmt.Sprintf("No se puede confirmar si la tarea sigue activa · Última confirmación %s", verified)
+			return fmt.Sprintf("%s · Estado desconocido", agent), "grey", withElapsed(fmt.Sprintf("No se puede confirmar si la tarea sigue activa · Última confirmación %s", verified))
 		}
-		return fmt.Sprintf("%s · Status unknown", agent), "grey", fmt.Sprintf("Unable to confirm whether the task is still running · Last confirmed %s", verified)
+		return fmt.Sprintf("%s · Status unknown", agent), "grey", withElapsed(fmt.Sprintf("Unable to confirm whether the task is still running · Last confirmed %s", verified))
 	default:
 		if traditional {
-			return defaultTitle, defaultTemplate, "正在確認任務狀態"
+			return defaultTitle, defaultTemplate, withElapsed("正在確認任務狀態")
 		}
 		if zh {
-			return defaultTitle, defaultTemplate, "正在确认任务状态"
+			return defaultTitle, defaultTemplate, withElapsed("正在确认任务状态")
 		}
 		if language == "ja" {
-			return defaultTitle, defaultTemplate, "タスク状態を確認中"
+			return defaultTitle, defaultTemplate, withElapsed("タスク状態を確認中")
 		}
 		if language == "es" {
-			return defaultTitle, defaultTemplate, "Comprobando el estado de la tarea"
+			return defaultTitle, defaultTemplate, withElapsed("Comprobando el estado de la tarea")
 		}
-		return defaultTitle, defaultTemplate, "Checking task status"
+		return defaultTitle, defaultTemplate, withElapsed("Checking task status")
 	}
 }
 

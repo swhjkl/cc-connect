@@ -1346,14 +1346,15 @@ func TestBuildPreviewCardJSON_ProgressHealthIsVisibleAndFailClosed(t *testing.T)
 		Version: 2, Agent: "Codex", Lang: string(core.LangChinese), State: core.ProgressCardStateRunning,
 		Items:  []core.ProgressCardEntry{{Kind: core.ProgressEntryThinking, Text: "检查中"}},
 		Health: core.ProgressCardHealthUnknown, LastVerifiedAt: time.Date(2026, 8, 30, 12, 34, 56, 0, time.Local).Unix(),
-		Hint: "回复此卡片可追加指令", Buttons: []core.CardButton{{Text: "中止", Value: "turn:interrupt:token"}},
+		ElapsedSeconds: 125,
+		Hint:           "回复此卡片可追加指令", Buttons: []core.CardButton{{Text: "中止", Value: "turn:interrupt:token"}},
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal progress payload: %v", err)
 	}
 	cardJSON := buildPreviewCardJSON(core.ProgressCardPayloadPrefix + string(raw))
-	for _, want := range []string{"Codex · 状态未知", "目前无法确认任务是否仍在运行", "12:34:56"} {
+	for _, want := range []string{"Codex · 状态未知", "已运行 2分5秒 · 卡片持续更新", "目前无法确认任务是否仍在运行", "12:34:56"} {
 		if !strings.Contains(cardJSON, want) {
 			t.Fatalf("unknown progress card should contain %q: %s", want, cardJSON)
 		}

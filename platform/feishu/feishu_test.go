@@ -60,7 +60,7 @@ func TestOnMessageRecalledDispatchesCoreRecallMessage(t *testing.T) {
 	}
 }
 
-func TestSendTrackedCard_PreservesV1QuestionCardOnCreateAndUpdate(t *testing.T) {
+func TestSendTrackedCard_UsesV2CallbacksOnCreateAndUpdate(t *testing.T) {
 	const (
 		appID      = "cli_tracked_question"
 		appSecret  = "secret"
@@ -69,7 +69,8 @@ func TestSendTrackedCard_PreservesV1QuestionCardOnCreateAndUpdate(t *testing.T) 
 		sessionKey = "feishu:oc_question:ou_admin"
 	)
 
-	var createdContent, patchedContent string
+	const cardID = "card_question"
+	var createdCard, updatedCard, sentContent string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -77,6 +78,19 @@ func TestSendTrackedCard_PreservesV1QuestionCardOnCreateAndUpdate(t *testing.T) 
 			writeJSON(t, w, map[string]any{
 				"code": 0, "expire": 7200, "tenant_access_token": "token",
 			})
+		case r.URL.Path == "/open-apis/cardkit/v1/cards" && r.Method == http.MethodPost:
+			var req struct {
+				Type string `json:"type"`
+				Data string `json:"data"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode card entity create request: %v", err)
+			}
+			if req.Type != "card_json" {
+				t.Fatalf("card entity type = %q, want card_json", req.Type)
+			}
+			createdCard = req.Data
+			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"card_id": cardID}})
 		case r.URL.Path == "/open-apis/im/v1/messages" && r.Method == http.MethodPost:
 			var req struct {
 				MsgType string `json:"msg_type"`
@@ -88,17 +102,23 @@ func TestSendTrackedCard_PreservesV1QuestionCardOnCreateAndUpdate(t *testing.T) 
 			if req.MsgType != larkim.MsgTypeInteractive {
 				t.Fatalf("create msg_type = %q, want interactive", req.MsgType)
 			}
-			createdContent = req.Content
+			sentContent = req.Content
 			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": messageID}})
-		case r.URL.Path == "/open-apis/im/v1/messages/"+messageID && r.Method == http.MethodPatch:
+		case r.URL.Path == "/open-apis/cardkit/v1/cards/"+cardID && r.Method == http.MethodPut:
 			var req struct {
-				Content string `json:"content"`
+				Card struct {
+					Type string `json:"type"`
+					Data string `json:"data"`
+				} `json:"card"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Fatalf("decode patch request: %v", err)
+				t.Fatalf("decode card entity update request: %v", err)
 			}
-			patchedContent = req.Content
-			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": messageID}})
+			if req.Card.Type != "card_json" {
+				t.Fatalf("updated card entity type = %q, want card_json", req.Card.Type)
+			}
+			updatedCard = req.Card.Data
+			writeJSON(t, w, map[string]any{"code": 0})
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
@@ -125,15 +145,18 @@ func TestSendTrackedCard_PreservesV1QuestionCardOnCreateAndUpdate(t *testing.T) 
 	if err != nil {
 		t.Fatalf("SendTrackedCard() error = %v", err)
 	}
-	wantCreated := renderCard(first, sessionKey)
-	if createdContent != wantCreated {
-		t.Fatalf("created content was transformed\ngot:  %s\nwant: %s", createdContent, wantCreated)
+	wantCreated := renderCallbackCard(first, sessionKey)
+	if createdCard != wantCreated {
+		t.Fatalf("created card was transformed\ngot:  %s\nwant: %s", createdCard, wantCreated)
 	}
-	if strings.Contains(createdContent, `"content":"{\"config\"`) {
-		t.Fatalf("created card embeds serialized card JSON as markdown: %s", createdContent)
+	if sentContent != `{"type":"card","data":{"card_id":"`+cardID+`"}}` {
+		t.Fatalf("sent content = %s, want card entity reference", sentContent)
 	}
-	if !strings.Contains(createdContent, `"action":"trackq:token:0:1"`) || !strings.Contains(createdContent, "inspect all files") {
-		t.Fatalf("created card lost question controls or description: %s", createdContent)
+	if !strings.Contains(createdCard, `"schema":"2.0"`) || !strings.Contains(createdCard, `"type":"callback"`) {
+		t.Fatalf("created card does not use Card 2.0 callbacks: %s", createdCard)
+	}
+	if !strings.Contains(createdCard, `"action":"trackq:token:0:1"`) || !strings.Contains(createdCard, "inspect all files") {
+		t.Fatalf("created card lost question controls or description: %s", createdCard)
 	}
 
 	second := core.NewCard().Title("Agent question (2/2)", "blue").
@@ -142,12 +165,12 @@ func TestSendTrackedCard_PreservesV1QuestionCardOnCreateAndUpdate(t *testing.T) 
 	if err := p.UpdateTrackedCard(context.Background(), handle, sessionKey, second); err != nil {
 		t.Fatalf("UpdateTrackedCard() error = %v", err)
 	}
-	wantPatched := renderCard(second, sessionKey)
-	if patchedContent != wantPatched {
-		t.Fatalf("patched content was transformed\ngot:  %s\nwant: %s", patchedContent, wantPatched)
+	wantUpdated := renderCallbackCard(second, sessionKey)
+	if updatedCard != wantUpdated {
+		t.Fatalf("updated card was transformed\ngot:  %s\nwant: %s", updatedCard, wantUpdated)
 	}
-	if !strings.Contains(patchedContent, `"action":"trackq:token:1:1"`) {
-		t.Fatalf("patched card lost second question control: %s", patchedContent)
+	if !strings.Contains(updatedCard, `"action":"trackq:token:1:1"`) || !strings.Contains(updatedCard, `"type":"callback"`) {
+		t.Fatalf("updated card lost second question callback: %s", updatedCard)
 	}
 }
 

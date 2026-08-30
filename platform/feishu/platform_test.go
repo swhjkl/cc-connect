@@ -1248,6 +1248,70 @@ func TestBuildPreviewCardJSON_ProgressPayloadUsesStructuredCard(t *testing.T) {
 	}
 }
 
+func TestBuildPreviewCardJSON_MirrorUsesNativeTaskCardWithPrompt(t *testing.T) {
+	items := []core.ProgressCardEntry{
+		{Kind: core.ProgressEntryThinking, Text: "检查工作区"},
+		{Kind: core.ProgressEntryToolUse, Tool: "functions.exec_command", Text: `{"cmd":"git status"}`},
+	}
+	nativePayload := core.BuildProgressCardPayloadV2(items, false, "Codex", core.LangChinese, core.ProgressCardStateRunning)
+	nativeCard := buildPreviewCardJSON(nativePayload)
+
+	mirror := core.ProgressCardPayload{
+		Version: 2, Agent: "Codex · 共享外部会话", Lang: string(core.LangChinese),
+		State: core.ProgressCardStateRunning, Variant: core.CardVariantMirror,
+		Items: items, Counts: core.ProgressCardCounts{Reasoning: 1, Tools: 1},
+		Context: "**任务**\n\n保留这条 prompt", ElapsedSeconds: 67,
+		Health: core.ProgressCardHealthVerified, LastVerifiedAt: time.Date(2026, 8, 30, 12, 34, 56, 0, time.Local).Unix(),
+		Footer: "来自共享 Codex 会话的镜像",
+	}
+	raw, err := json.Marshal(mirror)
+	if err != nil {
+		t.Fatalf("marshal mirror payload: %v", err)
+	}
+	mirrorCard := buildPreviewCardJSON(core.ProgressCardPayloadPrefix + string(raw))
+
+	if !reflect.DeepEqual(collectCardPanels(t, mirrorCard), collectCardPanels(t, nativeCard)) {
+		t.Fatalf("mirror progress panels drifted from native card\nmirror: %s\nnative: %s", mirrorCard, nativeCard)
+	}
+	for _, want := range []string{"保留这条 prompt", "已运行 1分7秒 · 12:34:56", "来自共享 Codex 会话的镜像"} {
+		if !strings.Contains(mirrorCard, want) {
+			t.Fatalf("mirror card should contain %q: %s", want, mirrorCard)
+		}
+	}
+	var native, mirrored map[string]any
+	if err := json.Unmarshal([]byte(nativeCard), &native); err != nil {
+		t.Fatalf("decode native card: %v", err)
+	}
+	if err := json.Unmarshal([]byte(mirrorCard), &mirrored); err != nil {
+		t.Fatalf("decode mirror card: %v", err)
+	}
+	if !reflect.DeepEqual(native["config"], mirrored["config"]) {
+		t.Fatalf("mirror config drifted from native: mirror=%#v native=%#v", mirrored["config"], native["config"])
+	}
+	header, _ := mirrored["header"].(map[string]any)
+	title, _ := header["title"].(map[string]any)
+	if header["template"] != "purple" || title["content"] != "Codex · 共享外部会话 · 进行中" {
+		t.Fatalf("mirror header = %#v", header)
+	}
+
+	mirror.State = core.ProgressCardStateCompleted
+	mirror.Context = "**任务**\n\n保留这条 prompt\n\n**答复**\n\n任务完成"
+	mirror.ReplaceFooter = true
+	raw, err = json.Marshal(mirror)
+	if err != nil {
+		t.Fatalf("marshal terminal mirror payload: %v", err)
+	}
+	terminal := buildPreviewCardJSON(core.ProgressCardPayloadPrefix + string(raw))
+	for _, want := range []string{"任务完成", "来自共享 Codex 会话的镜像", `"template":"green"`} {
+		if !strings.Contains(terminal, want) {
+			t.Fatalf("terminal mirror should contain %q: %s", want, terminal)
+		}
+	}
+	if strings.Contains(terminal, "完整答复见下一条消息") {
+		t.Fatalf("inline terminal mirror claimed a separate response: %s", terminal)
+	}
+}
+
 func TestBuildPreviewCardJSON_ProgressControlsDisappearWhenInterrupted(t *testing.T) {
 	items := []core.ProgressCardEntry{{Kind: core.ProgressEntryThinking, Text: "检查中"}}
 	button := core.CardButton{

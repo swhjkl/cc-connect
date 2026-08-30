@@ -75,6 +75,20 @@ type trackHealthPreviewPlatform struct {
 	options []RichCardRenderOptions
 }
 
+type progressTrackPreviewPlatform struct {
+	*trackPreviewPlatform
+}
+
+func (*progressTrackPreviewPlatform) SupportsProgressCardPayload() bool { return true }
+
+func (*progressTrackPreviewPlatform) PreviewMessageID(handle any) (string, error) {
+	messageID, ok := handle.(string)
+	if !ok || strings.TrimSpace(messageID) == "" {
+		return "", fmt.Errorf("invalid preview handle %T", handle)
+	}
+	return messageID, nil
+}
+
 func newTrackHealthPreviewPlatform() *trackHealthPreviewPlatform {
 	return &trackHealthPreviewPlatform{trackPreviewPlatform: newTrackPreviewPlatform()}
 }
@@ -379,6 +393,12 @@ func (p *mirrorQuestionPlatform) questionSnapshot() ([]*Card, []*Card) {
 type disabledMirrorTestPlatform struct {
 	*mirrorTestPlatform
 }
+
+type progressMirrorTestPlatform struct {
+	*mirrorTestPlatform
+}
+
+func (*progressMirrorTestPlatform) SupportsProgressCardPayload() bool { return true }
 
 func (*disabledMirrorTestPlatform) SupportsConversationMirror() bool { return false }
 
@@ -1538,6 +1558,99 @@ func TestConversationMirror_DefaultOnCreatesProgressCardAndFinalResult(t *testin
 	time.Sleep(100 * time.Millisecond)
 	if got := len(p.getSent()); got != 1 {
 		t.Fatalf("duplicate terminal event sent %d results", got)
+	}
+}
+
+func TestConversationMirror_ProgressPayloadMatchesNativeCardAndShowsPrompt(t *testing.T) {
+	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+	p := &progressMirrorTestPlatform{mirrorTestPlatform: newMirrorTestPlatform()}
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	defer e.Stop()
+	e.SetAdminFrom("admin")
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatalf("bindConversationMirror() error = %v", err)
+	}
+	e.startConversationMirror(agent, e.sessions, p, binding)
+	waitMirrorTest(t, "initial native-style mirror reconciliation", func() bool { return agent.readCount() > 0 })
+	running := ConversationTurn{
+		ID: "turn-native-style", Status: ConversationTurnInProgress, StartedAt: time.Now().Add(-time.Minute),
+		Messages: []ConversationMessage{
+			{Role: "user", Content: "keep this prompt visible"},
+			{Role: "assistant", Content: "checking the repository", Phase: "commentary"},
+		},
+		Activities: []ConversationActivity{{ID: "tool-1", Kind: "shell", Name: "Bash", Summary: "git status", Status: "in_progress"}},
+	}
+	agent.setSnapshot(mirrorTestSnapshot("thread-1", running))
+	agent.events <- Event{Type: EventTurnStarted, ThreadID: "thread-1", TurnID: running.ID}
+	waitMirrorTest(t, "native-style mirror payload", func() bool {
+		p.trackMu.Lock()
+		defer p.trackMu.Unlock()
+		return len(p.starts) == 1
+	})
+
+	p.trackMu.Lock()
+	content := p.starts[0]
+	p.trackMu.Unlock()
+	payload, ok := ParseProgressCardPayload(content)
+	if !ok {
+		t.Fatalf("mirror card did not use native progress payload: %q", content)
+	}
+	if payload.Variant != CardVariantMirror || payload.State != ProgressCardStateRunning || payload.Agent != "Codex · Shared external session" {
+		t.Fatalf("mirror payload identity = %#v", payload)
+	}
+	if !strings.Contains(payload.Context, "keep this prompt visible") {
+		t.Fatalf("mirror payload omitted prompt: %#v", payload)
+	}
+	if strings.Contains(payload.Context, "checking the repository") {
+		t.Fatalf("running mirror duplicated progress in response body: %#v", payload)
+	}
+	if len(payload.Items) != 2 || payload.Items[0].Kind != ProgressEntryThinking || payload.Items[1].Kind != ProgressEntryToolUse {
+		t.Fatalf("mirror payload progress = %#v", payload.Items)
+	}
+}
+
+func TestCmdTrack_ProgressPayloadMatchesNativeCardAndShowsPrompt(t *testing.T) {
+	confirmedAt := time.Date(2026, 8, 30, 12, 0, 1, 0, time.Local)
+	snapshot := &ConversationSnapshot{
+		SessionID: "thread-1", RetrievedAt: confirmedAt,
+		Turns: []ConversationTurn{{
+			ID: "turn-1", Status: ConversationTurnInProgress, StartedAt: confirmedAt.Add(-time.Minute),
+			Messages: []ConversationMessage{
+				{Role: "user", Content: "track this exact prompt"},
+				{Role: "assistant", Content: "still working", Phase: "commentary"},
+			},
+		}},
+	}
+	agent := &authoritativeConversationAgent{snapshots: []*ConversationSnapshot{snapshot}}
+	p := &progressTrackPreviewPlatform{trackPreviewPlatform: newTrackPreviewPlatform()}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+	e.SetAdminFrom("admin")
+	key := "feishu:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", "codex")
+
+	e.handleCommand(p, &Message{SessionKey: key, Platform: "feishu", UserID: "admin", ReplyCtx: "ctx"}, "/track")
+	var content string
+	select {
+	case content = <-p.starts:
+	case <-time.After(time.Second):
+		t.Fatal("/track did not create a progress card")
+	}
+	payload, ok := ParseProgressCardPayload(content)
+	if !ok {
+		t.Fatalf("/track card did not use native progress payload: %q", content)
+	}
+	if !strings.Contains(payload.Context, "track this exact prompt") {
+		t.Fatalf("/track payload omitted prompt: %#v", payload)
+	}
+	if len(payload.Items) != 1 || payload.Items[0].Text != "still working" {
+		t.Fatalf("/track payload progress = %#v", payload.Items)
+	}
+	if payload.Variant != CardVariantMirror || payload.Health != ProgressCardHealthVerified || payload.LastVerifiedAt != confirmedAt.Truncate(trackHealthDisplayInterval).Unix() {
+		t.Fatalf("/track payload metadata = %#v", payload)
 	}
 }
 

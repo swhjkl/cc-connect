@@ -2407,11 +2407,16 @@ func (e *Engine) renderTrackPayloadWithResponse(p Platform, snapshot *Conversati
 func (e *Engine) renderTrackPayloadWithHealth(p Platform, snapshot *ConversationSnapshot, turn ConversationTurn, markdown, sessionKey string, includeResponse bool, health ProgressCardHealth, lastVerifiedAt time.Time) string {
 	_, ok := p.(RichCardSupporter)
 	_, hasOptions := p.(RichCardOptionsSupporter)
-	if !ok && !hasOptions {
+	payloadSupport, hasPayload := p.(ProgressCardPayloadSupport)
+	if !ok && !hasOptions && (!hasPayload || !payloadSupport.SupportsProgressCardPayload()) {
 		return markdown
 	}
 	presentation := e.conversationTurnPresentation(turn)
 	richMarkdown := e.renderRichTrackMarkdown(turn, presentation, includeResponse)
+	streaming := !conversationTurnTerminal(turn.Status) && turn.Status != ConversationTurnUnknown
+	if resolver, ok := p.(RichCardMarkdownResolver); ok && richMarkdown != "" {
+		richMarkdown = resolver.ResolveRichCardMarkdown(e.ctx, richMarkdown, !streaming)
+	}
 	footer := e.i18n.T(MsgTrackMirrorFooter)
 	if elapsed := e.trackElapsed(turn); elapsed != "" {
 		footer += "\n" + elapsed
@@ -2436,9 +2441,8 @@ func (e *Engine) renderTrackPayloadWithHealth(p Platform, snapshot *Conversation
 			footer += "\n" + e.i18n.Tf(MsgTrackHealthUnknown, verified)
 		}
 	}
-	status := trackCardStatus(turn.Status)
-	streaming := !conversationTurnTerminal(turn.Status) && turn.Status != ConversationTurnUnknown
 	var buttons []CardButton
+	planExecuteHint := false
 	if streaming && health != ProgressCardHealthReconnecting && health != ProgressCardHealthUnknown {
 		action := "cmd:/track stop " + snapshot.SessionID + " " + turn.ID
 		if destination, err := mirrorDestinationKey(p, sessionKey); err == nil {
@@ -2457,6 +2461,7 @@ func (e *Engine) renderTrackPayloadWithHealth(p Platform, snapshot *Conversation
 			if delivery := e.trackStore.delivery(destination, snapshot.SessionID, turn.ID, "primary"); delivery != nil &&
 				delivery.Source == "external" && delivery.PlanActionState == "" {
 				footer += "\n" + e.i18n.T(MsgTrackPlanExecuteHint)
+				planExecuteHint = true
 				buttons = []CardButton{{
 					Text:  e.i18n.T(MsgTrackPlanExecuteButton),
 					Type:  "primary",
@@ -2466,6 +2471,36 @@ func (e *Engine) renderTrackPayloadWithHealth(p Platform, snapshot *Conversation
 			}
 		}
 	}
+	if hasPayload && payloadSupport.SupportsProgressCardPayload() {
+		unifiedFooter := e.i18n.T(MsgTrackMirrorFooter)
+		if waiting := e.trackWaitingLabel(snapshot.ActiveFlags); waiting != "" {
+			unifiedFooter += "\n" + waiting
+		}
+		if planExecuteHint {
+			unifiedFooter += "\n" + e.i18n.T(MsgTrackPlanExecuteHint)
+		}
+		payload := ProgressCardPayload{
+			Version:        2,
+			Agent:          e.i18n.T(MsgTrackMirrorTitle),
+			Lang:           string(e.i18n.CurrentLang()),
+			State:          trackProgressCardState(turn.Status),
+			Variant:        CardVariantMirror,
+			Context:        richMarkdown,
+			Footer:         unifiedFooter,
+			ReplaceFooter:  !streaming && includeResponse,
+			Items:          append([]ProgressCardEntry{}, presentation.ProgressItems...),
+			Counts:         presentation.ProgressCounts,
+			ElapsedSeconds: trackElapsedSeconds(turn),
+			Health:         health,
+			Truncated:      presentation.ProgressTruncated,
+			Buttons:        buttons,
+		}
+		if !lastVerifiedAt.IsZero() {
+			payload.LastVerifiedAt = lastVerifiedAt.Unix()
+		}
+		return encodeProgressCardPayload(payload)
+	}
+	status := trackCardStatus(turn.Status)
 	options := RichCardRenderOptions{
 		Status: status, Title: e.trackMirrorTitle(turn.Status), Variant: CardVariantMirror,
 		Steps:             presentation.Steps,
@@ -2478,13 +2513,36 @@ func (e *Engine) renderTrackPayloadWithHealth(p Platform, snapshot *Conversation
 		StatusFooter:      footer,
 		Buttons:           buttons,
 	}
-	if resolver, ok := p.(RichCardMarkdownResolver); ok && options.Markdown != "" {
-		options.Markdown = resolver.ResolveRichCardMarkdown(e.ctx, options.Markdown, !streaming)
-	}
 	if card, rendered := buildRichCardFrame(p, options); rendered {
 		return card
 	}
 	return markdown
+}
+
+func trackProgressCardState(status ConversationTurnStatus) ProgressCardState {
+	switch status {
+	case ConversationTurnCompleted:
+		return ProgressCardStateCompleted
+	case ConversationTurnFailed:
+		return ProgressCardStateFailed
+	case ConversationTurnInterrupted:
+		return ProgressCardStateInterrupted
+	case ConversationTurnUnknown:
+		return ProgressCardStateUnknown
+	default:
+		return ProgressCardStateRunning
+	}
+}
+
+func trackElapsedSeconds(turn ConversationTurn) int64 {
+	if turn.StartedAt.IsZero() {
+		return 0
+	}
+	end := time.Now()
+	if !turn.CompletedAt.IsZero() {
+		end = turn.CompletedAt
+	}
+	return max(int64(end.Sub(turn.StartedAt)/time.Second), 0)
 }
 
 func trackCardStatus(status ConversationTurnStatus) CardStatus {

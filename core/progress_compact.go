@@ -38,6 +38,7 @@ const (
 	ProgressCardStateCompleted   ProgressCardState = "completed"
 	ProgressCardStateFailed      ProgressCardState = "failed"
 	ProgressCardStateInterrupted ProgressCardState = "interrupted"
+	ProgressCardStateUnknown     ProgressCardState = "unknown"
 )
 
 // ProgressCardHealth describes whether a running card's authoritative turn
@@ -123,6 +124,10 @@ type ProgressCardPayload struct {
 	Agent          string              `json:"agent,omitempty"`
 	Lang           string              `json:"lang,omitempty"`
 	State          ProgressCardState   `json:"state,omitempty"`
+	Variant        CardVariant         `json:"variant,omitempty"`
+	Context        string              `json:"context,omitempty"`
+	Footer         string              `json:"footer,omitempty"`
+	ReplaceFooter  bool                `json:"replace_footer,omitempty"`
 	Entries        []string            `json:"entries,omitempty"` // legacy fallback
 	Items          []ProgressCardEntry `json:"items,omitempty"`   // ordered typed events
 	Counts         ProgressCardCounts  `json:"counts,omitempty"`
@@ -216,6 +221,10 @@ func buildProgressCardPayloadV2WithMeta(items []ProgressCardEntry, truncated boo
 		Hint:           strings.TrimSpace(hint),
 		Buttons:        cloneProgressCardButtons(buttons),
 	}
+	return encodeProgressCardPayload(payload)
+}
+
+func encodeProgressCardPayload(payload ProgressCardPayload) string {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return ""
@@ -261,7 +270,9 @@ func ParseProgressCardPayload(content string) (*ProgressCardPayload, bool) {
 			})
 		}
 	}
-	if len(items) == 0 && len(legacy) == 0 {
+	payload.Context = strings.TrimSpace(payload.Context)
+	payload.Footer = strings.TrimSpace(payload.Footer)
+	if len(items) == 0 && len(legacy) == 0 && payload.Context == "" {
 		return nil, false
 	}
 	if payload.State == "" {
@@ -276,6 +287,11 @@ func ParseProgressCardPayload(content string) (*ProgressCardPayload, bool) {
 	case "", ProgressCardHealthChecking, ProgressCardHealthVerified, ProgressCardHealthReconnecting, ProgressCardHealthUnknown:
 	default:
 		payload.Health = ProgressCardHealthUnknown
+	}
+	switch payload.Variant {
+	case "", CardVariantDefault, CardVariantMirror:
+	default:
+		payload.Variant = CardVariantDefault
 	}
 	if payload.LastVerifiedAt < 0 {
 		payload.LastVerifiedAt = 0

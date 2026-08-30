@@ -1748,7 +1748,7 @@ func TestCUJ_I5_TrackDoesNotBlockFeishuConversation(t *testing.T) {
 			Messages: []ConversationMessage{{Role: "user", Content: "long task"}},
 		}
 		replacementAgent := newMirrorTestAgent(mirrorTestSnapshot("thread-replacement", running))
-		replacementPlatform := newTrackHealthPreviewPlatform()
+		replacementPlatform := &progressTrackPreviewPlatform{trackPreviewPlatform: newTrackPreviewPlatform()}
 		replacementEngine := NewEngine("test", replacementAgent, []Platform{replacementPlatform}, t.TempDir()+"/sessions.json", LangEnglish)
 		defer replacementEngine.Stop()
 		replacementEngine.SetAdminFrom("admin")

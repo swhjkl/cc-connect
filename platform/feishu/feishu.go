@@ -4210,6 +4210,20 @@ func progressStateMeta(state core.ProgressCardState, lang string, agent string) 
 			return fmt.Sprintf("%s · Interrumpido", agent), "orange", "Esta tarjeta de progreso fue interrumpida; el progreso ya generado se conserva abajo."
 		}
 		return fmt.Sprintf("%s · Interrupted", agent), "orange", "This progress card was interrupted; progress produced so far is preserved below."
+	case core.ProgressCardStateUnknown:
+		if zh {
+			if traditional {
+				return fmt.Sprintf("%s · 狀態未知", agent), "grey", "目前無法確認此任務的最終狀態。"
+			}
+			return fmt.Sprintf("%s · 状态未知", agent), "grey", "目前无法确认此任务的最终状态。"
+		}
+		if language == "ja" {
+			return fmt.Sprintf("%s · 状態不明", agent), "grey", "このタスクの最終状態を確認できません。"
+		}
+		if language == "es" {
+			return fmt.Sprintf("%s · Estado desconocido", agent), "grey", "No se puede confirmar el estado final de esta tarea."
+		}
+		return fmt.Sprintf("%s · Status unknown", agent), "grey", "The final state of this task cannot be confirmed."
 	default:
 		if zh {
 			if traditional {
@@ -4735,7 +4749,8 @@ func appendProgressTruncatedNotice(elements []map[string]any, lang string) []map
 
 func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string {
 	items := normalizeProgressItems(payload)
-	if len(items) == 0 {
+	contextMarkdown := strings.TrimSpace(payload.Context)
+	if len(items) == 0 && contextMarkdown == "" {
 		return buildCardJSON(" ")
 	}
 
@@ -4746,13 +4761,32 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 		footer = progressHeartbeatFooter(payload.ElapsedSeconds, payload.Lang)
 		title, template, footer = progressHealthMeta(payload, agent, title, template, footer)
 	}
+	if payload.Variant == core.CardVariantMirror && running &&
+		payload.Health != core.ProgressCardHealthReconnecting && payload.Health != core.ProgressCardHealthUnknown {
+		template = "purple"
+	}
+	if payload.ReplaceFooter {
+		footer = strings.TrimSpace(payload.Footer)
+	} else if extraFooter := strings.TrimSpace(payload.Footer); extraFooter != "" {
+		if footer == "" {
+			footer = extraFooter
+		} else {
+			footer += "\n" + extraFooter
+		}
+	}
 
-	elements := make([]map[string]any, 0, len(items)+3)
+	elements := make([]map[string]any, 0, len(items)+4)
 	if payload.Truncated {
 		elements = appendProgressTruncatedNotice(elements, payload.Lang)
 	}
 
 	elements = appendProgressGroupedElements(elements, items, payload.Counts, payload.Lang, running)
+	if contextMarkdown != "" {
+		elements = append(elements, map[string]any{
+			"tag":     "markdown",
+			"content": sanitizeCardMarkdownForCard(contextMarkdown),
+		})
+	}
 	controlsVisible := running && payload.Health != core.ProgressCardHealthReconnecting && payload.Health != core.ProgressCardHealthUnknown
 	if controlsVisible && strings.TrimSpace(payload.Hint) != "" {
 		elements = append(elements, map[string]any{"tag": "hr"})

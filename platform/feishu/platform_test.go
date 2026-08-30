@@ -160,28 +160,28 @@ func TestDetectFeishuFileMessageType(t *testing.T) {
 			name:     "mp4 video",
 			mimeType: "video/mp4",
 			fileName: "demo.mp4",
-			fileType: larkim.FileTypeMp4,
+			fileType: larkim.CreateFileFileTypeMp4,
 			msgType:  larkim.MsgTypeMedia,
 		},
 		{
 			name:     "opus audio",
 			mimeType: "audio/ogg",
 			fileName: "voice.ogg",
-			fileType: larkim.FileTypeOpus,
+			fileType: larkim.CreateFileFileTypeOpus,
 			msgType:  larkim.MsgTypeAudio,
 		},
 		{
 			name:     "pdf file",
 			mimeType: "application/pdf",
 			fileName: "report.pdf",
-			fileType: larkim.FileTypePdf,
+			fileType: larkim.CreateFileFileTypePdf,
 			msgType:  larkim.MsgTypeFile,
 		},
 		{
 			name:     "unknown file",
 			mimeType: "application/octet-stream",
 			fileName: "payload.bin",
-			fileType: larkim.FileTypeStream,
+			fileType: larkim.CreateFileFileTypeStream,
 			msgType:  larkim.MsgTypeFile,
 		},
 	}
@@ -2024,6 +2024,33 @@ func TestBuildPreviewCardJSON_NormalTextFallback(t *testing.T) {
 	}
 	if !strings.Contains(cardJSON, "\"tag\":\"markdown\"") {
 		t.Fatalf("default preview card should contain markdown element, got %q", cardJSON)
+	}
+}
+
+func TestClassifyCardJSON(t *testing.T) {
+	v1 := renderCard(core.NewCard().Markdown("question").Build(), "feishu:chat:user")
+	v2 := buildCardJSON("progress")
+	tests := []struct {
+		name    string
+		content string
+		want    feishuCardJSONKind
+	}{
+		{name: "v1", content: v1, want: feishuCardJSONV1},
+		{name: "v1 with whitespace", content: " \n" + v1 + "\t", want: feishuCardJSONV1},
+		{name: "v2", content: v2, want: feishuCardJSONV2},
+		{name: "plain text", content: "hello", want: feishuCardJSONNone},
+		{name: "malformed", content: `{"config":{},"elements":[`, want: feishuCardJSONNone},
+		{name: "arbitrary json", content: `{"message":"schema and body"}`, want: feishuCardJSONNone},
+		{name: "invalid v1 elements", content: `{"config":{},"elements":["text"]}`, want: feishuCardJSONNone},
+		{name: "incomplete v2", content: `{"schema":"2.0","body":{}}`, want: feishuCardJSONNone},
+		{name: "unsupported schema", content: `{"schema":"3.0","body":{"elements":[]}}`, want: feishuCardJSONNone},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyCardJSON(test.content); got != test.want {
+				t.Fatalf("classifyCardJSON() = %d, want %d", got, test.want)
+			}
+		})
 	}
 }
 

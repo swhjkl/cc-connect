@@ -60,11 +60,11 @@ func (p *interactivePlatform) SendTrackedCard(ctx context.Context, rctx any, car
 	if !ok {
 		return nil, fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
 	}
-	return p.sendPreviewStart(ctx, rctx, renderCard(card, rc.sessionKey), "")
+	return p.sendPreviewStart(ctx, rctx, renderCallbackCard(card, rc.sessionKey), "")
 }
 
 func (p *interactivePlatform) UpdateTrackedCard(ctx context.Context, handle any, sessionKey string, card *core.Card) error {
-	return p.UpdateMessage(ctx, handle, renderCard(card, sessionKey))
+	return p.UpdateMessage(ctx, handle, renderCallbackCard(card, sessionKey))
 }
 
 // RefreshCard updates a previously rendered card in-place using the Patch API.
@@ -272,6 +272,76 @@ func renderCardMap(card *core.Card, sessionKey string) map[string]any {
 
 	result["elements"] = elements
 	return result
+}
+
+// renderCallbackCard renders tracked controls as Card 2.0 callback behaviors.
+// Card 1.0 value-only buttons use the legacy CARD websocket frame, which the
+// official Go SDK does not dispatch through card.action.trigger.
+func renderCallbackCard(card *core.Card, sessionKey string) string {
+	result := map[string]any{
+		"schema": "2.0",
+		"config": map[string]any{"wide_screen_mode": true},
+	}
+	if card == nil {
+		result["body"] = map[string]any{"elements": []any{}}
+		encoded, _ := json.Marshal(result)
+		return string(encoded)
+	}
+	if card.Header != nil && card.Header.Title != "" {
+		color := card.Header.Color
+		if color == "" {
+			color = "blue"
+		}
+		result["header"] = map[string]any{
+			"template": color,
+			"title":    plainText(card.Header.Title),
+		}
+	}
+	callbackButton := func(text, buttonType, value string, extra map[string]string) map[string]any {
+		if buttonType == "" {
+			buttonType = "default"
+		}
+		payload := map[string]string{"action": value}
+		if sessionKey != "" {
+			payload["session_key"] = sessionKey
+		}
+		for key, item := range extra {
+			payload[key] = item
+		}
+		return map[string]any{
+			"tag":  "button",
+			"text": plainText(text),
+			"type": buttonType,
+			"behaviors": []any{map[string]any{
+				"type": "callback", "value": payload,
+			}},
+		}
+	}
+	elements := make([]any, 0, len(card.Elements))
+	for _, elem := range card.Elements {
+		switch item := elem.(type) {
+		case core.CardMarkdown:
+			elements = append(elements, map[string]any{"tag": "markdown", "content": item.Content})
+		case core.CardDivider:
+			elements = append(elements, map[string]any{"tag": "hr"})
+		case core.CardNote:
+			elements = append(elements, map[string]any{
+				"tag": "note", "elements": []any{plainText(item.Text)},
+			})
+		case core.CardActions:
+			for _, button := range item.Buttons {
+				elements = append(elements, callbackButton(button.Text, button.Type, button.Value, button.Extra))
+			}
+		case core.CardListItem:
+			elements = append(elements,
+				map[string]any{"tag": "markdown", "content": item.Text},
+				callbackButton(item.BtnText, item.BtnType, item.BtnValue, item.Extra),
+			)
+		}
+	}
+	result["body"] = map[string]any{"elements": elements}
+	encoded, _ := json.Marshal(result)
+	return string(encoded)
 }
 
 type deleteModeCheckerRow struct {

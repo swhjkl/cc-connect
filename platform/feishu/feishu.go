@@ -1110,7 +1110,7 @@ func (p *Platform) IsMessageRecalled(ctx context.Context, rctx any) (bool, error
 
 	req := larkim.NewGetMessageReqBuilder().
 		MessageId(messageID).
-		UserIdType(larkim.UserIdTypeGetMessageOpenId).
+		UserIdType(larkim.UserIdTypeOpenId).
 		Build()
 
 	var resp *larkim.GetMessageResp
@@ -3078,13 +3078,13 @@ func detectFeishuFileType(mimeType, fileName string) string {
 	name := strings.ToLower(fileName)
 	switch {
 	case mimeType == "application/pdf" || strings.HasSuffix(name, ".pdf"):
-		return larkim.FileTypePdf
+		return larkim.CreateFileFileTypePdf
 	case strings.HasSuffix(name, ".doc") || strings.HasSuffix(name, ".docx"):
-		return larkim.FileTypeDoc
+		return larkim.CreateFileFileTypeDoc
 	case strings.HasSuffix(name, ".xls") || strings.HasSuffix(name, ".xlsx") || strings.HasSuffix(name, ".csv"):
-		return larkim.FileTypeXls
+		return larkim.CreateFileFileTypeXls
 	case strings.HasSuffix(name, ".ppt") || strings.HasSuffix(name, ".pptx"):
-		return larkim.FileTypePpt
+		return larkim.CreateFileFileTypePpt
 	// Feishu's file API only has "mp4" as the video type. We map all common
 	// video MIME types and extensions to FileTypeMp4 so the message renders
 	// as a native video player bubble rather than a generic file download.
@@ -3094,19 +3094,19 @@ func detectFeishuFileType(mimeType, fileName string) string {
 		strings.HasSuffix(name, ".mp4") || strings.HasSuffix(name, ".mov") ||
 		strings.HasSuffix(name, ".avi") || strings.HasSuffix(name, ".m4v") ||
 		strings.HasSuffix(name, ".mkv") || strings.HasSuffix(name, ".webm"):
-		return larkim.FileTypeMp4
+		return larkim.CreateFileFileTypeMp4
 	case mimeType == "audio/ogg" || mimeType == "audio/opus" || mimeType == "application/ogg" || strings.HasSuffix(name, ".ogg") || strings.HasSuffix(name, ".opus"):
-		return larkim.FileTypeOpus
+		return larkim.CreateFileFileTypeOpus
 	default:
-		return larkim.FileTypeStream
+		return larkim.CreateFileFileTypeStream
 	}
 }
 
 func detectFeishuFileMessageType(fileType string) string {
 	switch fileType {
-	case larkim.FileTypeOpus:
+	case larkim.CreateFileFileTypeOpus:
 		return larkim.MsgTypeAudio
-	case larkim.FileTypeMp4:
+	case larkim.CreateFileFileTypeMp4:
 		return larkim.MsgTypeMedia
 	default:
 		return larkim.MsgTypeFile
@@ -3821,7 +3821,7 @@ func (p *Platform) createMessageWithUUID(ctx context.Context, chatID, msgType, c
 		body.Uuid(uuid)
 	}
 	req := larkim.NewCreateMessageReqBuilder().
-		ReceiveIdType(larkim.ReceiveIdTypeChatId).
+		ReceiveIdType(larkim.CreateMessageV1ReceiveIDTypeChatId).
 		Body(body.Build()).
 		Build()
 	return p.withTransientRetry(ctx, op, func() error {
@@ -4767,13 +4767,17 @@ func (p *Platform) sendPreviewStart(ctx context.Context, rctx any, content, idem
 		return nil, fmt.Errorf("%s: chatID is empty", p.tag())
 	}
 
-	// Card 2.0 path: engine passes a pre-built rich card JSON; pass it through.
+	// Pre-rendered card path: pass complete v1 and v2 card JSON through.
 	var cardJSON string
 	var sendContent string // what goes into the Im.Message.Create / Reply content field
 	var cardID string      // cardkit-v1 entity id (empty = no streaming text path)
-	if isCardJSON(content) {
+	cardKind := classifyCardJSON(content)
+	if cardKind != feishuCardJSONNone {
 		cardJSON = content
-		if strings.TrimSpace(idempotencyKey) != "" {
+		if cardKind == feishuCardJSONV1 || strings.TrimSpace(idempotencyKey) != "" {
+			// Legacy v1 cards are sent inline and later updated with Message.Patch.
+			// Keep CardKit entities exclusive to schema 2.0 cards, whose element
+			// model is compatible with the CardKit update APIs.
 			// A retried UUID can return an already-created message. Creating a new
 			// CardKit entity before that retry would leave the restored handle
 			// pointing at an entity the message does not reference. Persistent
@@ -4832,7 +4836,7 @@ func (p *Platform) sendPreviewStart(ctx context.Context, rctx any, content, idem
 			body.Uuid(idempotencyKey)
 		}
 		req := larkim.NewCreateMessageReqBuilder().
-			ReceiveIdType(larkim.ReceiveIdTypeChatId).
+			ReceiveIdType(larkim.CreateMessageV1ReceiveIDTypeChatId).
 			Body(body.Build()).
 			Build()
 		var resp *larkim.CreateMessageResp
@@ -5247,7 +5251,7 @@ func (p *Platform) SendAudio(ctx context.Context, rctx any, audio []byte, format
 		return p.withFreshTenantAccessTokenRetry(ctx, "upload audio", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			req := larkim.NewCreateFileReqBuilder().
 				Body(larkim.NewCreateFileReqBodyBuilder().
-					FileType(larkim.FileTypeOpus).
+					FileType(larkim.CreateFileFileTypeOpus).
 					FileName("tts_audio.opus").
 					File(bytes.NewReader(audio)).
 					Build()).
@@ -5322,7 +5326,7 @@ func (p *Platform) SendVideo(ctx context.Context, rctx any, video []byte, format
 		return p.withFreshTenantAccessTokenRetry(ctx, "upload video", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			req := larkim.NewCreateFileReqBuilder().
 				Body(larkim.NewCreateFileReqBodyBuilder().
-					FileType(larkim.FileTypeMp4).
+					FileType(larkim.CreateFileFileTypeMp4).
 					FileName(fileName).
 					File(bytes.NewReader(video)).
 					Build()).
@@ -6685,13 +6689,68 @@ func richStepBody(step core.ToolStep) string {
 	return strings.Join(lines, "\n")
 }
 
-// isCardJSON returns true if content looks like a complete Feishu card JSON
-// (has "schema" and "body"). Used to avoid double-wrapping rich card output.
-func isCardJSON(content string) bool {
-	if len(content) < 10 || content[0] != '{' {
+type feishuCardJSONKind uint8
+
+const (
+	feishuCardJSONNone feishuCardJSONKind = iota
+	feishuCardJSONV1
+	feishuCardJSONV2
+)
+
+// classifyCardJSON structurally recognizes complete Feishu cards so arbitrary
+// JSON and user text are not mistaken for pre-rendered card content.
+func classifyCardJSON(content string) feishuCardJSONKind {
+	trimmed := strings.TrimSpace(content)
+	if len(trimmed) < 2 || trimmed[0] != '{' {
+		return feishuCardJSONNone
+	}
+
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &root); err != nil || root == nil {
+		return feishuCardJSONNone
+	}
+
+	if rawSchema, ok := root["schema"]; ok {
+		var schema string
+		if json.Unmarshal(rawSchema, &schema) != nil || schema != "2.0" {
+			return feishuCardJSONNone
+		}
+		var body struct {
+			Elements json.RawMessage `json:"elements"`
+		}
+		if json.Unmarshal(root["body"], &body) != nil || !validFeishuCardElements(body.Elements) {
+			return feishuCardJSONNone
+		}
+		return feishuCardJSONV2
+	}
+
+	var config map[string]json.RawMessage
+	if json.Unmarshal(root["config"], &config) != nil || config == nil || !validFeishuCardElements(root["elements"]) {
+		return feishuCardJSONNone
+	}
+	return feishuCardJSONV1
+}
+
+func validFeishuCardElements(raw json.RawMessage) bool {
+	var elements []json.RawMessage
+	if json.Unmarshal(raw, &elements) != nil {
 		return false
 	}
-	return strings.Contains(content, `"schema"`) && strings.Contains(content, `"body"`)
+	for _, rawElement := range elements {
+		var element map[string]json.RawMessage
+		if json.Unmarshal(rawElement, &element) != nil || element == nil {
+			return false
+		}
+		var tag string
+		if json.Unmarshal(element["tag"], &tag) != nil || strings.TrimSpace(tag) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func isCardJSON(content string) bool {
+	return classifyCardJSON(content) != feishuCardJSONNone
 }
 
 // buildCardJSONWithStatus builds a Feishu card JSON with a colored header

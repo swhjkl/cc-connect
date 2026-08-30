@@ -60,6 +60,120 @@ func TestOnMessageRecalledDispatchesCoreRecallMessage(t *testing.T) {
 	}
 }
 
+func TestSendTrackedCard_UsesV2CallbacksOnCreateAndUpdate(t *testing.T) {
+	const (
+		appID      = "cli_tracked_question"
+		appSecret  = "secret"
+		chatID     = "oc_question"
+		messageID  = "om_question"
+		sessionKey = "feishu:oc_question:ou_admin"
+	)
+
+	const cardID = "card_question"
+	var createdCard, updatedCard, sentContent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "expire": 7200, "tenant_access_token": "token",
+			})
+		case r.URL.Path == "/open-apis/cardkit/v1/cards" && r.Method == http.MethodPost:
+			var req struct {
+				Type string `json:"type"`
+				Data string `json:"data"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode card entity create request: %v", err)
+			}
+			if req.Type != "card_json" {
+				t.Fatalf("card entity type = %q, want card_json", req.Type)
+			}
+			createdCard = req.Data
+			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"card_id": cardID}})
+		case r.URL.Path == "/open-apis/im/v1/messages" && r.Method == http.MethodPost:
+			var req struct {
+				MsgType string `json:"msg_type"`
+				Content string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode create request: %v", err)
+			}
+			if req.MsgType != larkim.MsgTypeInteractive {
+				t.Fatalf("create msg_type = %q, want interactive", req.MsgType)
+			}
+			sentContent = req.Content
+			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": messageID}})
+		case r.URL.Path == "/open-apis/cardkit/v1/cards/"+cardID && r.Method == http.MethodPut:
+			var req struct {
+				Card struct {
+					Type string `json:"type"`
+					Data string `json:"data"`
+				} `json:"card"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode card entity update request: %v", err)
+			}
+			if req.Card.Type != "card_json" {
+				t.Fatalf("updated card entity type = %q, want card_json", req.Card.Type)
+			}
+			updatedCard = req.Card.Data
+			writeJSON(t, w, map[string]any{"code": 0})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	base := &Platform{
+		platformName: "feishu", domain: srv.URL, appID: appID, appSecret: appSecret,
+		useInteractiveCard: true,
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+		replayClient: lark.NewClient(appID, appSecret, lark.WithEnableTokenCache(false),
+			lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+	}
+	p := &interactivePlatform{Platform: base}
+	base.self = p
+
+	first := core.NewCard().Title("Agent question (1/2)", "blue").
+		Markdown("**Which scope?**").
+		ListItemBtnExtra("Repository — inspect all files", "Repository", "default", "trackq:token:0:1", map[string]string{
+			"askq_label": "Repository", "askq_question": "Which scope?",
+		}).Build()
+	handle, err := p.SendTrackedCard(context.Background(), replyContext{chatID: chatID, sessionKey: sessionKey}, first)
+	if err != nil {
+		t.Fatalf("SendTrackedCard() error = %v", err)
+	}
+	wantCreated := renderCallbackCard(first, sessionKey)
+	if createdCard != wantCreated {
+		t.Fatalf("created card was transformed\ngot:  %s\nwant: %s", createdCard, wantCreated)
+	}
+	if sentContent != `{"type":"card","data":{"card_id":"`+cardID+`"}}` {
+		t.Fatalf("sent content = %s, want card entity reference", sentContent)
+	}
+	if !strings.Contains(createdCard, `"schema":"2.0"`) || !strings.Contains(createdCard, `"type":"callback"`) {
+		t.Fatalf("created card does not use Card 2.0 callbacks: %s", createdCard)
+	}
+	if !strings.Contains(createdCard, `"action":"trackq:token:0:1"`) || !strings.Contains(createdCard, "inspect all files") {
+		t.Fatalf("created card lost question controls or description: %s", createdCard)
+	}
+
+	second := core.NewCard().Title("Agent question (2/2)", "blue").
+		Markdown("**Which commands?**").
+		ListItemBtn("Plan only", "Plan only", "default", "trackq:token:1:1").Build()
+	if err := p.UpdateTrackedCard(context.Background(), handle, sessionKey, second); err != nil {
+		t.Fatalf("UpdateTrackedCard() error = %v", err)
+	}
+	wantUpdated := renderCallbackCard(second, sessionKey)
+	if updatedCard != wantUpdated {
+		t.Fatalf("updated card was transformed\ngot:  %s\nwant: %s", updatedCard, wantUpdated)
+	}
+	if !strings.Contains(updatedCard, `"action":"trackq:token:1:1"`) || !strings.Contains(updatedCard, `"type":"callback"`) {
+		t.Fatalf("updated card lost second question callback: %s", updatedCard)
+	}
+}
+
 func TestDispatchMessageDropsRecalledMessageBeforeHandler(t *testing.T) {
 	called := false
 	p := &Platform{

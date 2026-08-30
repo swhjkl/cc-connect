@@ -1343,7 +1343,42 @@ func (e *Engine) handleTrackedConversationElicitationInput(p Platform, msg *Mess
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgAskQuestionAnswerConfirmed, question.Question, answer))
 		if tracked, ok := p.(TrackedCardSender); ok && handle != nil {
 			card := e.buildConversationElicitationCard(questions, nextIndex, token)
-			if err := tracked.UpdateTrackedCard(e.ctx, handle, mirror.sessionKey, e.renderCardForPlatform(p, card)); err != nil {
+			rendered := e.renderCardForPlatform(p, card)
+			if !isAction {
+				// A typed reply becomes the newest chat message. Retire the old
+				// prompt and send the next question again so the active controls
+				// remain at the bottom of the conversation.
+				e.updateResolvedAskQuestionCard(p, handle, mirror.sessionKey, question, answer, false)
+				newHandle, sendErr := tracked.SendTrackedCard(e.ctx, msg.ReplyCtx, rendered)
+				var newMessageID string
+				var identifyErr error
+				if sendErr == nil {
+					newMessageID, identifyErr = previewMessageID(p, newHandle)
+				}
+				if sendErr == nil && identifyErr == nil {
+					mirror.mu.Lock()
+					adopted := false
+					if mirror.pending == pending && !pending.resolved && pending.current == nextIndex {
+						pending.cardHandle = newHandle
+						pending.cardMessageID = newMessageID
+						pending.actionable = true
+						adopted = true
+					}
+					mirror.mu.Unlock()
+					if !adopted {
+						e.updateResolvedAskQuestionCard(p, newHandle, mirror.sessionKey, questions[nextIndex], "", true)
+					}
+				} else {
+					if sendErr != nil {
+						slog.Warn("track: resend advanced question card failed", "platform", p.Name(), "error", sendErr)
+					} else {
+						slog.Warn("track: identify resent question card failed", "platform", p.Name(), "error", identifyErr)
+					}
+					if err := tracked.UpdateTrackedCard(e.ctx, handle, mirror.sessionKey, rendered); err != nil {
+						slog.Warn("track: advance question card fallback failed", "platform", p.Name(), "error", err)
+					}
+				}
+			} else if err := tracked.UpdateTrackedCard(e.ctx, handle, mirror.sessionKey, rendered); err != nil {
 				slog.Warn("track: advance question card failed", "platform", p.Name(), "error", err)
 			}
 		}

@@ -91,6 +91,14 @@ func (p *trackHealthPreviewPlatform) getOptions() []RichCardRenderOptions {
 	return append([]RichCardRenderOptions(nil), p.options...)
 }
 
+func (*trackHealthPreviewPlatform) PreviewMessageID(handle any) (string, error) {
+	messageID, ok := handle.(string)
+	if !ok || strings.TrimSpace(messageID) == "" {
+		return "", fmt.Errorf("invalid preview handle %T", handle)
+	}
+	return messageID, nil
+}
+
 func (p *trackActionPlatform) BuildRichCard(_ CardStatus, _ string, _ []ToolStep, markdown string, _ bool, _ string) string {
 	return markdown
 }

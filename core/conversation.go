@@ -22,13 +22,23 @@ const (
 
 type conversationTracker struct {
 	cancel         context.CancelFunc
+	platform       string
+	sessionKey     string
 	sessionID      string
 	turnID         string
+	cardMessageID  string
+	terminal       bool
 	health         ProgressCardHealth
 	lastVerifiedAt time.Time
 	firstFailureAt time.Time
 	lastSnapshot   *ConversationSnapshot
 	lastTurn       ConversationTurn
+}
+
+type conversationTrackerCardRef struct {
+	sessionID string
+	turnID    string
+	terminal  bool
 }
 
 type conversationMirror struct {
@@ -1614,6 +1624,7 @@ func (e *Engine) handleTrackedConversationInput(p Platform, msg *Message, direct
 	}
 	binding := e.trackStore.binding(destination)
 	var referenced *trackDeliveryState
+	var replacement *conversationTrackerCardRef
 	if msg.ReferencedMessageID != "" {
 		referenced = e.trackStore.deliveryByCardMessageID(destination, msg.ReferencedMessageID)
 		if referenced != nil {
@@ -1628,11 +1639,24 @@ func (e *Engine) handleTrackedConversationInput(p Platform, msg *Message, direct
 				return true
 			}
 		}
+		if referenced == nil {
+			replacement = e.conversationTrackerByCard(p.Name(), msg.SessionKey, msg.ReferencedMessageID)
+			if replacement != nil {
+				if !e.isAdmin(msg.UserID) {
+					e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/track"))
+					return true
+				}
+				if replacement.terminal || replacement.sessionID != threadID {
+					e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+					return true
+				}
+			}
+		}
 	}
 	// Preserve the existing in-process busy queue for a foreground cc-connect
 	// turn. The authoritative check below is for turns that this process does
 	// not currently own.
-	if referenced == nil && session.Busy() {
+	if referenced == nil && replacement == nil && session.Busy() {
 		return false
 	}
 
@@ -1655,7 +1679,7 @@ func (e *Engine) handleTrackedConversationInput(p Platform, msg *Message, direct
 		}
 	}
 
-	if referenced == nil {
+	if referenced == nil && replacement == nil {
 		if active.ID == "" {
 			return false
 		}
@@ -1670,7 +1694,13 @@ func (e *Engine) handleTrackedConversationInput(p Platform, msg *Message, direct
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSharedTurnBusy))
 		return true
 	}
-	if active.ID == "" || active.ID != referenced.TurnID {
+	targetTurnID := ""
+	if referenced != nil {
+		targetTurnID = referenced.TurnID
+	} else if replacement != nil {
+		targetTurnID = replacement.turnID
+	}
+	if active.ID == "" || active.ID != targetTurnID {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
 		return true
 	}
@@ -1683,7 +1713,7 @@ func (e *Engine) handleTrackedConversationInput(p Platform, msg *Message, direct
 	session.TouchUserActivity()
 	steerCtx, steerCancel := context.WithTimeout(e.ctx, 5*time.Second)
 	steerErr := steerer.SteerConversationTurn(
-		steerCtx, threadID, referenced.TurnID, directContent, msg.MessageID, msg.Images, msg.Files,
+		steerCtx, threadID, targetTurnID, directContent, msg.MessageID, msg.Images, msg.Files,
 	)
 	steerCancel()
 	if steerErr != nil {
@@ -1828,10 +1858,15 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 	if conversationTurnTerminal(turn.Status) || turn.Status == ConversationTurnUnknown {
 		return
 	}
+	cardMessageID, identityErr := previewMessageID(p, handle)
+	if identityErr != nil {
+		slog.Warn("track: replacement card cannot accept replies", "platform", p.Name(), "error", identityErr)
+	}
 
 	ctx, cancel := context.WithCancel(e.ctx)
 	tracker := &conversationTracker{
-		cancel: cancel, sessionID: sessionID, turnID: turn.ID,
+		cancel: cancel, platform: p.Name(), sessionKey: msg.SessionKey,
+		sessionID: sessionID, turnID: turn.ID, cardMessageID: cardMessageID,
 		health: ProgressCardHealthVerified, lastVerifiedAt: verifiedAt,
 		lastSnapshot: snapshot, lastTurn: turn,
 	}
@@ -2030,7 +2065,7 @@ func (e *Engine) cmdTrackStop(p Platform, msg *Message, args []string) {
 	}
 	e.trackMu.Lock()
 	tracker := e.trackers[interactiveKey]
-	validTracker := len(args) == 3 && tracker != nil && tracker.sessionID == sessionID && tracker.turnID == turnID
+	validTracker := len(args) == 3 && tracker != nil && !tracker.terminal && tracker.sessionID == sessionID && tracker.turnID == turnID
 	e.trackMu.Unlock()
 	validDelivery := false
 	if destination, destinationErr := mirrorDestinationKey(p, msg.SessionKey); destinationErr == nil {
@@ -2086,11 +2121,33 @@ func (e *Engine) cancelConversationTracker(interactiveKey string) {
 	}
 }
 
+func (e *Engine) conversationTrackerByCard(platform, sessionKey, messageID string) *conversationTrackerCardRef {
+	platform = strings.TrimSpace(platform)
+	sessionKey = strings.TrimSpace(sessionKey)
+	messageID = strings.TrimSpace(messageID)
+	if platform == "" || sessionKey == "" || messageID == "" {
+		return nil
+	}
+	e.trackMu.Lock()
+	defer e.trackMu.Unlock()
+	for _, tracker := range e.trackers {
+		if tracker == nil || !strings.EqualFold(tracker.platform, platform) || tracker.sessionKey != sessionKey || tracker.cardMessageID != messageID {
+			continue
+		}
+		return &conversationTrackerCardRef{sessionID: tracker.sessionID, turnID: tracker.turnID, terminal: tracker.terminal}
+	}
+	return nil
+}
+
 func (e *Engine) runConversationTracker(ctx context.Context, tracker *conversationTracker, interactiveKey, sessionKey string, provider ConversationProvider, platform Platform, updater MessageUpdater, handle any, lastPayload string) {
 	defer func() {
 		e.trackMu.Lock()
 		if e.trackers[interactiveKey] == tracker {
-			delete(e.trackers, interactiveKey)
+			if tracker.cardMessageID == "" {
+				delete(e.trackers, interactiveKey)
+			} else {
+				tracker.terminal = true
+			}
 		}
 		e.trackMu.Unlock()
 	}()

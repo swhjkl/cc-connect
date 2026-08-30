@@ -1741,6 +1741,65 @@ func TestCUJ_I5_TrackDoesNotBlockFeishuConversation(t *testing.T) {
 			t.Fatalf("stale card interrupted a newer turn: %#v", interruptAgent.interrupts)
 		}
 	})
+
+	t.Run("replacement card reply steers exact turn and turns stale", func(t *testing.T) {
+		running := ConversationTurn{
+			ID: "turn-replacement", Status: ConversationTurnInProgress,
+			Messages: []ConversationMessage{{Role: "user", Content: "long task"}},
+		}
+		replacementAgent := newMirrorTestAgent(mirrorTestSnapshot("thread-replacement", running))
+		replacementPlatform := newTrackHealthPreviewPlatform()
+		replacementEngine := NewEngine("test", replacementAgent, []Platform{replacementPlatform}, t.TempDir()+"/sessions.json", LangEnglish)
+		defer replacementEngine.Stop()
+		replacementEngine.SetAdminFrom("admin")
+		replacementKey := "feishu:group:replacement"
+		replacementEngine.sessions.GetOrCreateActive(replacementKey).SetAgentSessionID("thread-replacement", replacementAgent.Name())
+
+		// Action 1: /track creates a replacement card bound to one exact turn.
+		replacementEngine.ReceiveMessage(replacementPlatform, &Message{
+			SessionKey: replacementKey, Platform: replacementPlatform.Name(), MessageID: "i5-replacement-track",
+			UserID: "admin", Content: "/track", ReplyCtx: "track-ctx",
+		})
+		select {
+		case <-replacementPlatform.starts:
+		case <-time.After(time.Second):
+			t.Fatal("replacement /track did not create a card")
+		}
+
+		// Action 2: replying to that card steers the bound turn, not a new turn.
+		accepted := 0
+		replacementEngine.ReceiveMessage(replacementPlatform, &Message{
+			SessionKey: replacementKey, Platform: replacementPlatform.Name(), MessageID: "i5-replacement-steer", ReferencedMessageID: "track-card",
+			UserID: "admin", Content: "add this constraint", ReplyCtx: "steer-ctx", OnAccepted: func() { accepted++ },
+		})
+		replacementAgent.mu.Lock()
+		steers := append([][4]string(nil), replacementAgent.steers...)
+		replacementAgent.mu.Unlock()
+		if len(steers) != 1 || steers[0] != [4]string{"thread-replacement", "turn-replacement", "add this constraint", "i5-replacement-steer"} || accepted != 1 {
+			t.Fatalf("replacement exact steer = steers %#v accepted %d", steers, accepted)
+		}
+
+		// Action 3: after completion, replying to the same card is fail-closed.
+		replacementAgent.setSnapshot(mirrorTestSnapshot("thread-replacement", ConversationTurn{
+			ID: "turn-replacement", Status: ConversationTurnCompleted,
+			Messages: []ConversationMessage{{Role: "user", Content: "long task"}},
+		}))
+		waitMirrorTest(t, "replacement tracker tombstone", func() bool {
+			ref := replacementEngine.conversationTrackerByCard(replacementPlatform.Name(), replacementKey, "track-card")
+			return ref != nil && ref.terminal
+		})
+		replacementPlatform.clearSent()
+		replacementEngine.ReceiveMessage(replacementPlatform, &Message{
+			SessionKey: replacementKey, Platform: replacementPlatform.Name(), MessageID: "i5-replacement-late", ReferencedMessageID: "track-card",
+			UserID: "admin", Content: "do not start another turn", ReplyCtx: "late-ctx",
+		})
+		replacementAgent.mu.Lock()
+		steerCount := len(replacementAgent.steers)
+		replacementAgent.mu.Unlock()
+		if steerCount != 1 || !strings.Contains(strings.Join(replacementPlatform.getSent(), "\n"), "no longer points to the active turn") {
+			t.Fatalf("stale replacement reply = steers %d replies %q", steerCount, strings.Join(replacementPlatform.getSent(), "\n"))
+		}
+	})
 }
 
 // CUJ-I6 · A turn started outside cc-connect is mirrored by default. While it

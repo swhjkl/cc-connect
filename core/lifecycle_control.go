@@ -6,7 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+const lifecycleMirrorReadyTimeout = 8 * time.Second
 
 // LifecycleError is a stable error returned by the local lifecycle-control API.
 type LifecycleError struct {
@@ -324,6 +327,23 @@ func (e *Engine) SessionsAttach(sessionKey, agentSessionID string) (*SessionCont
 	}
 	active := sessions.ActiveSession(sessionKey)
 	if active != nil && active.GetAgentSessionID() == agentSessionID {
+		p := e.platformForName(extractPlatformName(sessionKey))
+		if supportsConversationMirror(agent, p) {
+			destination, destinationErr := mirrorDestinationKey(p, sessionKey)
+			if destinationErr != nil {
+				return nil, lifecycleError("internal_error", "resolve conversation mirror: %v", destinationErr)
+			}
+			binding := e.trackStore.binding(destination)
+			if binding == nil || binding.SessionKey != sessionKey || binding.ThreadID != agentSessionID {
+				binding, err = e.rebindConversationMirror(p, sessionKey, agentSessionID, agent)
+				if err != nil {
+					return nil, lifecycleError("internal_error", "persist conversation mirror: %v", err)
+				}
+			}
+			if err := e.waitLifecycleConversationMirrorReady(e.startConversationMirror(agent, sessions, p, binding)); err != nil {
+				return nil, err
+			}
+		}
 		result := e.sessionsStatusLocked(sessionKey, worktree, sessions)
 		result.Changed = false
 		return result, nil
@@ -355,6 +375,36 @@ func (e *Engine) SessionsAttach(sessionKey, agentSessionID string) (*SessionCont
 	if err != nil {
 		return nil, lifecycleError("internal_error", "persist session attachment: %v", err)
 	}
-	e.startConversationMirror(agent, sessions, p, binding)
+	if err := e.waitLifecycleConversationMirrorReady(e.startConversationMirror(agent, sessions, p, binding)); err != nil {
+		return nil, err
+	}
 	return &SessionControlResult{Project: e.name, Session: sessionKey, Worktree: worktree, InternalID: session.ID, AgentSessionID: matched.ID, Changed: true}, nil
+}
+
+func (e *Engine) waitLifecycleConversationMirrorReady(mirror *conversationMirror) error {
+	if mirror == nil {
+		return nil
+	}
+	timer := time.NewTimer(lifecycleMirrorReadyTimeout)
+	defer timer.Stop()
+	select {
+	case <-mirror.ready:
+		return nil
+	case <-mirror.done:
+		select {
+		case <-mirror.ready:
+			return nil
+		default:
+		}
+		return lifecycleError("internal_error", "conversation mirror stopped before observer was ready")
+	case <-timer.C:
+		select {
+		case <-mirror.ready:
+			return nil
+		default:
+		}
+		return lifecycleError("internal_error", "conversation mirror observer was not ready within %s", lifecycleMirrorReadyTimeout)
+	case <-e.ctx.Done():
+		return lifecycleError("internal_error", "conversation mirror stopped while waiting for observer readiness")
+	}
 }

@@ -48,6 +48,9 @@ type conversationMirror struct {
 	threadID    string
 	generation  uint64
 	wake        chan struct{}
+	ready       chan struct{}
+	done        chan struct{}
+	readyOnce   sync.Once
 	platform    Platform
 
 	mu             sync.Mutex
@@ -398,12 +401,12 @@ func (e *Engine) prepareForegroundConversation(p Platform, msg *Message, session
 	return nil
 }
 
-func (e *Engine) startConversationMirror(agent Agent, sessions *SessionManager, p Platform, binding *trackBindingState) {
+func (e *Engine) startConversationMirror(agent Agent, sessions *SessionManager, p Platform, binding *trackBindingState) *conversationMirror {
 	if binding == nil || !e.effectiveTrackEnabled(binding) {
-		return
+		return nil
 	}
 	if !supportsConversationMirror(agent, p) {
-		return
+		return nil
 	}
 
 	var retired *conversationMirror
@@ -412,7 +415,7 @@ func (e *Engine) startConversationMirror(agent Agent, sessions *SessionManager, 
 		if current.threadID == binding.ThreadID && current.generation == binding.Generation {
 			e.trackMu.Unlock()
 			current.signal()
-			return
+			return current
 		}
 		delete(e.conversationMirrors, binding.Destination)
 		retired = current
@@ -421,12 +424,13 @@ func (e *Engine) startConversationMirror(agent Agent, sessions *SessionManager, 
 	mirror := &conversationMirror{
 		cancel: cancel, destination: binding.Destination, sessionKey: binding.SessionKey,
 		threadID: binding.ThreadID, generation: binding.Generation, wake: make(chan struct{}, 1),
-		platform: p, handles: make(map[string]any),
+		ready: make(chan struct{}), done: make(chan struct{}), platform: p, handles: make(map[string]any),
 	}
 	e.conversationMirrors[binding.Destination] = mirror
 	e.trackMu.Unlock()
 	e.retireConversationMirror(retired)
 	go e.runConversationMirror(ctx, mirror, agent, sessions, p)
+	return mirror
 }
 
 func (e *Engine) stopConversationMirror(destination string) {
@@ -565,6 +569,7 @@ func (e *Engine) validateConversationMirrorRestore(agent Agent, threadID string)
 
 func (e *Engine) runConversationMirror(ctx context.Context, mirror *conversationMirror, agent Agent, sessions *SessionManager, p Platform) {
 	defer func() {
+		close(mirror.done)
 		e.trackMu.Lock()
 		if e.conversationMirrors[mirror.destination] == mirror {
 			delete(e.conversationMirrors, mirror.destination)
@@ -603,6 +608,7 @@ func (e *Engine) runConversationMirror(ctx context.Context, mirror *conversation
 			}
 			continue
 		}
+		mirror.readyOnce.Do(func() { close(mirror.ready) })
 		// Subscribe before the potentially slow initial reconciliation. Blocking
 		// questions are edge-triggered app-server requests and are not replayed to
 		// an observer that resumes after the request was emitted.

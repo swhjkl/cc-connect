@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -21,6 +22,28 @@ type closeoutAgentSession struct {
 type blockingListAgent struct {
 	called  chan struct{}
 	release chan struct{}
+}
+
+type delayedLifecycleMirrorAgent struct {
+	*interactiveQuestionMirrorAgent
+	openStarted chan struct{}
+	allowOpen   chan struct{}
+	openOnce    sync.Once
+	listed      []AgentSessionInfo
+}
+
+func (a *delayedLifecycleMirrorAgent) OpenConversationObserver(ctx context.Context, sessionID string) (ConversationObserver, error) {
+	a.openOnce.Do(func() { close(a.openStarted) })
+	select {
+	case <-a.allowOpen:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return a.interactiveQuestionMirrorAgent.OpenConversationObserver(ctx, sessionID)
+}
+
+func (a *delayedLifecycleMirrorAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	return append([]AgentSessionInfo(nil), a.listed...), nil
 }
 
 func (a *blockingListAgent) Name() string { return "stub" }
@@ -139,6 +162,140 @@ func TestWorkspaceRoute_NewRouteRemainsBlockedWhileTargetSessionBusy(t *testing.
 	if binding := e.workspaceBindings.LookupExact("project:project", "feishu:chat"); binding != nil {
 		t.Fatalf("busy route unexpectedly created binding: %#v", binding)
 	}
+}
+
+func TestSessionsAttach_IdempotentAttachWaitsForConversationObserverBeforeReturning(t *testing.T) {
+	tmp := t.TempDir()
+	worktree := filepath.Join(tmp, "worktree")
+	if err := os.Mkdir(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agent := &delayedLifecycleMirrorAgent{
+		interactiveQuestionMirrorAgent: newInteractiveQuestionMirrorAgent(mirrorTestSnapshot("thread-new", ConversationTurn{})),
+		openStarted:                    make(chan struct{}),
+		allowOpen:                      make(chan struct{}),
+	}
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("project", agent, []Platform{p}, "", LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	e.SetMultiWorkspace(tmp, filepath.Join(tmp, "bindings.json"))
+	sessionKey := "mirror:chat:user"
+	e.workspaceBindings.Bind("project:project", "mirror:chat", "", worktree)
+	ws := e.workspacePool.GetOrCreate(worktree)
+	ws.mu.Lock()
+	ws.agent = agent
+	ws.sessions = NewSessionManager("")
+	ws.sessions.GetOrCreateActive(sessionKey).SetAgentSessionID("thread-new", agent.Name())
+	ws.mu.Unlock()
+
+	type attachResult struct {
+		result *SessionControlResult
+		err    error
+	}
+	attached := make(chan attachResult, 1)
+	go func() {
+		result, err := e.SessionsAttach(sessionKey, "thread-new")
+		attached <- attachResult{result: result, err: err}
+	}()
+	select {
+	case <-agent.openStarted:
+	case <-time.After(time.Second):
+		t.Fatal("idempotent attach did not start the conversation observer")
+	}
+	select {
+	case got := <-attached:
+		t.Fatalf("attach returned before observer was ready: %#v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(agent.allowOpen)
+
+	var got attachResult
+	select {
+	case got = <-attached:
+	case <-time.After(time.Second):
+		t.Fatal("attach did not return after observer became ready")
+	}
+	if got.err != nil || got.result == nil || got.result.Changed {
+		t.Fatalf("idempotent attach result = %#v, err = %v", got.result, got.err)
+	}
+	binding := e.trackStore.binding("mirror:chat")
+	if binding == nil || binding.ThreadID != "thread-new" {
+		t.Fatalf("conversation mirror binding = %#v", binding)
+	}
+
+	// The task initializer starts the turn as soon as attach returns. Its first
+	// blocking question must therefore already have an interactive subscriber.
+	agent.observer.events <- Event{
+		Type: EventPermissionRequest, ThreadID: "thread-new", TurnID: "turn-new", ItemID: "question-new",
+		RequestID: "request-new", ToolName: "AskUserQuestion",
+		Questions: []UserQuestion{{Question: "Choose an execution mode", Options: []UserQuestionOption{{Label: "Safe"}}}},
+	}
+	waitMirrorTest(t, "task initialization question card", func() bool {
+		starts, _ := p.questionSnapshot()
+		return len(starts) == 1
+	})
+}
+
+func TestSessionsAttach_NewTaskWaitsForConversationObserverBeforeReturning(t *testing.T) {
+	tmp := t.TempDir()
+	worktree := filepath.Join(tmp, "worktree")
+	if err := os.Mkdir(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agent := &delayedLifecycleMirrorAgent{
+		interactiveQuestionMirrorAgent: newInteractiveQuestionMirrorAgent(mirrorTestSnapshot("thread-new", ConversationTurn{})),
+		openStarted:                    make(chan struct{}),
+		allowOpen:                      make(chan struct{}),
+		listed:                         []AgentSessionInfo{{ID: "thread-new", Summary: "new task"}},
+	}
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("project", agent, []Platform{p}, "", LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	e.SetMultiWorkspace(tmp, filepath.Join(tmp, "bindings.json"))
+	sessionKey := "mirror:chat:user"
+	e.workspaceBindings.Bind("project:project", "mirror:chat", "", worktree)
+	ws := e.workspacePool.GetOrCreate(worktree)
+	ws.mu.Lock()
+	ws.agent = agent
+	ws.sessions = NewSessionManager("")
+	ws.mu.Unlock()
+
+	attached := make(chan error, 1)
+	go func() {
+		_, err := e.SessionsAttach(sessionKey, "thread-new")
+		attached <- err
+	}()
+	select {
+	case <-agent.openStarted:
+	case <-time.After(time.Second):
+		t.Fatal("new task attach did not start the conversation observer")
+	}
+	select {
+	case err := <-attached:
+		t.Fatalf("new task attach returned before observer was ready: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(agent.allowOpen)
+	select {
+	case err := <-attached:
+		if err != nil {
+			t.Fatalf("new task attach failed after observer became ready: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new task attach did not return after observer became ready")
+	}
+
+	agent.observer.events <- Event{
+		Type: EventPermissionRequest, ThreadID: "thread-new", TurnID: "turn-new", ItemID: "question-new",
+		RequestID: "request-new", ToolName: "AskUserQuestion",
+		Questions: []UserQuestion{{Question: "Choose an execution mode", Options: []UserQuestionOption{{Label: "Safe"}}}},
+	}
+	waitMirrorTest(t, "new task question card", func() bool {
+		starts, _ := p.questionSnapshot()
+		return len(starts) == 1
+	})
 }
 
 func TestSessionsAttach_SerializesRouteValidationAndPersistenceWithUnbind(t *testing.T) {

@@ -4767,13 +4767,17 @@ func (p *Platform) sendPreviewStart(ctx context.Context, rctx any, content, idem
 		return nil, fmt.Errorf("%s: chatID is empty", p.tag())
 	}
 
-	// Card 2.0 path: engine passes a pre-built rich card JSON; pass it through.
+	// Pre-rendered card path: pass complete v1 and v2 card JSON through.
 	var cardJSON string
 	var sendContent string // what goes into the Im.Message.Create / Reply content field
 	var cardID string      // cardkit-v1 entity id (empty = no streaming text path)
-	if isCardJSON(content) {
+	cardKind := classifyCardJSON(content)
+	if cardKind != feishuCardJSONNone {
 		cardJSON = content
-		if strings.TrimSpace(idempotencyKey) != "" {
+		if cardKind == feishuCardJSONV1 || strings.TrimSpace(idempotencyKey) != "" {
+			// Legacy v1 cards are sent inline and later updated with Message.Patch.
+			// Keep CardKit entities exclusive to schema 2.0 cards, whose element
+			// model is compatible with the CardKit update APIs.
 			// A retried UUID can return an already-created message. Creating a new
 			// CardKit entity before that retry would leave the restored handle
 			// pointing at an entity the message does not reference. Persistent
@@ -6685,13 +6689,68 @@ func richStepBody(step core.ToolStep) string {
 	return strings.Join(lines, "\n")
 }
 
-// isCardJSON returns true if content looks like a complete Feishu card JSON
-// (has "schema" and "body"). Used to avoid double-wrapping rich card output.
-func isCardJSON(content string) bool {
-	if len(content) < 10 || content[0] != '{' {
+type feishuCardJSONKind uint8
+
+const (
+	feishuCardJSONNone feishuCardJSONKind = iota
+	feishuCardJSONV1
+	feishuCardJSONV2
+)
+
+// classifyCardJSON structurally recognizes complete Feishu cards so arbitrary
+// JSON and user text are not mistaken for pre-rendered card content.
+func classifyCardJSON(content string) feishuCardJSONKind {
+	trimmed := strings.TrimSpace(content)
+	if len(trimmed) < 2 || trimmed[0] != '{' {
+		return feishuCardJSONNone
+	}
+
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &root); err != nil || root == nil {
+		return feishuCardJSONNone
+	}
+
+	if rawSchema, ok := root["schema"]; ok {
+		var schema string
+		if json.Unmarshal(rawSchema, &schema) != nil || schema != "2.0" {
+			return feishuCardJSONNone
+		}
+		var body struct {
+			Elements json.RawMessage `json:"elements"`
+		}
+		if json.Unmarshal(root["body"], &body) != nil || !validFeishuCardElements(body.Elements) {
+			return feishuCardJSONNone
+		}
+		return feishuCardJSONV2
+	}
+
+	var config map[string]json.RawMessage
+	if json.Unmarshal(root["config"], &config) != nil || config == nil || !validFeishuCardElements(root["elements"]) {
+		return feishuCardJSONNone
+	}
+	return feishuCardJSONV1
+}
+
+func validFeishuCardElements(raw json.RawMessage) bool {
+	var elements []json.RawMessage
+	if json.Unmarshal(raw, &elements) != nil {
 		return false
 	}
-	return strings.Contains(content, `"schema"`) && strings.Contains(content, `"body"`)
+	for _, rawElement := range elements {
+		var element map[string]json.RawMessage
+		if json.Unmarshal(rawElement, &element) != nil || element == nil {
+			return false
+		}
+		var tag string
+		if json.Unmarshal(element["tag"], &tag) != nil || strings.TrimSpace(tag) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func isCardJSON(content string) bool {
+	return classifyCardJSON(content) != feishuCardJSONNone
 }
 
 // buildCardJSONWithStatus builds a Feishu card JSON with a colored header

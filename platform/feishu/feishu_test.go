@@ -60,6 +60,97 @@ func TestOnMessageRecalledDispatchesCoreRecallMessage(t *testing.T) {
 	}
 }
 
+func TestSendTrackedCard_PreservesV1QuestionCardOnCreateAndUpdate(t *testing.T) {
+	const (
+		appID      = "cli_tracked_question"
+		appSecret  = "secret"
+		chatID     = "oc_question"
+		messageID  = "om_question"
+		sessionKey = "feishu:oc_question:ou_admin"
+	)
+
+	var createdContent, patchedContent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "expire": 7200, "tenant_access_token": "token",
+			})
+		case r.URL.Path == "/open-apis/im/v1/messages" && r.Method == http.MethodPost:
+			var req struct {
+				MsgType string `json:"msg_type"`
+				Content string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode create request: %v", err)
+			}
+			if req.MsgType != larkim.MsgTypeInteractive {
+				t.Fatalf("create msg_type = %q, want interactive", req.MsgType)
+			}
+			createdContent = req.Content
+			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": messageID}})
+		case r.URL.Path == "/open-apis/im/v1/messages/"+messageID && r.Method == http.MethodPatch:
+			var req struct {
+				Content string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode patch request: %v", err)
+			}
+			patchedContent = req.Content
+			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": messageID}})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	base := &Platform{
+		platformName: "feishu", domain: srv.URL, appID: appID, appSecret: appSecret,
+		useInteractiveCard: true,
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+		replayClient: lark.NewClient(appID, appSecret, lark.WithEnableTokenCache(false),
+			lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+	}
+	p := &interactivePlatform{Platform: base}
+	base.self = p
+
+	first := core.NewCard().Title("Agent question (1/2)", "blue").
+		Markdown("**Which scope?**").
+		ListItemBtnExtra("Repository — inspect all files", "Repository", "default", "trackq:token:0:1", map[string]string{
+			"askq_label": "Repository", "askq_question": "Which scope?",
+		}).Build()
+	handle, err := p.SendTrackedCard(context.Background(), replyContext{chatID: chatID, sessionKey: sessionKey}, first)
+	if err != nil {
+		t.Fatalf("SendTrackedCard() error = %v", err)
+	}
+	wantCreated := renderCard(first, sessionKey)
+	if createdContent != wantCreated {
+		t.Fatalf("created content was transformed\ngot:  %s\nwant: %s", createdContent, wantCreated)
+	}
+	if strings.Contains(createdContent, `"content":"{\"config\"`) {
+		t.Fatalf("created card embeds serialized card JSON as markdown: %s", createdContent)
+	}
+	if !strings.Contains(createdContent, `"action":"trackq:token:0:1"`) || !strings.Contains(createdContent, "inspect all files") {
+		t.Fatalf("created card lost question controls or description: %s", createdContent)
+	}
+
+	second := core.NewCard().Title("Agent question (2/2)", "blue").
+		Markdown("**Which commands?**").
+		ListItemBtn("Plan only", "Plan only", "default", "trackq:token:1:1").Build()
+	if err := p.UpdateTrackedCard(context.Background(), handle, sessionKey, second); err != nil {
+		t.Fatalf("UpdateTrackedCard() error = %v", err)
+	}
+	wantPatched := renderCard(second, sessionKey)
+	if patchedContent != wantPatched {
+		t.Fatalf("patched content was transformed\ngot:  %s\nwant: %s", patchedContent, wantPatched)
+	}
+	if !strings.Contains(patchedContent, `"action":"trackq:token:1:1"`) {
+		t.Fatalf("patched card lost second question control: %s", patchedContent)
+	}
+}
+
 func TestDispatchMessageDropsRecalledMessageBeforeHandler(t *testing.T) {
 	called := false
 	p := &Platform{

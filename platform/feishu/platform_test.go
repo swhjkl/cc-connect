@@ -2027,6 +2027,33 @@ func TestBuildPreviewCardJSON_NormalTextFallback(t *testing.T) {
 	}
 }
 
+func TestClassifyCardJSON(t *testing.T) {
+	v1 := renderCard(core.NewCard().Markdown("question").Build(), "feishu:chat:user")
+	v2 := buildCardJSON("progress")
+	tests := []struct {
+		name    string
+		content string
+		want    feishuCardJSONKind
+	}{
+		{name: "v1", content: v1, want: feishuCardJSONV1},
+		{name: "v1 with whitespace", content: " \n" + v1 + "\t", want: feishuCardJSONV1},
+		{name: "v2", content: v2, want: feishuCardJSONV2},
+		{name: "plain text", content: "hello", want: feishuCardJSONNone},
+		{name: "malformed", content: `{"config":{},"elements":[`, want: feishuCardJSONNone},
+		{name: "arbitrary json", content: `{"message":"schema and body"}`, want: feishuCardJSONNone},
+		{name: "invalid v1 elements", content: `{"config":{},"elements":["text"]}`, want: feishuCardJSONNone},
+		{name: "incomplete v2", content: `{"schema":"2.0","body":{}}`, want: feishuCardJSONNone},
+		{name: "unsupported schema", content: `{"schema":"3.0","body":{"elements":[]}}`, want: feishuCardJSONNone},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyCardJSON(test.content); got != test.want {
+				t.Fatalf("classifyCardJSON() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 func collectCardPanels(t *testing.T, cardJSON string) []map[string]any {
 	t.Helper()
 	var card map[string]any

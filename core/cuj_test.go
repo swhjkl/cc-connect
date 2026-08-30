@@ -1977,7 +1977,7 @@ func TestCUJ_I9_ExternalBlockingQuestionMirrorLifecycle(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("interactive conversation observer did not open")
 	}
-	questions := testQuestions()
+	questions := testMultiQuestions()
 
 	// Action 1: an external turn blocks and the user sees the full question
 	// plus options instead of only a generic "waiting for input" state.
@@ -1991,30 +1991,57 @@ func TestCUJ_I9_ExternalBlockingQuestionMirrorLifecycle(t *testing.T) {
 	})
 	starts, _ := p.questionSnapshot()
 	action := firstCardActionWithPrefix(starts[0], "trackq:")
-	if action == "" || !strings.Contains(starts[0].RenderText(), "Which database?") {
+	if action == "" || !strings.Contains(starts[0].RenderText(), "Which database?") ||
+		starts[0].Header == nil || !strings.Contains(starts[0].Header.Title, "(1/2)") ||
+		strings.Contains(starts[0].RenderText(), `{"config"`) {
 		t.Fatalf("external question card = %#v", starts[0])
 	}
 
-	// Action 2: clicking the exact Feishu card answers that request, and the
-	// original card becomes terminal instead of starting a new turn.
+	// Action 2: the first exact answer updates the same card to question 2/2
+	// without resolving the original daemon request yet.
 	e.ReceiveMessage(p, &Message{
 		SessionKey: key, Platform: p.Name(), MessageID: "i9-answer", UserID: "admin",
 		Content: action, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
 	})
 	select {
 	case response := <-agent.observer.responses:
+		t.Fatalf("first answer resolved multi-question request early: %#v", response)
+	default:
+	}
+	waitMirrorTest(t, "second question card", func() bool {
+		_, updates := p.questionSnapshot()
+		return len(updates) == 1 && updates[0].Header != nil && strings.Contains(updates[0].Header.Title, "(2/2)")
+	})
+	_, updates := p.questionSnapshot()
+	secondAction := firstCardActionWithPrefix(updates[0], "trackq:")
+	if secondAction == "" || !strings.Contains(updates[0].RenderText(), "Which framework?") {
+		t.Fatalf("second question card = %#v", updates[0])
+	}
+
+	// Action 3: answering the second question submits both answers to the exact
+	// original request and makes the tracked card terminal.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i9-answer-2", UserID: "admin",
+		Content: secondAction, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+	})
+	select {
+	case response := <-agent.observer.responses:
 		if response.requestID != "request-1" || response.result.Behavior != "allow" {
 			t.Fatalf("shared question response = %#v", response)
+		}
+		answers, ok := response.result.UpdatedInput["answers"].(map[string]any)
+		if !ok || answers["Which database?"] != "PostgreSQL" || answers["Which framework?"] != "Gin" {
+			t.Fatalf("shared question answers = %#v", response.result.UpdatedInput)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Feishu card did not answer the shared question")
 	}
 	waitMirrorTest(t, "answered question card", func() bool {
-		_, updates := p.questionSnapshot()
-		return len(updates) > 0 && updates[len(updates)-1].Header != nil && updates[len(updates)-1].Header.Color == "green"
+		_, cards := p.questionSnapshot()
+		return len(cards) > 1 && cards[len(cards)-1].Header != nil && cards[len(cards)-1].Header.Color == "green"
 	})
 
-	// Action 3: for the next question, the TUI wins the response race. The
+	// Action 4: for the next question, the TUI wins the response race. The
 	// Feishu card turns grey, loses its controls, and no longer looks hung.
 	agent.observer.events <- Event{
 		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-external-2", ItemID: "question-2",

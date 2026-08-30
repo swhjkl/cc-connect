@@ -329,6 +329,34 @@ type interactiveQuestionMirrorAgent struct {
 	once     sync.Once
 }
 
+type blockingReconcileQuestionAgent struct {
+	*interactiveQuestionMirrorAgent
+	reconcileStarted chan struct{}
+	releaseReconcile chan struct{}
+	reconcileOnce    sync.Once
+}
+
+func newBlockingReconcileQuestionAgent(snapshot *ConversationSnapshot) *blockingReconcileQuestionAgent {
+	return &blockingReconcileQuestionAgent{
+		interactiveQuestionMirrorAgent: newInteractiveQuestionMirrorAgent(snapshot),
+		reconcileStarted:               make(chan struct{}),
+		releaseReconcile:               make(chan struct{}),
+	}
+}
+
+func (a *blockingReconcileQuestionAgent) GetConversation(ctx context.Context, _ string, _ int) (*ConversationSnapshot, error) {
+	a.reconcileOnce.Do(func() { close(a.reconcileStarted) })
+	select {
+	case <-a.releaseReconcile:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reads++
+	return a.snapshot, nil
+}
+
 func newInteractiveQuestionMirrorAgent(snapshot *ConversationSnapshot) *interactiveQuestionMirrorAgent {
 	return &interactiveQuestionMirrorAgent{
 		mirrorTestAgent: newMirrorTestAgent(snapshot),
@@ -744,6 +772,60 @@ func TestConversationMirror_ForegroundDeliveryWithoutBusySessionShowsRecoveredQu
 	starts, _ := p.questionSnapshot()
 	if len(starts) != 1 || !strings.Contains(starts[0].RenderText(), "Which database?") {
 		t.Fatalf("recovered lifecycle question cards = %#v, want one actionable question", starts)
+	}
+}
+
+func TestConversationMirror_SubscribesBeforeInitialReconcileSoPlanQuestionIsNotLost(t *testing.T) {
+	agent := newBlockingReconcileQuestionAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatalf("bindConversationMirror() error = %v", err)
+	}
+
+	var releaseOnce sync.Once
+	releaseReconcile := func() { releaseOnce.Do(func() { close(agent.releaseReconcile) }) }
+	t.Cleanup(releaseReconcile)
+	e.startConversationMirror(agent, e.sessions, p, binding)
+	select {
+	case <-agent.reconcileStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("initial reconciliation did not start")
+	}
+
+	// App-server permission requests are edge-triggered. Emit the question only
+	// when an observer is already connected, matching the backend's behavior.
+	select {
+	case <-agent.opened:
+		agent.observer.events <- Event{
+			Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-plan", ItemID: "question-plan",
+			RequestID: "request-plan", ToolName: "AskUserQuestion",
+			Questions: []UserQuestion{{
+				Question: "How should correctness be evaluated?",
+				Options:  []UserQuestionOption{{Label: "Golden cases"}, {Label: "Review rubric"}},
+			}},
+		}
+	default:
+		// The request is lost when reconciliation starts before subscription.
+	}
+	releaseReconcile()
+
+	waitMirrorTest(t, "plan question card", func() bool {
+		starts, _ := p.questionSnapshot()
+		return len(starts) == 1
+	})
+	starts, _ := p.questionSnapshot()
+	if got := starts[0].RenderText(); !strings.Contains(got, "How should correctness be evaluated?") {
+		t.Fatalf("plan question card = %q", got)
+	}
+	if got := countCardActionValues(starts[0], "trackq:"); got != 2 {
+		t.Fatalf("trackq controls = %d, want 2", got)
 	}
 }
 

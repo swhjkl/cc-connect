@@ -576,9 +576,6 @@ func (e *Engine) runConversationMirror(ctx context.Context, mirror *conversation
 	source := agent.(ConversationEventSource)
 	backoff := time.Second
 	for ctx.Err() == nil {
-		if err := e.reconcileConversationMirror(ctx, mirror, provider, sessions, p); err != nil && ctx.Err() == nil {
-			slog.Warn("track: mirror reconcile failed", "platform", p.Name(), "error", err)
-		}
 		var events <-chan Event
 		var observer ConversationObserver
 		var err error
@@ -591,6 +588,10 @@ func (e *Engine) runConversationMirror(ctx context.Context, mirror *conversation
 			events, err = source.WatchConversation(ctx, mirror.threadID)
 		}
 		if err != nil {
+			// Keep card state observable even while the event source is down.
+			if reconcileErr := e.reconcileConversationMirror(ctx, mirror, provider, sessions, p); reconcileErr != nil && ctx.Err() == nil {
+				slog.Warn("track: mirror reconcile failed", "platform", p.Name(), "error", reconcileErr)
+			}
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, ErrNotSupported) {
 				slog.Warn("track: observer connect failed", "platform", p.Name(), "error", err)
 			}
@@ -601,6 +602,12 @@ func (e *Engine) runConversationMirror(ctx context.Context, mirror *conversation
 				backoff *= 2
 			}
 			continue
+		}
+		// Subscribe before the potentially slow initial reconciliation. Blocking
+		// questions are edge-triggered app-server requests and are not replayed to
+		// an observer that resumes after the request was emitted.
+		if err := e.reconcileConversationMirror(ctx, mirror, provider, sessions, p); err != nil && ctx.Err() == nil {
+			slog.Warn("track: mirror reconcile failed", "platform", p.Name(), "error", err)
 		}
 		backoff = time.Second
 		watchdog := time.NewTicker(15 * time.Second)

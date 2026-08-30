@@ -281,7 +281,7 @@ func TestNativeTurnCard_HealthMonitorSynchronizesTerminalState(t *testing.T) {
 	f.finish(t, "completed")
 }
 
-func TestNativeTurnCard_TrackDoesNotClaimStaleCardWasSynchronized(t *testing.T) {
+func TestNativeTurnCard_TrackReplacesStaleRunningCard(t *testing.T) {
 	f := startActiveNativeTurnCard(t)
 	f.e.SetAdminFrom("admin")
 	token := strings.TrimPrefix(f.action, turnCardInterruptActionPrefix)
@@ -294,13 +294,19 @@ func TestNativeTurnCard_TrackDoesNotClaimStaleCardWasSynchronized(t *testing.T) 
 		SessionKey: f.key, Platform: f.p.Name(), MessageID: "track-stale-native",
 		UserID: "admin", Content: "/track", ReplyCtx: "track-ctx",
 	})
-	if startsAfter := len(f.p.getPreviewStarts()); startsAfter != startsBefore {
-		t.Fatalf("/track created a duplicate stale native card: before=%d after=%d", startsBefore, startsAfter)
+	if startsAfter := len(f.p.getPreviewStarts()); startsAfter != startsBefore+1 {
+		t.Fatalf("/track replacement cards: before=%d after=%d", startsBefore, startsAfter)
 	}
-	got := strings.Join(f.p.getSent(), "\n")
-	if !strings.Contains(got, "状态监测已停止") || strings.Contains(got, "已同步") {
-		t.Fatalf("stale native /track reply = %q", got)
+	f.e.trackMu.Lock()
+	tracker := f.e.trackers[f.key]
+	f.e.trackMu.Unlock()
+	if tracker == nil || tracker.sessionID != "thread-1" || tracker.turnID != "turn-1" {
+		t.Fatalf("stale native /track tracker = %#v", tracker)
 	}
+	if got := strings.Join(f.p.getSent(), "\n"); strings.Contains(got, "已同步") {
+		t.Fatalf("stale native /track falsely claimed synchronization: %q", got)
+	}
+	f.e.cancelConversationTracker(f.key)
 	f.finish(t, "completed")
 }
 

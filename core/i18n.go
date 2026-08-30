@@ -743,7 +743,6 @@ const (
 	MsgTrackRefreshed                     MsgKey = "track_refreshed"
 	MsgTrackNativeCardSynced              MsgKey = "track_native_card_synced"
 	MsgTrackNativeCardExists              MsgKey = "track_native_card_exists"
-	MsgTrackNativeCardMonitorInactive     MsgKey = "track_native_card_monitor_inactive"
 	MsgTrackHealthVerified                MsgKey = "track_health_verified"
 	MsgTrackHealthReconnecting            MsgKey = "track_health_reconnecting"
 	MsgTrackHealthUnknown                 MsgKey = "track_health_unknown"
@@ -1837,13 +1836,6 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "ℹ️ 現有原生任務卡片已是目前狀態：%s；未建立重複卡片。",
 		LangJapanese:           "ℹ️ 既存のネイティブタスクカードは現在の状態（%s）を反映済みです。重複カードは作成しませんでした。",
 		LangSpanish:            "ℹ️ La tarjeta de tarea nativa existente ya refleja el estado actual: %s. No se creó una tarjeta duplicada.",
-	},
-	MsgTrackNativeCardMonitorInactive: {
-		LangEnglish:            "⚠️ An existing native task card was found, but its in-process status monitor is no longer active. No duplicate card was created.",
-		LangChinese:            "⚠️ 已找到现有原生任务卡片，但其进程内状态监测已停止；未创建重复卡片。",
-		LangTraditionalChinese: "⚠️ 已找到現有原生任務卡片，但其程序內狀態監測已停止；未建立重複卡片。",
-		LangJapanese:           "⚠️ 既存のネイティブタスクカードは見つかりましたが、プロセス内状態モニターは停止しています。重複カードは作成しませんでした。",
-		LangSpanish:            "⚠️ Se encontró una tarjeta de tarea nativa, pero su monitor de estado en proceso ya no está activo. No se creó una tarjeta duplicada.",
 	},
 	MsgTrackHealthVerified: {
 		LangEnglish:            "Task status confirmed at %s",

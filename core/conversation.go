@@ -1757,15 +1757,17 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackNativeCardExists, e.trackStatusLabel(string(turn.Status))))
 				return
 			}
-			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackNativeCardMonitorInactive))
+			// The persisted native card has no in-process update path after a
+			// restart or monitor loss. Fall through so /track can create (or
+			// refresh) a replacement tracker for the authoritative turn.
+		} else {
+			if _, _, syncErr := e.checkNativeTurnCardMonitor(e.ctx, monitor, snapshot); syncErr != nil {
+				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackReadFailed, syncErr))
+				return
+			}
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackNativeCardSynced, e.trackStatusLabel(string(turn.Status))))
 			return
 		}
-		if _, _, syncErr := e.checkNativeTurnCardMonitor(e.ctx, monitor, snapshot); syncErr != nil {
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackReadFailed, syncErr))
-			return
-		}
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackNativeCardSynced, e.trackStatusLabel(string(turn.Status))))
-		return
 	}
 	if destination, destinationErr := mirrorDestinationKey(p, msg.SessionKey); destinationErr == nil {
 		if delivery := e.trackStore.delivery(destination, sessionID, turn.ID, "primary"); delivery != nil && delivery.Source == "external" && delivery.CardHandle != "" {

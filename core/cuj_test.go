@@ -1997,11 +1997,11 @@ func TestCUJ_I9_ExternalBlockingQuestionMirrorLifecycle(t *testing.T) {
 		t.Fatalf("external question card = %#v", starts[0])
 	}
 
-	// Action 2: the first exact answer updates the same card to question 2/2
-	// without resolving the original daemon request yet.
+	// Action 2: a custom typed answer retires the old prompt and resends
+	// question 2/2, keeping the active question as the newest chat message.
 	e.ReceiveMessage(p, &Message{
 		SessionKey: key, Platform: p.Name(), MessageID: "i9-answer", UserID: "admin",
-		Content: action, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+		Content: "PostgreSQL", ReplyCtx: "ctx", ReferencedMessageID: "question-card-1",
 	})
 	select {
 	case response := <-agent.observer.responses:
@@ -2009,20 +2009,23 @@ func TestCUJ_I9_ExternalBlockingQuestionMirrorLifecycle(t *testing.T) {
 	default:
 	}
 	waitMirrorTest(t, "second question card", func() bool {
-		_, updates := p.questionSnapshot()
-		return len(updates) == 1 && updates[0].Header != nil && strings.Contains(updates[0].Header.Title, "(2/2)")
+		starts, updates := p.questionSnapshot()
+		return len(starts) == 2 && len(updates) == 1 && starts[1].Header != nil && strings.Contains(starts[1].Header.Title, "(2/2)")
 	})
-	_, updates := p.questionSnapshot()
-	secondAction := firstCardActionWithPrefix(updates[0], "trackq:")
-	if secondAction == "" || !strings.Contains(updates[0].RenderText(), "Which framework?") {
-		t.Fatalf("second question card = %#v", updates[0])
+	starts, updates := p.questionSnapshot()
+	if updates[0].Header == nil || updates[0].Header.Color != "green" || updates[0].HasButtons() {
+		t.Fatalf("retired first question card = %#v", updates[0])
+	}
+	secondAction := firstCardActionWithPrefix(starts[1], "trackq:")
+	if secondAction == "" || !strings.Contains(starts[1].RenderText(), "Which framework?") {
+		t.Fatalf("second question card = %#v", starts[1])
 	}
 
 	// Action 3: answering the second question submits both answers to the exact
 	// original request and makes the tracked card terminal.
 	e.ReceiveMessage(p, &Message{
 		SessionKey: key, Platform: p.Name(), MessageID: "i9-answer-2", UserID: "admin",
-		Content: secondAction, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+		Content: secondAction, ReplyCtx: "ctx", ReferencedMessageID: "question-card-2", IsCardAction: true,
 	})
 	select {
 	case response := <-agent.observer.responses:

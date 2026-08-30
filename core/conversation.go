@@ -14,15 +14,21 @@ import (
 )
 
 const (
-	trackSectionMaxBytes   = 6_000
-	trackReconcileMaxTurns = 256
-	trackPlanExecutePrefix = "plan:execute:"
+	trackSectionMaxBytes       = 6_000
+	trackReconcileMaxTurns     = 256
+	trackHealthDisplayInterval = 15 * time.Second
+	trackPlanExecutePrefix     = "plan:execute:"
 )
 
 type conversationTracker struct {
-	cancel    context.CancelFunc
-	sessionID string
-	turnID    string
+	cancel         context.CancelFunc
+	sessionID      string
+	turnID         string
+	health         ProgressCardHealth
+	lastVerifiedAt time.Time
+	firstFailureAt time.Time
+	lastSnapshot   *ConversationSnapshot
+	lastTurn       ConversationTurn
 }
 
 type conversationMirror struct {
@@ -852,6 +858,7 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 	if verifiedAt.IsZero() {
 		verifiedAt = time.Now()
 	}
+	verifiedAt = verifiedAt.Truncate(trackHealthDisplayInterval)
 	mirror.health = ProgressCardHealthVerified
 	mirror.lastVerifiedAt = verifiedAt
 	mirror.firstFailureAt = time.Time{}
@@ -1794,8 +1801,13 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 		}
 	}
 
+	verifiedAt := snapshot.RetrievedAt
+	if verifiedAt.IsZero() {
+		verifiedAt = time.Now()
+	}
+	verifiedAt = verifiedAt.Truncate(trackHealthDisplayInterval)
 	markdown := e.renderTrackMarkdown(snapshot, turn)
-	payload := e.renderTrackPayload(p, snapshot, turn, markdown, msg.SessionKey)
+	payload := e.renderTrackPayloadWithHealth(p, snapshot, turn, markdown, msg.SessionKey, true, ProgressCardHealthVerified, verifiedAt)
 	starter, hasStarter := p.(PreviewStarter)
 	updater, hasUpdater := p.(MessageUpdater)
 	if !hasStarter || !hasUpdater {
@@ -1818,7 +1830,11 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 	}
 
 	ctx, cancel := context.WithCancel(e.ctx)
-	tracker := &conversationTracker{cancel: cancel, sessionID: sessionID, turnID: turn.ID}
+	tracker := &conversationTracker{
+		cancel: cancel, sessionID: sessionID, turnID: turn.ID,
+		health: ProgressCardHealthVerified, lastVerifiedAt: verifiedAt,
+		lastSnapshot: snapshot, lastTurn: turn,
+	}
 	e.trackMu.Lock()
 	e.trackers[interactiveKey] = tracker
 	e.trackMu.Unlock()
@@ -2101,15 +2117,28 @@ func (e *Engine) runConversationTracker(ctx context.Context, tracker *conversati
 			if ctx.Err() == nil {
 				slog.Warn("track: backend refresh failed", "session", tracker.sessionID, "turn", tracker.turnID, "error", err)
 			}
+			e.updateConversationTrackerHealth(ctx, tracker, sessionKey, platform, updater, handle, &lastPayload, time.Now())
 			continue
 		}
 		turn, ok := conversationTurnByID(snapshot, tracker.turnID)
 		if !ok {
 			slog.Warn("track: pinned turn disappeared", "session", tracker.sessionID, "turn", tracker.turnID)
-			return
+			e.updateConversationTrackerHealth(ctx, tracker, sessionKey, platform, updater, handle, &lastPayload, time.Now())
+			continue
 		}
+		now := time.Now()
+		verifiedAt := snapshot.RetrievedAt
+		if verifiedAt.IsZero() {
+			verifiedAt = now
+		}
+		verifiedAt = verifiedAt.Truncate(trackHealthDisplayInterval)
+		tracker.health = ProgressCardHealthVerified
+		tracker.lastVerifiedAt = verifiedAt
+		tracker.firstFailureAt = time.Time{}
+		tracker.lastSnapshot = snapshot
+		tracker.lastTurn = turn
 		markdown := e.renderTrackMarkdown(snapshot, turn)
-		payload := e.renderTrackPayload(platform, snapshot, turn, markdown, sessionKey)
+		payload := e.renderTrackPayloadWithHealth(platform, snapshot, turn, markdown, sessionKey, true, tracker.health, tracker.lastVerifiedAt)
 		if payload != lastPayload {
 			if ctx.Err() != nil {
 				return
@@ -2124,6 +2153,37 @@ func (e *Engine) runConversationTracker(ctx context.Context, tracker *conversati
 			return
 		}
 	}
+}
+
+func (e *Engine) updateConversationTrackerHealth(ctx context.Context, tracker *conversationTracker, sessionKey string, platform Platform, updater MessageUpdater, handle any, lastPayload *string, now time.Time) {
+	if tracker == nil || tracker.lastSnapshot == nil || lastPayload == nil {
+		return
+	}
+	if tracker.firstFailureAt.IsZero() {
+		tracker.firstFailureAt = now
+	}
+	health := ProgressCardHealthReconnecting
+	if now.Sub(tracker.firstFailureAt) >= cardHealthUnknownAfter {
+		health = ProgressCardHealthUnknown
+	}
+	if tracker.health == health {
+		return
+	}
+	markdown := e.renderTrackMarkdown(tracker.lastSnapshot, tracker.lastTurn)
+	payload := e.renderTrackPayloadWithHealth(platform, tracker.lastSnapshot, tracker.lastTurn, markdown, sessionKey, true, health, tracker.lastVerifiedAt)
+	if payload == *lastPayload {
+		tracker.health = health
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if err := updater.UpdateMessage(ctx, handle, payload); err != nil {
+		slog.Warn("track: preview health update failed", "platform", platform.Name(), "error", err)
+		return
+	}
+	tracker.health = health
+	*lastPayload = payload
 }
 
 func latestConversationTurn(snapshot *ConversationSnapshot) (ConversationTurn, bool) {

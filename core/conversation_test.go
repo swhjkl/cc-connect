@@ -68,6 +68,29 @@ type trackActionPlatform struct {
 	buttons []CardButton
 }
 
+type trackHealthPreviewPlatform struct {
+	*trackPreviewPlatform
+	mu      sync.Mutex
+	options []RichCardRenderOptions
+}
+
+func newTrackHealthPreviewPlatform() *trackHealthPreviewPlatform {
+	return &trackHealthPreviewPlatform{trackPreviewPlatform: newTrackPreviewPlatform()}
+}
+
+func (p *trackHealthPreviewPlatform) BuildRichCardWithOptions(options RichCardRenderOptions) string {
+	p.mu.Lock()
+	p.options = append(p.options, options)
+	p.mu.Unlock()
+	return fmt.Sprintf("%#v", options)
+}
+
+func (p *trackHealthPreviewPlatform) getOptions() []RichCardRenderOptions {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]RichCardRenderOptions(nil), p.options...)
+}
+
 func (p *trackActionPlatform) BuildRichCard(_ CardStatus, _ string, _ []ToolStep, markdown string, _ bool, _ string) string {
 	return markdown
 }
@@ -1046,6 +1069,121 @@ func TestCmdTrack_UpdatesPinnedLatestTurnUntilCompletion(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for completed track update")
 	}
+}
+
+func TestCmdTrack_RunningCardShowsAndRefreshesStatusConfirmation(t *testing.T) {
+	confirmed1 := time.Date(2026, 8, 30, 12, 0, 1, 0, time.Local)
+	confirmed2 := confirmed1.Add(time.Minute)
+	visibleConfirmed1 := confirmed1.Truncate(trackHealthDisplayInterval)
+	visibleConfirmed2 := confirmed2.Truncate(trackHealthDisplayInterval)
+	running1 := &ConversationSnapshot{
+		SessionID: "thread-1", RetrievedAt: confirmed1,
+		Turns: []ConversationTurn{{
+			ID: "turn-1", Status: ConversationTurnInProgress,
+			Messages: []ConversationMessage{{Role: "user", Content: "long task"}},
+		}},
+	}
+	running2 := &ConversationSnapshot{
+		SessionID: "thread-1", RetrievedAt: confirmed2,
+		Turns: []ConversationTurn{{
+			ID: "turn-1", Status: ConversationTurnInProgress,
+			Messages: []ConversationMessage{
+				{Role: "user", Content: "long task"},
+				{Role: "assistant", Content: "still working", Phase: "commentary"},
+			},
+		}},
+	}
+	agent := &authoritativeConversationAgent{snapshots: []*ConversationSnapshot{running1, running2}}
+	p := newTrackHealthPreviewPlatform()
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	defer e.cancel()
+	e.SetAdminFrom("admin")
+	key := "feishu:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", "codex")
+
+	e.handleCommand(p, &Message{SessionKey: key, Platform: "feishu", UserID: "admin", ReplyCtx: "ctx"}, "/track")
+	options := p.getOptions()
+	if len(options) == 0 || !strings.Contains(options[0].StatusFooter, "Task status confirmed at "+visibleConfirmed1.Format("15:04:05")) {
+		t.Fatalf("initial track health options = %#v", options)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		options = p.getOptions()
+		if len(options) >= 2 && strings.Contains(options[len(options)-1].StatusFooter, "Task status confirmed at "+visibleConfirmed2.Format("15:04:05")) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("track confirmation was not refreshed: options=%#v calls=%d", options, agent.callCount())
+}
+
+func TestConversationTracker_ReadFailureIsVisibleOnReplacementCard(t *testing.T) {
+	p := newTrackHealthPreviewPlatform()
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	turn := ConversationTurn{
+		ID: "turn-1", Status: ConversationTurnInProgress,
+		Messages: []ConversationMessage{{Role: "user", Content: "long task"}},
+	}
+	confirmedAt := time.Date(2026, 8, 30, 12, 0, 1, 0, time.Local)
+	snapshot := &ConversationSnapshot{SessionID: "thread-1", RetrievedAt: confirmedAt, Turns: []ConversationTurn{turn}}
+	tracker := &conversationTracker{
+		sessionID: "thread-1", turnID: "turn-1", health: ProgressCardHealthVerified,
+		lastVerifiedAt: confirmedAt, lastSnapshot: snapshot, lastTurn: turn,
+	}
+	markdown := e.renderTrackMarkdown(snapshot, turn)
+	lastPayload := e.renderTrackPayloadWithHealth(p, snapshot, turn, markdown, "feishu:chat:admin", true, tracker.health, confirmedAt)
+
+	now := confirmedAt.Add(time.Second)
+	e.updateConversationTrackerHealth(e.ctx, tracker, "feishu:chat:admin", p, p, "card", &lastPayload, now)
+	options := p.getOptions()
+	last := options[len(options)-1]
+	if tracker.health != ProgressCardHealthReconnecting || !strings.Contains(last.StatusFooter, "Reconnecting to task status") {
+		t.Fatalf("reconnecting replacement card = tracker %#v options %#v", tracker, options)
+	}
+
+	tracker.firstFailureAt = now.Add(-cardHealthUnknownAfter)
+	e.updateConversationTrackerHealth(e.ctx, tracker, "feishu:chat:admin", p, p, "card", &lastPayload, now)
+	options = p.getOptions()
+	last = options[len(options)-1]
+	if tracker.health != ProgressCardHealthUnknown || !strings.Contains(last.StatusFooter, "Task status unknown") {
+		t.Fatalf("unknown replacement card = tracker %#v options %#v", tracker, options)
+	}
+}
+
+func TestConversationTracker_RecoversVisibleConfirmationAfterReadFailure(t *testing.T) {
+	confirmed1 := time.Date(2026, 8, 30, 12, 0, 1, 0, time.Local)
+	confirmed2 := confirmed1.Add(time.Minute)
+	turn := ConversationTurn{
+		ID: "turn-1", Status: ConversationTurnInProgress,
+		Messages: []ConversationMessage{{Role: "user", Content: "long task"}},
+	}
+	agent := newMirrorTestAgent(&ConversationSnapshot{SessionID: "thread-1", RetrievedAt: confirmed1, Turns: []ConversationTurn{turn}})
+	p := newTrackHealthPreviewPlatform()
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	defer e.cancel()
+	e.SetAdminFrom("admin")
+	key := "feishu:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+
+	e.handleCommand(p, &Message{SessionKey: key, Platform: "feishu", UserID: "admin", ReplyCtx: "ctx"}, "/track")
+	agent.mu.Lock()
+	agent.readErr = errors.New("temporary backend failure")
+	agent.mu.Unlock()
+	waitMirrorTest(t, "replacement card reconnecting state", func() bool {
+		options := p.getOptions()
+		return len(options) > 0 && strings.Contains(options[len(options)-1].StatusFooter, "Reconnecting to task status")
+	})
+
+	agent.setSnapshot(&ConversationSnapshot{SessionID: "thread-1", RetrievedAt: confirmed2, Turns: []ConversationTurn{turn}})
+	agent.mu.Lock()
+	agent.readErr = nil
+	agent.mu.Unlock()
+	want := "Task status confirmed at " + confirmed2.Truncate(trackHealthDisplayInterval).Format("15:04:05")
+	waitMirrorTest(t, "replacement card confirmed after recovery", func() bool {
+		options := p.getOptions()
+		return len(options) > 0 && strings.Contains(options[len(options)-1].StatusFooter, want)
+	})
 }
 
 func TestCmdTrack_DoesNotBlockFollowingFeishuConversation(t *testing.T) {

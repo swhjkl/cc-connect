@@ -493,14 +493,24 @@ type ConversationActivity struct {
 	Success  *bool
 }
 
+// ConversationPendingInput is a persisted, structured user-input request on
+// an in-progress backend turn. It deliberately excludes the transport request
+// ID because that identifier is only valid on the connection that received
+// the original server request.
+type ConversationPendingInput struct {
+	ItemID    string
+	Questions []UserQuestion
+}
+
 // ConversationTurn is one authoritative backend turn.
 type ConversationTurn struct {
-	ID          string
-	Status      ConversationTurnStatus
-	StartedAt   time.Time
-	CompletedAt time.Time
-	Messages    []ConversationMessage
-	Activities  []ConversationActivity
+	ID           string
+	Status       ConversationTurnStatus
+	StartedAt    time.Time
+	CompletedAt  time.Time
+	Messages     []ConversationMessage
+	Activities   []ConversationActivity
+	PendingInput *ConversationPendingInput
 	// PresentationEvents uses the same sanitized event vocabulary as a live
 	// foreground turn. Providers should populate it when exact card parity is
 	// available; core derives a conservative fallback from Messages/Activities.

@@ -2146,6 +2146,119 @@ func TestCUJ_I9_ExternalBlockingQuestionMirrorLifecycle(t *testing.T) {
 	})
 }
 
+// CUJ-I10 · A newly attached Codex task can persist a Plan-mode question on
+// the writer connection without replaying the server request to cc-connect's
+// observer. The mirror recovers that question from the snapshot, and the card
+// answer continues only the exact blocked turn.
+func TestCUJ_I10_SnapshotOnlyPlanQuestionContinuesExactTurn(t *testing.T) {
+	agent := newInteractiveQuestionMirrorAgent(mirrorTestSnapshot("thread-plan", ConversationTurn{}))
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, t.TempDir()+"/sessions.json", LangEnglish)
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-plan", agent.Name())
+	e.sessions.Save()
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer e.Stop()
+	select {
+	case <-agent.opened:
+	case <-time.After(2 * time.Second):
+		t.Fatal("interactive conversation observer did not open")
+	}
+	waitMirrorTest(t, "new task attachment", func() bool { return agent.readCount() > 0 })
+
+	// Action 1: the external writer emits commentary and then blocks. The
+	// observer deliberately receives no EventPermissionRequest; only the
+	// authoritative snapshot contains request_user_input.
+	questions := []UserQuestion{{
+		Question: "Which scope should I implement?", Header: "Scope",
+		Options: []UserQuestionOption{{Label: "Repository", Description: "Apply the complete fix"}, {Label: "Tests only", Description: "Limit changes to tests"}},
+	}}
+	running := ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnInProgress, StartedAt: time.Now(),
+		Messages: []ConversationMessage{
+			{Role: "user", Content: "Plan and implement the fix"},
+			{Role: "assistant", Content: "I inspected the code and need one choice.", Phase: "commentary"},
+		},
+		PendingInput: &ConversationPendingInput{ItemID: "question-plan", Questions: questions},
+	}
+	waiting := mirrorTestSnapshot("thread-plan", running)
+	waiting.ActiveFlags = []string{"waitingOnUserInput"}
+	agent.setSnapshot(waiting)
+	agent.observer.events <- Event{
+		Type: EventThinking, ThreadID: "thread-plan", TurnID: "turn-plan",
+		Content: "I inspected the code and need one choice.",
+	}
+	waitMirrorTest(t, "snapshot-only Plan question", func() bool {
+		starts, _ := p.questionSnapshot()
+		return len(starts) == 1 && strings.Contains(starts[0].RenderText(), "Which scope should I implement?")
+	})
+	starts, _ := p.questionSnapshot()
+	action := firstCardActionWithPrefix(starts[0], "trackq:")
+	if action == "" {
+		t.Fatalf("snapshot-only question has no action: %#v", starts[0])
+	}
+	select {
+	case response := <-agent.observer.responses:
+		t.Fatalf("observer unexpectedly received a request to answer: %#v", response)
+	default:
+	}
+
+	// Action 2: clicking the option revalidates the persisted item and uses an
+	// exact expected-turn steer. It never creates a new turn or replies through
+	// an observer request ID that this client did not receive.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "i10-answer", UserID: "admin",
+		Content: action, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+	})
+	agent.mu.Lock()
+	steers := append([][4]string(nil), agent.steers...)
+	agent.mu.Unlock()
+	if len(steers) != 1 || steers[0][0] != "thread-plan" || steers[0][1] != "turn-plan" ||
+		!strings.Contains(steers[0][2], "Repository") || steers[0][3] == "" {
+		t.Fatalf("snapshot-only exact steer = %#v", steers)
+	}
+	waitMirrorTest(t, "snapshot question controls retired", func() bool {
+		_, updates := p.questionSnapshot()
+		if len(updates) == 0 {
+			return false
+		}
+		last := updates[len(updates)-1]
+		return last.Header != nil && last.Header.Color == "green" && !last.HasButtons()
+	})
+
+	// Action 3: the steered turn continues and completes. The user-visible
+	// progress card reaches a terminal state, proving the journey no longer
+	// stalls at waitingOnUserInput.
+	completed := running
+	completed.Status = ConversationTurnCompleted
+	completed.CompletedAt = time.Now()
+	completed.PendingInput = nil
+	completed.Messages = append(completed.Messages, ConversationMessage{
+		Role: "assistant", Content: "Implemented the complete fix.", Phase: "final_answer",
+	})
+	agent.setSnapshot(mirrorTestSnapshot("thread-plan", completed))
+	agent.observer.events <- Event{Type: EventConversationChanged, ThreadID: "thread-plan", TurnID: "turn-plan"}
+	waitMirrorTest(t, "snapshot-only Plan turn completion", func() bool {
+		p.trackMu.Lock()
+		defer p.trackMu.Unlock()
+		if len(p.options) == 0 {
+			return false
+		}
+		last := p.options[len(p.options)-1]
+		return last.Status == CardStatusDone && !last.Streaming && strings.Contains(last.Markdown, "Implemented the complete fix.")
+	})
+	p.trackMu.Lock()
+	progressStarts := len(p.starts)
+	p.trackMu.Unlock()
+	if progressStarts != 1 {
+		t.Fatalf("snapshot-only journey created %d progress cards, want 1", progressStarts)
+	}
+}
+
 // CUJ-I7 · Session lifecycle commands move the mirror binding atomically. An
 // old shared thread must not continue posting after /switch or /new.
 func TestCUJ_I7_SessionCommandsRebindMirror(t *testing.T) {

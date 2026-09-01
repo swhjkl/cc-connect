@@ -140,6 +140,7 @@ type mirrorTestAgent struct {
 	events     chan Event
 	readErr    error
 	watchErr   error
+	steerErr   error
 	reads      int
 	watches    int
 	interrupts [][2]string
@@ -275,9 +276,9 @@ func (a *mirrorTestAgent) InterruptConversationTurn(_ context.Context, sessionID
 
 func (a *mirrorTestAgent) SteerConversationTurn(_ context.Context, sessionID, turnID, input, clientID string, _ []ImageAttachment, _ []FileAttachment) error {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.steers = append(a.steers, [4]string{sessionID, turnID, input, clientID})
-	a.mu.Unlock()
-	return nil
+	return a.steerErr
 }
 
 func (a *mirrorTestAgent) setSnapshot(snapshot *ConversationSnapshot) {
@@ -829,6 +830,390 @@ func TestConversationMirror_SubscribesBeforeInitialReconcileSoPlanQuestionIsNotL
 	}
 }
 
+func TestConversationMirror_RecoversSnapshotOnlyPlanQuestionAndSteersExactTurn(t *testing.T) {
+	questions := []UserQuestion{
+		{
+			Question: "Which scope?", Header: "Scope",
+			Options: []UserQuestionOption{{Label: "Repository", Description: "Inspect all files"}, {Label: "Diff", Description: "Inspect changed files"}},
+		},
+		{
+			Question: "Which checks?", Header: "Checks",
+			Options: []UserQuestionOption{{Label: "Unit tests"}, {Label: "Full suite"}},
+		},
+	}
+	snapshot := mirrorTestSnapshot("thread-1", ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnInProgress,
+		Messages: []ConversationMessage{
+			{Role: "user", Content: "Plan the change"},
+			{Role: "assistant", Content: "I need two choices.", Phase: "commentary"},
+		},
+		PendingInput: &ConversationPendingInput{ItemID: "question-plan", Questions: questions},
+	})
+	snapshot.ActiveFlags = []string{"waitingOnUserInput"}
+	agent := newMirrorTestAgent(snapshot)
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatalf("bindConversationMirror() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	t.Cleanup(cancel)
+	mirror := &conversationMirror{
+		cancel: cancel, destination: binding.Destination, sessionKey: binding.SessionKey,
+		threadID: binding.ThreadID, generation: binding.Generation, wake: make(chan struct{}, 1),
+		platform: p, handles: make(map[string]any),
+	}
+	e.trackMu.Lock()
+	e.conversationMirrors[binding.Destination] = mirror
+	e.trackMu.Unlock()
+
+	// No EventPermissionRequest is emitted. The authoritative snapshot alone
+	// must recover one actionable card, and repeated watchdog reads must not
+	// create duplicates.
+	if err := e.reconcileConversationMirror(ctx, mirror, agent, e.sessions, p); err != nil {
+		t.Fatalf("initial snapshot reconciliation error = %v", err)
+	}
+	if err := e.reconcileConversationMirror(ctx, mirror, agent, e.sessions, p); err != nil {
+		t.Fatalf("repeated snapshot reconciliation error = %v", err)
+	}
+	starts, _ := p.questionSnapshot()
+	if len(starts) != 1 || !strings.Contains(starts[0].RenderText(), "Which scope?") {
+		t.Fatalf("snapshot question cards = %#v, want one first question", starts)
+	}
+
+	// Answering question 1 advances the same card lifecycle without steering
+	// yet; answering question 2 revalidates the exact item and steers only the
+	// expected in-progress turn.
+	firstAction := firstCardActionWithPrefix(starts[0], "trackq:")
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "snapshot-answer-1", UserID: "admin",
+		Content: firstAction, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+	})
+	starts, _ = p.questionSnapshot()
+	if len(starts) != 1 {
+		t.Fatalf("snapshot question starts after advance = %d, want 1", len(starts))
+	}
+	mirror.mu.Lock()
+	currentCardID := mirror.pending.cardMessageID
+	mirror.mu.Unlock()
+	secondAction := firstCardActionWithPrefix(starts[0], "trackq:")
+	if currentCardID == "" || secondAction == "" || !strings.Contains(starts[0].RenderText(), "Which checks?") {
+		// The test platform updates in place, so inspect its latest update when
+		// the original start snapshot still contains question 1.
+		_, updates := p.questionSnapshot()
+		if len(updates) == 0 {
+			t.Fatalf("second snapshot question was not rendered: starts=%#v updates=%#v", starts, updates)
+		}
+		secondAction = firstCardActionWithPrefix(updates[len(updates)-1], "trackq:")
+	}
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "snapshot-answer-2", UserID: "admin",
+		Content: secondAction, ReplyCtx: "ctx", ReferencedMessageID: currentCardID, IsCardAction: true,
+	})
+
+	agent.mu.Lock()
+	steers := append([][4]string(nil), agent.steers...)
+	agent.mu.Unlock()
+	if len(steers) != 1 || steers[0][0] != "thread-1" || steers[0][1] != "turn-plan" {
+		t.Fatalf("snapshot answer steers = %#v", steers)
+	}
+	if !strings.Contains(steers[0][2], "Which scope?") || !strings.Contains(steers[0][2], "Repository") ||
+		!strings.Contains(steers[0][2], "Which checks?") || !strings.Contains(steers[0][2], "Unit tests") || steers[0][3] == "" {
+		t.Fatalf("snapshot steer payload = %#v", steers[0])
+	}
+	_, updates := p.questionSnapshot()
+	if len(updates) == 0 || updates[len(updates)-1].Header == nil || updates[len(updates)-1].Header.Color != "green" || updates[len(updates)-1].HasButtons() {
+		t.Fatalf("snapshot answer did not retire controls: %#v", updates)
+	}
+}
+
+func TestConversationMirror_LatePermissionEventUpgradesSnapshotQuestionWithoutDuplicate(t *testing.T) {
+	questions := []UserQuestion{{Question: "Which database?", Options: []UserQuestionOption{{Label: "Postgres"}}}}
+	snapshot := mirrorTestSnapshot("thread-1", ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnInProgress,
+		Messages:     []ConversationMessage{{Role: "user", Content: "Plan it"}},
+		PendingInput: &ConversationPendingInput{ItemID: "question-plan", Questions: questions},
+	})
+	snapshot.ActiveFlags = []string{"waitingOnUserInput"}
+	agent := newMirrorTestAgent(snapshot)
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	t.Cleanup(cancel)
+	mirror := &conversationMirror{
+		cancel: cancel, destination: binding.Destination, sessionKey: binding.SessionKey,
+		threadID: binding.ThreadID, generation: binding.Generation, wake: make(chan struct{}, 1), platform: p, handles: make(map[string]any),
+	}
+	e.trackMu.Lock()
+	e.conversationMirrors[binding.Destination] = mirror
+	e.trackMu.Unlock()
+	if err := e.reconcileConversationMirror(ctx, mirror, agent, e.sessions, p); err != nil {
+		t.Fatal(err)
+	}
+	observer := newMirrorQuestionObserver()
+	e.handleConversationElicitation(ctx, mirror, e.sessions, p, observer, Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-plan", ItemID: "question-plan",
+		RequestID: "request-plan", ToolName: "AskUserQuestion", Questions: questions,
+	})
+	starts, _ := p.questionSnapshot()
+	if len(starts) != 1 {
+		t.Fatalf("late event duplicated snapshot card: %d", len(starts))
+	}
+	action := firstCardActionWithPrefix(starts[0], "trackq:")
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "late-answer", UserID: "admin",
+		Content: action, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+	})
+	select {
+	case response := <-observer.responses:
+		if response.requestID != "request-plan" {
+			t.Fatalf("late observer response = %#v", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late permission event did not upgrade snapshot question")
+	}
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	if len(agent.steers) != 0 {
+		t.Fatalf("upgraded request unexpectedly used turn steering: %#v", agent.steers)
+	}
+}
+
+func TestConversationMirror_SnapshotQuestionExpiresBeforeStaleCallback(t *testing.T) {
+	questions := []UserQuestion{{Question: "Which database?", Options: []UserQuestionOption{{Label: "Postgres"}}}}
+	snapshot := mirrorTestSnapshot("thread-1", ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnInProgress,
+		PendingInput: &ConversationPendingInput{ItemID: "question-plan", Questions: questions},
+	})
+	snapshot.ActiveFlags = []string{"waitingOnUserInput"}
+	agent := newMirrorTestAgent(snapshot)
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	t.Cleanup(cancel)
+	mirror := &conversationMirror{
+		cancel: cancel, destination: binding.Destination, sessionKey: binding.SessionKey,
+		threadID: binding.ThreadID, generation: binding.Generation, wake: make(chan struct{}, 1), platform: p, handles: make(map[string]any),
+	}
+	e.trackMu.Lock()
+	e.conversationMirrors[binding.Destination] = mirror
+	e.trackMu.Unlock()
+	if err := e.reconcileConversationMirror(ctx, mirror, agent, e.sessions, p); err != nil {
+		t.Fatal(err)
+	}
+	starts, _ := p.questionSnapshot()
+	if len(starts) != 1 {
+		t.Fatalf("snapshot question cards = %d, want 1", len(starts))
+	}
+	action := firstCardActionWithPrefix(starts[0], "trackq:")
+
+	// The backend has continued and no longer reports the pending item. The
+	// card must become terminal before an old callback can steer a new turn.
+	agent.setSnapshot(mirrorTestSnapshot("thread-1", ConversationTurn{ID: "turn-plan", Status: ConversationTurnInProgress}))
+	if err := e.reconcileConversationMirror(ctx, mirror, agent, e.sessions, p); err != nil {
+		t.Fatal(err)
+	}
+	_, updates := p.questionSnapshot()
+	if len(updates) == 0 || updates[len(updates)-1].Header == nil || updates[len(updates)-1].Header.Color != "grey" || updates[len(updates)-1].HasButtons() {
+		t.Fatalf("expired snapshot question card = %#v", updates)
+	}
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "stale-answer", UserID: "admin",
+		Content: action, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+	})
+	agent.mu.Lock()
+	steers := append([][4]string(nil), agent.steers...)
+	agent.mu.Unlock()
+	if len(steers) != 0 || !strings.Contains(strings.Join(p.getSent(), "\n"), e.i18n.T(MsgTrackSteerStale)) {
+		t.Fatalf("stale snapshot callback did not fail closed: steers=%#v sent=%q", steers, strings.Join(p.getSent(), "\n"))
+	}
+}
+
+func TestConversationMirror_SnapshotQuestionSteerFailureRemainsRetryable(t *testing.T) {
+	questions := []UserQuestion{{Question: "Which database?", Options: []UserQuestionOption{{Label: "Postgres"}}}}
+	snapshot := mirrorTestSnapshot("thread-1", ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnInProgress,
+		PendingInput: &ConversationPendingInput{ItemID: "question-plan", Questions: questions},
+	})
+	snapshot.ActiveFlags = []string{"waitingOnUserInput"}
+	agent := newMirrorTestAgent(snapshot)
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	t.Cleanup(cancel)
+	mirror := &conversationMirror{
+		cancel: cancel, destination: binding.Destination, sessionKey: binding.SessionKey,
+		threadID: binding.ThreadID, generation: binding.Generation, wake: make(chan struct{}, 1), platform: p, handles: make(map[string]any),
+	}
+	e.trackMu.Lock()
+	e.conversationMirrors[binding.Destination] = mirror
+	e.trackMu.Unlock()
+	if err := e.reconcileConversationMirror(ctx, mirror, agent, e.sessions, p); err != nil {
+		t.Fatal(err)
+	}
+	starts, _ := p.questionSnapshot()
+	action := firstCardActionWithPrefix(starts[0], "trackq:")
+
+	// Shared-chat answers remain administrator-only for snapshot recovery too.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "guest-answer", UserID: "guest",
+		Content: action, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+	})
+	agent.mu.Lock()
+	if len(agent.steers) != 0 {
+		t.Fatalf("non-admin snapshot answer steered the turn: %#v", agent.steers)
+	}
+	agent.steerErr = errors.New("turn/steer unavailable")
+	agent.mu.Unlock()
+
+	// A failed exact steer leaves the same controls actionable for a retry.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "failed-answer", UserID: "admin",
+		Content: action, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+	})
+	mirror.mu.Lock()
+	retryable := mirror.pending != nil && !mirror.pending.resolved && !mirror.pending.submitting && mirror.pending.actionable
+	mirror.mu.Unlock()
+	if !retryable || !strings.Contains(strings.Join(p.getSent(), "\n"), "turn/steer unavailable") {
+		t.Fatalf("failed snapshot steer was not retryable: retryable=%t sent=%q", retryable, strings.Join(p.getSent(), "\n"))
+	}
+	agent.mu.Lock()
+	agent.steerErr = nil
+	agent.mu.Unlock()
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "retry-answer", UserID: "admin",
+		Content: action, ReplyCtx: "ctx", ReferencedMessageID: "question-card-1", IsCardAction: true,
+	})
+	agent.mu.Lock()
+	steers := append([][4]string(nil), agent.steers...)
+	agent.mu.Unlock()
+	_, updates := p.questionSnapshot()
+	if len(steers) != 2 || len(updates) == 0 || updates[len(updates)-1].Header == nil || updates[len(updates)-1].Header.Color != "green" || updates[len(updates)-1].HasButtons() {
+		t.Fatalf("snapshot steer retry did not resolve: steers=%#v updates=%#v", steers, updates)
+	}
+}
+
+func TestConversationMirror_SnapshotSecretQuestionCannotBeAnsweredInSharedChat(t *testing.T) {
+	secret := []UserQuestion{{Question: "Enter the deployment token", Secret: true}}
+	snapshot := mirrorTestSnapshot("thread-1", ConversationTurn{
+		ID: "turn-plan", Status: ConversationTurnInProgress,
+		PendingInput: &ConversationPendingInput{ItemID: "secret-plan", Questions: secret},
+	})
+	snapshot.ActiveFlags = []string{"waitingOnUserInput"}
+	agent := newMirrorTestAgent(snapshot)
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	t.Cleanup(cancel)
+	mirror := &conversationMirror{
+		cancel: cancel, destination: binding.Destination, sessionKey: binding.SessionKey,
+		threadID: binding.ThreadID, generation: binding.Generation, wake: make(chan struct{}, 1), platform: p, handles: make(map[string]any),
+	}
+	e.trackMu.Lock()
+	e.conversationMirrors[binding.Destination] = mirror
+	e.trackMu.Unlock()
+	if err := e.reconcileConversationMirror(ctx, mirror, agent, e.sessions, p); err != nil {
+		t.Fatal(err)
+	}
+	starts, _ := p.questionSnapshot()
+	if len(starts) != 1 || starts[0].HasButtons() || !strings.Contains(starts[0].RenderText(), e.i18n.T(MsgAskQuestionSensitiveExternal)) {
+		t.Fatalf("snapshot secret question card = %#v", starts)
+	}
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key, Platform: p.Name(), MessageID: "secret-answer", UserID: "admin",
+		Content: "top-secret", ReplyCtx: "ctx", ReferencedMessageID: "question-card-1",
+	})
+	agent.mu.Lock()
+	steers := append([][4]string(nil), agent.steers...)
+	agent.mu.Unlock()
+	visible := strings.Join(p.getSent(), "\n")
+	if len(steers) != 0 || strings.Contains(visible, "top-secret") || !strings.Contains(visible, e.i18n.T(MsgAskQuestionSensitiveExternal)) {
+		t.Fatalf("snapshot secret answer handling: steers=%#v sent=%q", steers, visible)
+	}
+}
+
+func TestConversationMirror_LiveQuestionSurvivesLaggingSnapshot(t *testing.T) {
+	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{ID: "turn-plan", Status: ConversationTurnInProgress}))
+	p := newMirrorQuestionPlatform()
+	e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	t.Cleanup(e.cancel)
+	e.SetAdminFrom("admin")
+	e.SetTrackCfg(TrackCfg{Enabled: true, DefaultEnabled: true, Notify: "never", SharedWrite: "observer_only"})
+	key := "mirror:chat:admin"
+	e.sessions.GetOrCreateActive(key).SetAgentSessionID("thread-1", agent.Name())
+	binding, err := e.bindConversationMirror(p, key, "thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(e.ctx)
+	t.Cleanup(cancel)
+	mirror := &conversationMirror{
+		cancel: cancel, destination: binding.Destination, sessionKey: binding.SessionKey,
+		threadID: binding.ThreadID, generation: binding.Generation, wake: make(chan struct{}, 1), platform: p, handles: make(map[string]any),
+	}
+	e.trackMu.Lock()
+	e.conversationMirrors[binding.Destination] = mirror
+	e.trackMu.Unlock()
+	observer := newMirrorQuestionObserver()
+	e.handleConversationElicitation(ctx, mirror, e.sessions, p, observer, Event{
+		Type: EventPermissionRequest, ThreadID: "thread-1", TurnID: "turn-plan", ItemID: "question-plan",
+		RequestID: "request-plan", ToolName: "AskUserQuestion",
+		Questions: []UserQuestion{{Question: "Which database?", Options: []UserQuestionOption{{Label: "Postgres"}}}},
+	})
+	if err := e.reconcileConversationMirror(ctx, mirror, agent, e.sessions, p); err != nil {
+		t.Fatal(err)
+	}
+	mirror.mu.Lock()
+	active := mirror.pending != nil && !mirror.pending.resolved && mirror.pending.responder == observer
+	mirror.mu.Unlock()
+	_, updates := p.questionSnapshot()
+	if !active || len(updates) != 0 {
+		t.Fatalf("lagging snapshot invalidated live question: active=%t updates=%#v", active, updates)
+	}
+}
+
 func TestConversationMirror_BlockingQuestionIsVisibleAnswerableAndInvalidated(t *testing.T) {
 	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
 	p := newMirrorQuestionPlatform()
@@ -888,13 +1273,13 @@ func TestConversationMirror_BlockingQuestionIsVisibleAnswerableAndInvalidated(t 
 	// closed. Only a real callback from the exact source card reaches Codex.
 	if e.handleTrackedConversationElicitationInput(p, &Message{
 		SessionKey: key, UserID: "admin", Content: action, ReplyCtx: "ctx",
-	}, action, e.sessions) {
+	}, action, agent, e.sessions) {
 		t.Fatal("typed trackq look-alike was consumed as a card action")
 	}
 	if !e.handleTrackedConversationElicitationInput(p, &Message{
 		SessionKey: key, UserID: "admin", Content: action, ReplyCtx: "ctx",
 		ReferencedMessageID: "copied-card", IsCardAction: true,
-	}, action, e.sessions) {
+	}, action, agent, e.sessions) {
 		t.Fatal("copied-card action should be consumed as stale")
 	}
 	select {

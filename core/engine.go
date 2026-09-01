@@ -3094,7 +3094,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if e.handleTurnCardAction(p, msg, content, agent, sessions, interactiveKey) {
 		return
 	}
-	if e.handleTrackedConversationElicitationInput(p, msg, directContent, sessions) {
+	if e.handleTrackedConversationElicitationInput(p, msg, directContent, agent, sessions) {
 		return
 	}
 

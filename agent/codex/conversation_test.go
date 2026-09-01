@@ -123,6 +123,79 @@ func TestMapAppServerConversationTurn_HidesRequestUserInputTransportJSON(t *test
 	}
 }
 
+func TestMapAppServerConversationTurn_RecoversPendingRequestUserInput(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments any
+	}{
+		{
+			name: "object arguments",
+			arguments: map[string]any{"questions": []any{
+				map[string]any{
+					"id": "scope", "header": "Scope", "question": "Which scope?", "isOther": true,
+					"options": []any{
+						map[string]any{"label": "Repository", "description": "Inspect all files"},
+						map[string]any{"label": "Diff", "description": "Inspect changed files"},
+					},
+				},
+				map[string]any{
+					"id": "token", "header": "Secret", "question": "Enter the token", "isSecret": true,
+				},
+			}},
+		},
+		{
+			name:      "JSON string arguments",
+			arguments: `{"questions":[{"id":"scope","header":"Scope","question":"Which scope?","isOther":true,"options":[{"label":"Repository","description":"Inspect all files"},{"label":"Diff","description":"Inspect changed files"}]},{"id":"token","header":"Secret","question":"Enter the token","isSecret":true}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mapped := mapAppServerConversationTurn(appServerConversationTurn{
+				ID: "turn-waiting", Status: "inProgress",
+				Items: []map[string]any{
+					{"type": "agentMessage", "id": "commentary", "text": "I need two choices."},
+					{
+						"type": "dynamicToolCall", "id": "question-1", "tool": "request_user_input",
+						"status": "inProgress", "arguments": tt.arguments,
+					},
+				},
+			})
+
+			if mapped.PendingInput == nil || mapped.PendingInput.ItemID != "question-1" {
+				t.Fatalf("pending input = %#v", mapped.PendingInput)
+			}
+			questions := mapped.PendingInput.Questions
+			if len(questions) != 2 || questions[0].Question != "Which scope?" || questions[0].Header != "Scope" {
+				t.Fatalf("questions = %#v", questions)
+			}
+			if len(questions[0].Options) != 2 || questions[0].Options[0].Label != "Repository" ||
+				questions[0].Options[1].Description != "Inspect changed files" || !questions[1].Secret {
+				t.Fatalf("question details = %#v", questions)
+			}
+			if len(mapped.Activities) != 0 {
+				t.Fatalf("request_user_input activities = %#v, want none", mapped.Activities)
+			}
+			if len(mapped.PresentationEvents) != 1 || mapped.PresentationEvents[0].Content != "I need two choices." {
+				t.Fatalf("presentation = %#v", mapped.PresentationEvents)
+			}
+		})
+	}
+}
+
+func TestMapAppServerConversationTurn_DoesNotRecoverCompletedRequestUserInput(t *testing.T) {
+	mapped := mapAppServerConversationTurn(appServerConversationTurn{
+		ID: "turn-running", Status: "inProgress",
+		Items: []map[string]any{{
+			"type": "dynamicToolCall", "id": "question-1", "tool": "request_user_input", "status": "completed",
+			"arguments": map[string]any{"questions": []any{map[string]any{"id": "scope", "question": "Which scope?"}}},
+		}},
+	})
+	if mapped.PendingInput != nil {
+		t.Fatalf("completed pending input = %#v, want nil", mapped.PendingInput)
+	}
+}
+
 func TestAgentGetConversation_ReadsDaemonWithoutResumingThread(t *testing.T) {
 	daemon := newFakeSharedAppServerDaemon(t)
 	workDir := t.TempDir()
@@ -135,6 +208,10 @@ func TestAgentGetConversation_ReadsDaemonWithoutResumingThread(t *testing.T) {
 				map[string]any{"type": "agentMessage", "id": "a-new", "text": "Working on it.", "phase": "commentary"},
 				map[string]any{"type": "commandExecution", "id": "tool-new", "command": "cat /secret/path", "status": "inProgress"},
 				map[string]any{"type": "reasoning", "id": "r-new", "summary": []any{"private reasoning"}},
+				map[string]any{
+					"type": "dynamicToolCall", "id": "question-new", "tool": "request_user_input", "status": "inProgress",
+					"arguments": `{"questions":[{"id":"scope","header":"Scope","question":"Which scope?","options":[{"label":"Repository","description":"Inspect all files"}]}]}`,
+				},
 			},
 		},
 		{
@@ -193,6 +270,10 @@ func TestAgentGetConversation_ReadsDaemonWithoutResumingThread(t *testing.T) {
 	}
 	if got := latest.Messages[0].ClientID; got != "message-marker" {
 		t.Fatalf("user message client marker = %q, want message-marker", got)
+	}
+	if latest.PendingInput == nil || latest.PendingInput.ItemID != "question-new" ||
+		len(latest.PendingInput.Questions) != 1 || latest.PendingInput.Questions[0].Question != "Which scope?" {
+		t.Fatalf("latest pending input = %#v", latest.PendingInput)
 	}
 	presentation := latest.PresentationEvents
 	if len(presentation) != 3 {
@@ -303,7 +384,7 @@ func TestAgentWatchConversation_IsReadOnlyAndFiltersThreadEvents(t *testing.T) {
 		t.Fatal("timed out waiting for identified observer event")
 	}
 
-	daemon.broadcastRequest(t, 72, "item/tool/requestUserInput", map[string]any{
+	daemon.sendRequestToClient(t, clients[0], 72, "item/tool/requestUserInput", map[string]any{
 		"threadId": threadID, "turnId": "turn-live", "itemId": "question-passive",
 		"questions": []any{map[string]any{
 			"id": "database", "question": "Should passive watch answer?",
@@ -341,7 +422,7 @@ func TestAgentOpenConversationObserver_ResumesAndAnswersSharedUserInput(t *testi
 		t.Fatal("interactive observer thread/resume excludeTurns = false, want true")
 	}
 
-	daemon.broadcastRequest(t, 73, "item/tool/requestUserInput", map[string]any{
+	daemon.sendRequestToThread(t, threadID, 73, "item/tool/requestUserInput", map[string]any{
 		"threadId": threadID,
 		"turnId":   "turn-live",
 		"itemId":   "question-1",
@@ -410,7 +491,7 @@ func TestAgentOpenConversationObserver_ResumesAndAnswersSharedUserInput(t *testi
 
 	// Rejoining a thread only permits requestUserInput. A passive observer must
 	// never answer a command approval or otherwise become the turn writer.
-	daemon.broadcastRequest(t, 74, "item/commandExecution/requestApproval", map[string]any{
+	daemon.sendRequestToThread(t, threadID, 74, "item/commandExecution/requestApproval", map[string]any{
 		"threadId": threadID, "turnId": "turn-live", "itemId": "command-1", "command": "pwd",
 	})
 	daemon.assertNoResponse(t, 100*time.Millisecond)
@@ -446,7 +527,7 @@ func TestAgentOpenConversationObserver_ProgressFloodPreservesBlockingQuestionLif
 		})
 	}
 	time.Sleep(100 * time.Millisecond)
-	daemon.broadcastRequest(t, 75, "item/tool/requestUserInput", map[string]any{
+	daemon.sendRequestToThread(t, threadID, 75, "item/tool/requestUserInput", map[string]any{
 		"threadId": threadID, "turnId": "turn-live", "itemId": "question-flood",
 		"questions": []any{map[string]any{
 			"id": "database", "question": "Which database?",

@@ -170,6 +170,25 @@ func TestRenderCardMap_DefaultActionsStayActionRow(t *testing.T) {
 	}
 }
 
+func TestRenderCallbackCard_UsesMarkdownForNotesInSchemaV2(t *testing.T) {
+	card := core.NewCard().
+		Title("Agent question", "blue").
+		Markdown("**Which scope?**").
+		ListItemBtn("Repository", "Repository", "default", "trackq:token:0:1").
+		Note("Choose an option or reply with a custom answer.").
+		Build()
+
+	rendered := renderCallbackCard(card, "feishu:chat:admin")
+	if strings.Contains(rendered, `"tag":"note"`) {
+		t.Fatalf("Card 2.0 contains unsupported note element: %s", rendered)
+	}
+	if !strings.Contains(rendered, `"schema":"2.0"`) ||
+		!strings.Contains(rendered, `"tag":"markdown"`) ||
+		!strings.Contains(rendered, "Choose an option or reply with a custom answer.") {
+		t.Fatalf("Card 2.0 lost note content: %s", rendered)
+	}
+}
+
 func TestRenderCardMap_DeleteModeUsesCheckerForm(t *testing.T) {
 	card := core.NewCard().
 		Title("删除会话", "carmine").

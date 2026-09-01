@@ -1143,7 +1143,7 @@ func TestAppServerSession_FakeSharedDaemonRoutesNotificationsAndServerRequestsTo
 			}
 			params["threadId"] = threadID
 			params["turnId"] = "server-turn-" + threadID
-			daemon.broadcastRequest(t, requestID, request.method, params)
+			daemon.sendRequestToThread(t, threadID, requestID, request.method, params)
 
 			if request.expectsEvent {
 				event := waitForAppServerEvent(t, owner.Events())
@@ -1585,13 +1585,32 @@ func (d *fakeSharedAppServerDaemon) broadcast(t *testing.T, method string, param
 	}
 }
 
-func (d *fakeSharedAppServerDaemon) broadcastRequest(t *testing.T, id int, method string, params any) {
+func (d *fakeSharedAppServerDaemon) sendRequestToThread(t *testing.T, threadID string, id int, method string, params any) {
 	t.Helper()
-	message := map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}
+	var target *fakeSharedAppServerClient
 	for _, client := range d.snapshotClients(t) {
-		if err := client.writeJSON(message); err != nil {
-			t.Fatalf("broadcast request %s: %v", method, err)
+		d.mu.Lock()
+		clientThreadID := client.threadID
+		d.mu.Unlock()
+		if clientThreadID == threadID {
+			target = client
+			break
 		}
+	}
+	if target == nil {
+		t.Fatalf("fake daemon has no request client for thread %q", threadID)
+	}
+	d.sendRequestToClient(t, target, id, method, params)
+}
+
+func (d *fakeSharedAppServerDaemon) sendRequestToClient(t *testing.T, target *fakeSharedAppServerClient, id int, method string, params any) {
+	t.Helper()
+	if target == nil {
+		t.Fatal("fake daemon request target is nil")
+	}
+	message := map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}
+	if err := target.writeJSON(message); err != nil {
+		t.Fatalf("send request %s: %v", method, err)
 	}
 }
 

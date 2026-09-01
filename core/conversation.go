@@ -77,6 +77,7 @@ type conversationElicitation struct {
 	cardMessageID string
 	actionable    bool
 	resolved      bool
+	sending       bool
 	submitting    bool
 }
 
@@ -680,6 +681,172 @@ func newConversationElicitationToken() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
+func conversationSnapshotWaitingOnUserInput(snapshot *ConversationSnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	for _, flag := range snapshot.ActiveFlags {
+		switch strings.ToLower(strings.TrimSpace(flag)) {
+		case "waitingonuserinput", "waiting_on_user_input":
+			return true
+		}
+	}
+	return false
+}
+
+func conversationSnapshotPendingInput(snapshot *ConversationSnapshot) (ConversationTurn, *ConversationPendingInput, bool) {
+	if !conversationSnapshotWaitingOnUserInput(snapshot) {
+		return ConversationTurn{}, nil, false
+	}
+	for index := len(snapshot.Turns) - 1; index >= 0; index-- {
+		turn := snapshot.Turns[index]
+		pending := turn.PendingInput
+		if turn.Status != ConversationTurnInProgress || pending == nil || strings.TrimSpace(pending.ItemID) == "" || len(pending.Questions) == 0 {
+			continue
+		}
+		return turn, pending, true
+	}
+	return ConversationTurn{}, nil, false
+}
+
+func conversationElicitationMatches(pending *conversationElicitation, threadID, turnID, itemID string) bool {
+	return pending != nil && pending.threadID == strings.TrimSpace(threadID) &&
+		pending.turnID == strings.TrimSpace(turnID) && pending.itemID == strings.TrimSpace(itemID)
+}
+
+func conversationSnapshotContainsElicitation(snapshot *ConversationSnapshot, pending *conversationElicitation) bool {
+	if snapshot == nil || pending == nil || !conversationSnapshotWaitingOnUserInput(snapshot) {
+		return false
+	}
+	turn, ok := conversationTurnByID(snapshot, pending.turnID)
+	if !ok || turn.Status != ConversationTurnInProgress || turn.PendingInput == nil {
+		return false
+	}
+	return turn.PendingInput.ItemID == pending.itemID && len(turn.PendingInput.Questions) > 0
+}
+
+func conversationSnapshotProvesElicitationGone(snapshot *ConversationSnapshot, pending *conversationElicitation) bool {
+	if snapshot == nil || pending == nil {
+		return false
+	}
+	if !conversationSnapshotWaitingOnUserInput(snapshot) {
+		// A live server request can arrive just before its waiting flag is
+		// persisted. Its connection-bound responder remains authoritative until
+		// a resolution event or terminal turn proves otherwise. Snapshot-only
+		// requests have no such edge and may be retired when the flag disappears.
+		if pending.responder == nil {
+			return true
+		}
+		turn, ok := conversationTurnByID(snapshot, pending.turnID)
+		return ok && conversationTurnTerminal(turn.Status)
+	}
+	turn, ok := conversationTurnByID(snapshot, pending.turnID)
+	if !ok {
+		// A bounded snapshot may not include the pending turn. Absence alone is
+		// not enough evidence to invalidate a live card.
+		return false
+	}
+	if conversationTurnTerminal(turn.Status) {
+		return true
+	}
+	// The waiting flag can precede persistence of the dynamic tool item. Keep
+	// an existing live request during that short window. A different persisted
+	// item, however, authoritatively supersedes the old controls.
+	return turn.PendingInput != nil &&
+		(turn.PendingInput.ItemID != pending.itemID || len(turn.PendingInput.Questions) == 0)
+}
+
+func (e *Engine) deliverConversationElicitationCard(ctx context.Context, mirror *conversationMirror, p Platform, pending *conversationElicitation) {
+	if mirror == nil || pending == nil {
+		return
+	}
+	mirror.mu.Lock()
+	if mirror.pending != pending || pending.resolved || pending.cardHandle != nil || pending.sending {
+		mirror.mu.Unlock()
+		return
+	}
+	pending.sending = true
+	mirror.mu.Unlock()
+
+	binding := e.trackStore.binding(mirror.destination)
+	if binding == nil || binding.ThreadID != mirror.threadID || binding.Generation != mirror.generation || !e.effectiveTrackEnabled(binding) {
+		mirror.mu.Lock()
+		if mirror.pending == pending {
+			pending.sending = false
+		}
+		mirror.mu.Unlock()
+		return
+	}
+	reconstructor, ok := p.(ReplyContextReconstructor)
+	if !ok {
+		mirror.mu.Lock()
+		if mirror.pending == pending {
+			pending.sending = false
+		}
+		mirror.mu.Unlock()
+		return
+	}
+	replyCtx, err := reconstructor.ReconstructReplyCtx(binding.Destination)
+	if err != nil {
+		slog.Warn("track: reconstruct question target failed", "platform", p.Name(), "error", err)
+		mirror.mu.Lock()
+		if mirror.pending == pending {
+			pending.sending = false
+		}
+		mirror.mu.Unlock()
+		return
+	}
+
+	card := e.buildConversationElicitationCard(pending.questions, pending.current, pending.token)
+	tracked, trackedOK := p.(TrackedCardSender)
+	if !trackedOK {
+		e.sendWithCard(p, replyCtx, card)
+		mirror.mu.Lock()
+		if mirror.pending == pending {
+			pending.sending = false
+		}
+		mirror.mu.Unlock()
+		return
+	}
+	if err := e.waitOutgoing(p); err != nil {
+		mirror.mu.Lock()
+		if mirror.pending == pending {
+			pending.sending = false
+		}
+		mirror.mu.Unlock()
+		return
+	}
+	handle, err := tracked.SendTrackedCard(ctx, replyCtx, e.renderCardForPlatform(p, card))
+	if err != nil {
+		slog.Warn("track: send question card failed", "platform", p.Name(), "error", err)
+		mirror.mu.Lock()
+		if mirror.pending == pending {
+			pending.sending = false
+		}
+		mirror.mu.Unlock()
+		return
+	}
+	messageID, identifyErr := previewMessageID(p, handle)
+	if identifyErr != nil {
+		slog.Warn("track: identify question card failed", "platform", p.Name(), "error", identifyErr)
+	}
+	mirror.mu.Lock()
+	pending.sending = false
+	pending.cardHandle = handle
+	pending.cardMessageID = messageID
+	pending.actionable = identifyErr == nil && messageID != ""
+	stillCurrent := mirror.pending == pending
+	if !stillCurrent {
+		pending.resolved = true
+	}
+	resolved := pending.resolved
+	resolvedCard, resolvedCardOK := conversationElicitationCardSnapshot(pending)
+	mirror.mu.Unlock()
+	if (!stillCurrent || resolved) && resolvedCardOK {
+		e.updateConversationElicitationCard(p, mirror.sessionKey, resolvedCard, "")
+	}
+}
+
 func (e *Engine) buildConversationElicitationCard(questions []UserQuestion, questionIndex int, token string) *Card {
 	if questionIndex < 0 || questionIndex >= len(questions) {
 		return nil
@@ -702,7 +869,7 @@ func (e *Engine) buildConversationElicitationCard(questions []UserQuestion, ques
 func (e *Engine) handleConversationElicitation(ctx context.Context, mirror *conversationMirror, sessions *SessionManager, p Platform, responder ConversationObserver, event Event) {
 	if responder == nil || event.ToolName != "AskUserQuestion" || len(event.Questions) == 0 ||
 		strings.TrimSpace(event.RequestID) == "" || strings.TrimSpace(event.ThreadID) != mirror.threadID ||
-		strings.TrimSpace(event.TurnID) == "" {
+		strings.TrimSpace(event.TurnID) == "" || strings.TrimSpace(event.ItemID) == "" {
 		return
 	}
 	binding := e.trackStore.binding(mirror.destination)
@@ -721,20 +888,20 @@ func (e *Engine) handleConversationElicitation(ctx context.Context, mirror *conv
 		return
 	}
 
-	reconstructor, ok := p.(ReplyContextReconstructor)
-	if !ok {
-		return
-	}
-	replyCtx, err := reconstructor.ReconstructReplyCtx(binding.Destination)
-	if err != nil {
-		slog.Warn("track: reconstruct question target failed", "platform", p.Name(), "error", err)
-		return
-	}
-
 	mirror.mu.Lock()
-	if current := mirror.pending; current != nil && current.requestID == event.RequestID && current.threadID == event.ThreadID {
-		current.responder = responder
+	if current := mirror.pending; conversationElicitationMatches(current, event.ThreadID, event.TurnID, event.ItemID) {
+		if !current.resolved {
+			// A persisted snapshot may have created the card before the observer
+			// receives the edge-triggered request. Upgrade that exact pending item
+			// with its connection-bound response capability without sending again.
+			current.requestID = event.RequestID
+			current.responder = responder
+		}
+		needsDelivery := !current.resolved && current.cardHandle == nil
 		mirror.mu.Unlock()
+		if needsDelivery {
+			e.deliverConversationElicitationCard(ctx, mirror, p, current)
+		}
 		return
 	}
 	previous := mirror.pending
@@ -764,39 +931,7 @@ func (e *Engine) handleConversationElicitation(ctx context.Context, mirror *conv
 	mirror.mu.Lock()
 	mirror.pending = pending
 	mirror.mu.Unlock()
-
-	card := e.buildConversationElicitationCard(pending.questions, 0, pending.token)
-	tracked, trackedOK := p.(TrackedCardSender)
-	if !trackedOK {
-		e.sendWithCard(p, replyCtx, card)
-		return
-	}
-	if err := e.waitOutgoing(p); err != nil {
-		return
-	}
-	handle, err := tracked.SendTrackedCard(ctx, replyCtx, e.renderCardForPlatform(p, card))
-	if err != nil {
-		slog.Warn("track: send question card failed", "platform", p.Name(), "error", err)
-		return
-	}
-	messageID, identifyErr := previewMessageID(p, handle)
-	if identifyErr != nil {
-		slog.Warn("track: identify question card failed", "platform", p.Name(), "error", identifyErr)
-	}
-	mirror.mu.Lock()
-	pending.cardHandle = handle
-	pending.cardMessageID = messageID
-	pending.actionable = identifyErr == nil && messageID != ""
-	stillCurrent := mirror.pending == pending
-	if !stillCurrent {
-		pending.resolved = true
-	}
-	resolved := pending.resolved
-	resolvedCard, resolvedCardOK := conversationElicitationCardSnapshot(pending)
-	mirror.mu.Unlock()
-	if (!stillCurrent || resolved) && resolvedCardOK {
-		e.updateConversationElicitationCard(p, mirror.sessionKey, resolvedCard, "")
-	}
+	e.deliverConversationElicitationCard(ctx, mirror, p, pending)
 }
 
 func (e *Engine) resolveConversationElicitation(mirror *conversationMirror, p Platform, requestID, answer string) {
@@ -845,10 +980,14 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 	mirror.mu.Lock()
 	var terminalQuestionCard conversationElicitationCardState
 	var terminalQuestionCardOK bool
+	var recoveredQuestion *conversationElicitation
 	defer func() {
 		mirror.mu.Unlock()
 		if terminalQuestionCardOK {
 			e.updateConversationElicitationCard(p, mirror.sessionKey, terminalQuestionCard, "")
+		}
+		if recoveredQuestion != nil {
+			e.deliverConversationElicitationCard(ctx, mirror, p, recoveredQuestion)
 		}
 	}()
 	binding := e.trackStore.binding(mirror.destination)
@@ -886,14 +1025,44 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 	mirror.lastVerifiedAt = verifiedAt
 	mirror.firstFailureAt = time.Time{}
 	mirror.lastSnapshot = snapshot
-	if pending := mirror.pending; pending != nil && !pending.resolved {
-		for _, turn := range snapshot.Turns {
-			if turn.ID == pending.turnID && conversationTurnTerminal(turn.Status) {
-				pending.resolved = true
-				pending.submitting = false
-				terminalQuestionCard, terminalQuestionCardOK = conversationElicitationCardSnapshot(pending)
-				break
+
+	pendingTurn, pendingInput, hasPendingInput := conversationSnapshotPendingInput(snapshot)
+	foregroundOwnsQuestion := false
+	if hasPendingInput {
+		session := sessions.GetOrCreateActive(binding.SessionKey)
+		foregroundOwnsQuestion = session.GetAgentSessionID() == mirror.threadID && session.Busy()
+	}
+	current := mirror.pending
+	if current != nil && !current.resolved && !conversationSnapshotContainsElicitation(snapshot, current) &&
+		conversationSnapshotProvesElicitationGone(snapshot, current) {
+		current.resolved = true
+		current.sending = false
+		current.submitting = false
+		terminalQuestionCard, terminalQuestionCardOK = conversationElicitationCardSnapshot(current)
+	}
+	if hasPendingInput && !foregroundOwnsQuestion {
+		current = mirror.pending
+		if conversationElicitationMatches(current, mirror.threadID, pendingTurn.ID, pendingInput.ItemID) {
+			if !current.resolved && current.cardHandle == nil {
+				recoveredQuestion = current
 			}
+		} else {
+			if current != nil && !current.resolved {
+				current.resolved = true
+				current.sending = false
+				current.submitting = false
+				terminalQuestionCard, terminalQuestionCardOK = conversationElicitationCardSnapshot(current)
+			}
+			token, tokenErr := newConversationElicitationToken()
+			if tokenErr != nil {
+				return tokenErr
+			}
+			recoveredQuestion = &conversationElicitation{
+				token: token, threadID: mirror.threadID, turnID: pendingTurn.ID,
+				itemID: pendingInput.ItemID, generation: mirror.generation,
+				questions: append([]UserQuestion(nil), pendingInput.Questions...), answers: make(map[int]string),
+			}
+			mirror.pending = recoveredQuestion
 		}
 	}
 	if !coverageProven {
@@ -1311,7 +1480,7 @@ func (e *Engine) shouldNotifyTrackTerminal(status ConversationTurnStatus) bool {
 	}
 }
 
-func (e *Engine) handleTrackedConversationElicitationInput(p Platform, msg *Message, directContent string, sessions *SessionManager) bool {
+func (e *Engine) handleTrackedConversationElicitationInput(p Platform, msg *Message, directContent string, agent Agent, sessions *SessionManager) bool {
 	if msg == nil {
 		return false
 	}
@@ -1470,14 +1639,38 @@ func (e *Engine) handleTrackedConversationElicitationInput(p Platform, msg *Mess
 	responder := pending.responder
 	requestID := pending.requestID
 	updatedInput := buildAskQuestionResponse(nil, pending.questions, pending.answers)
+	threadID := pending.threadID
+	turnID := pending.turnID
+	itemID := pending.itemID
+	questions := append([]UserQuestion(nil), pending.questions...)
+	answers := make(map[int]string, len(pending.answers))
+	for index, value := range pending.answers {
+		answers[index] = value
+	}
 	mirror.mu.Unlock()
 	if responder == nil {
-		mirror.mu.Lock()
-		if mirror.pending == pending {
-			pending.submitting = false
+		stale, steerErr := e.steerSnapshotConversationElicitation(agent, threadID, turnID, itemID, questions, answers)
+		if stale {
+			e.resolveConversationElicitation(mirror, p, "", "")
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+			return true
 		}
-		mirror.mu.Unlock()
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+		if steerErr != nil {
+			mirror.mu.Lock()
+			if mirror.pending == pending {
+				pending.submitting = false
+			}
+			alreadyResolved := pending.resolved
+			mirror.mu.Unlock()
+			if alreadyResolved {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackSteerStale))
+			} else {
+				e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), steerErr))
+			}
+			return true
+		}
+		e.resolveConversationElicitation(mirror, p, "", answer)
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgAskQuestionAnswerConfirmed, question.Question, answer))
 		return true
 	}
 	if err := responder.RespondPermission(requestID, PermissionResult{Behavior: "allow", UpdatedInput: updatedInput}); err != nil {
@@ -1497,6 +1690,74 @@ func (e *Engine) handleTrackedConversationElicitationInput(p Platform, msg *Mess
 	e.resolveConversationElicitation(mirror, p, requestID, answer)
 	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgAskQuestionAnswerConfirmed, question.Question, answer))
 	return true
+}
+
+func (e *Engine) steerSnapshotConversationElicitation(agent Agent, threadID, turnID, itemID string, questions []UserQuestion, answers map[int]string) (bool, error) {
+	provider, providerOK := agent.(ConversationProvider)
+	steerer, steererOK := agent.(ConversationTurnSteerer)
+	if !providerOK || !steererOK {
+		return false, fmt.Errorf("track: backend cannot verify and steer a recovered user-input request")
+	}
+	stillPending := func() (bool, error) {
+		readCtx, cancel := context.WithTimeout(e.ctx, 6*time.Second)
+		defer cancel()
+		snapshot, err := provider.GetConversation(readCtx, threadID, trackRecentTurnLimit)
+		if err != nil {
+			return false, err
+		}
+		if snapshot == nil || snapshot.SessionID != threadID || !conversationSnapshotWaitingOnUserInput(snapshot) {
+			return false, nil
+		}
+		turn, ok := conversationTurnByID(snapshot, turnID)
+		return ok && turn.Status == ConversationTurnInProgress && turn.PendingInput != nil &&
+			turn.PendingInput.ItemID == itemID && len(turn.PendingInput.Questions) > 0, nil
+	}
+	pending, err := stillPending()
+	if err != nil {
+		return false, err
+	}
+	if !pending {
+		return true, nil
+	}
+
+	input := formatConversationElicitationAnswers(questions, answers)
+	if input == "" {
+		return false, fmt.Errorf("track: recovered user-input answer is empty")
+	}
+	seed := strings.Join([]string{threadID, turnID, itemID}, "\x00")
+	clientID := "cc-connect-" + trackIdempotencyKey(seed, "question-answer")
+	steerCtx, cancel := context.WithTimeout(e.ctx, 6*time.Second)
+	err = steerer.SteerConversationTurn(steerCtx, threadID, turnID, input, clientID, nil, nil)
+	cancel()
+	if err == nil {
+		return false, nil
+	}
+	// The exact-turn precondition may lose a race after the first read. Re-read
+	// once so a backend that already continued is reported as stale rather than
+	// leaving a retryable-looking card behind.
+	pending, readErr := stillPending()
+	if readErr == nil && !pending {
+		return true, nil
+	}
+	return false, err
+}
+
+func formatConversationElicitationAnswers(questions []UserQuestion, answers map[int]string) string {
+	var builder strings.Builder
+	for index, question := range questions {
+		answer := strings.TrimSpace(answers[index])
+		if answer == "" {
+			continue
+		}
+		if builder.Len() == 0 {
+			builder.WriteString("Answers to the pending questions:\n")
+		}
+		builder.WriteString("\n- ")
+		builder.WriteString(strings.TrimSpace(question.Question))
+		builder.WriteString("\n  Answer: ")
+		builder.WriteString(answer)
+	}
+	return strings.TrimSpace(builder.String())
 }
 
 func (e *Engine) handleTrackedPlanAction(p Platform, msg *Message, content string, agent Agent, sessions *SessionManager) bool {

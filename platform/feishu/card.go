@@ -325,8 +325,11 @@ func renderCallbackCard(card *core.Card, sessionKey string) string {
 		case core.CardDivider:
 			elements = append(elements, map[string]any{"tag": "hr"})
 		case core.CardNote:
+			// Card 2.0 no longer accepts the legacy note element. Keep the
+			// explanatory text visible as markdown so tracked question cards can
+			// be created by CardKit instead of failing the entire request.
 			elements = append(elements, map[string]any{
-				"tag": "note", "elements": []any{plainText(item.Text)},
+				"tag": "markdown", "content": item.Text,
 			})
 		case core.CardActions:
 			for _, button := range item.Buttons {

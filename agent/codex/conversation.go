@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -666,6 +667,9 @@ func mapAppServerConversationTurn(turn appServerConversationTurn) core.Conversat
 			// projected through PresentationEvents below, matching the live card.
 		default:
 			if appServerConversationRequestUserInputItem(itemType, item) {
+				if pending := appServerConversationPendingInput(item); pending != nil {
+					mapped.PendingInput = pending
+				}
 				continue
 			}
 			if activity, ok := appServerConversationActivity(itemType, item, mapped.Status); ok {
@@ -675,6 +679,47 @@ func mapAppServerConversationTurn(turn appServerConversationTurn) core.Conversat
 	}
 	mapped.PresentationEvents = appServerConversationPresentationEvents(turn.Items, mapped.Status)
 	return mapped
+}
+
+func appServerConversationPendingInput(item map[string]any) *core.ConversationPendingInput {
+	if !appServerConversationRequestUserInputItem(stringMapValue(item, "type"), item) ||
+		normalizeConversationStatus(stringMapValue(item, "status")) != "in_progress" {
+		return nil
+	}
+	itemID := stringMapValue(item, "id")
+	if itemID == "" {
+		return nil
+	}
+
+	arguments, ok := item["arguments"]
+	if !ok || arguments == nil {
+		return nil
+	}
+	var raw []byte
+	var err error
+	switch value := arguments.(type) {
+	case string:
+		raw = []byte(value)
+	case json.RawMessage:
+		raw = append([]byte(nil), value...)
+	default:
+		raw, err = json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+	}
+	var params appServerRequestUserInputParams
+	if json.Unmarshal(raw, &params) != nil {
+		return nil
+	}
+	questions := appServerRequestUserInputQuestions(params.Questions)
+	if len(questions) == 0 {
+		return nil
+	}
+	return &core.ConversationPendingInput{
+		ItemID:    itemID,
+		Questions: questions,
+	}
 }
 
 func appServerConversationPresentationEvents(items []map[string]any, turnStatus core.ConversationTurnStatus) []core.Event {

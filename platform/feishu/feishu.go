@@ -7046,7 +7046,7 @@ func buildRichCardWithOptions(options core.RichCardRenderOptions) string {
 	} {
 		compactOptions := options
 		if options.ProgressItems != nil {
-			compactOptions.ProgressItems = compactProgressItemsForCardSize(options.ProgressItems, limit.perLane*2, limit.textLen)
+			compactOptions.ProgressItems = compactProgressItemsForCardSize(options.ProgressItems, limit.perLane, limit.textLen)
 			compactOptions.ProgressTruncated = options.ProgressTruncated || len(compactOptions.ProgressItems) < len(options.ProgressItems)
 		} else {
 			compactOptions.Steps = compactRichStepsForCardSize(options.Steps, limit.perLane, limit.textLen)
@@ -7313,12 +7313,12 @@ func compactRichStepsForCardSize(steps []core.ToolStep, perLaneLimit, textLimit 
 	return kept
 }
 
-func compactProgressItemsForCardSize(items []core.ProgressCardEntry, itemLimit, textLimit int) []core.ProgressCardEntry {
-	if len(items) == 0 || itemLimit <= 0 {
+func compactProgressItemsForCardSize(items []core.ProgressCardEntry, perLaneLimit, textLimit int) []core.ProgressCardEntry {
+	if len(items) == 0 || perLaneLimit <= 0 {
 		return []core.ProgressCardEntry{}
 	}
-	start := max(0, len(items)-itemLimit)
-	compacted := append([]core.ProgressCardEntry(nil), items[start:]...)
+	trimmed, _ := core.TrimProgressCardEntriesByLane(items, perLaneLimit)
+	compacted := append([]core.ProgressCardEntry(nil), trimmed...)
 	for index := range compacted {
 		compacted[index].Text = compactRichText(compacted[index].Text, textLimit)
 	}

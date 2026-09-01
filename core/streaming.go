@@ -144,16 +144,14 @@ type richTurnPresentation struct {
 	Markdown          string
 }
 
-const richProgressMaxEntries = 10
+const richProgressMaxEntriesPerLane = 10
 
 func (p *richTurnPresentation) appendProgress(item ProgressCardEntry) {
 	p.ProgressCounts.add(item.Kind)
 	p.ProgressItems = append(p.ProgressItems, item)
-	if len(p.ProgressItems) <= richProgressMaxEntries {
-		return
-	}
-	p.ProgressItems = p.ProgressItems[len(p.ProgressItems)-richProgressMaxEntries:]
-	p.ProgressTruncated = true
+	var truncated bool
+	p.ProgressItems, truncated = TrimProgressCardEntriesByLane(p.ProgressItems, richProgressMaxEntriesPerLane)
+	p.ProgressTruncated = p.ProgressTruncated || truncated
 }
 
 func (p *richTurnPresentation) Apply(event Event, display DisplayCfg) {

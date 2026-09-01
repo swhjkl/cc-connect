@@ -1668,6 +1668,42 @@ func TestBuildRichCardWithOptions_MirrorReusesNativeProgressPanels(t *testing.T)
 	}
 }
 
+func TestBuildRichCardWithOptions_OversizeProgressKeepsReasoningLane(t *testing.T) {
+	items := []core.ProgressCardEntry{{
+		Kind: core.ProgressEntryThinking,
+		Text: "keep this reasoning " + strings.Repeat("r", 2000),
+	}}
+	for i := 0; i < 20; i++ {
+		items = append(items, core.ProgressCardEntry{
+			Kind: core.ProgressEntryToolUse,
+			Tool: "Bash",
+			Text: fmt.Sprintf("tool-index-%02d %s", i, strings.Repeat("t", 2000)),
+		})
+	}
+
+	p := &Platform{}
+	cardJSON := p.BuildRichCardWithOptions(core.RichCardRenderOptions{
+		Status: core.CardStatusWorking, Variant: core.CardVariantMirror,
+		Title: "Codex · Shared external session", ProgressItems: items,
+		ProgressCounts: core.ProgressCardCounts{Reasoning: 1, Tools: 20},
+		Language:       core.LangEnglish, Streaming: true,
+	})
+
+	panels := collectCardPanels(t, cardJSON)
+	if len(panels) != 2 {
+		t.Fatalf("oversize progress panels = %#v, want reasoning and tools", panels)
+	}
+	if !panelContains(t, panels[0], "keep this reasoning") {
+		t.Fatalf("oversize compaction evicted reasoning: %#v", panels[0])
+	}
+	if !panelContains(t, panels[1], "tool-index-19") {
+		t.Fatalf("oversize compaction omitted the latest tool: %#v", panels[1])
+	}
+	if !strings.Contains(cardJSON, "Showing latest updates only.") {
+		t.Fatalf("oversize compacted card omitted truncation notice: %s", cardJSON)
+	}
+}
+
 func TestBuildReplyContent_PreservesPrebuiltRichCard(t *testing.T) {
 	card := buildRichCardWithOptions(core.RichCardRenderOptions{
 		Status: core.CardStatusDone, Title: "Codex · 已完成", Markdown: "plain final response",

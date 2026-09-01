@@ -1736,6 +1736,46 @@ func TestCmdTrack_ProgressPayloadMatchesNativeCardAndShowsPrompt(t *testing.T) {
 	}
 }
 
+func TestRenderTrackPayload_ToolOverflowKeepsReasoningForMirrorAndTrack(t *testing.T) {
+	events := []Event{{Type: EventThinking, ItemID: "reasoning-1", Content: "keep this reasoning"}}
+	for i := 0; i < 12; i++ {
+		events = append(events, Event{
+			Type: EventToolUse, ItemID: fmt.Sprintf("tool-%02d", i),
+			ToolName: "Bash", ToolInput: fmt.Sprintf("tool-%02d", i),
+		})
+	}
+	turn := ConversationTurn{
+		ID: "turn-overflow", Status: ConversationTurnInProgress,
+		Messages:           []ConversationMessage{{Role: "user", Content: "inspect the workspace"}},
+		PresentationEvents: events,
+	}
+	snapshot := &ConversationSnapshot{SessionID: "thread-1", Turns: []ConversationTurn{turn}}
+	p := &progressTrackPreviewPlatform{trackPreviewPlatform: newTrackPreviewPlatform()}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer e.Stop()
+
+	content := e.renderTrackPayload(p, snapshot, turn, e.renderTrackMarkdown(snapshot, turn), "feishu:chat:admin")
+	payload, ok := ParseProgressCardPayload(content)
+	if !ok {
+		t.Fatalf("shared external/track card did not use a progress payload: %q", content)
+	}
+	if !payload.Truncated || len(payload.Items) != 11 {
+		t.Fatalf("bounded shared progress = %#v, truncated = %t", payload.Items, payload.Truncated)
+	}
+	if got := payload.Items[0]; got.Kind != ProgressEntryThinking || got.Text != "keep this reasoning" {
+		t.Fatalf("reasoning was evicted by tool activity: %#v", got)
+	}
+	if got := payload.Items[1].Text; got != "tool-02" {
+		t.Fatalf("oldest retained tool = %q, want tool-02", got)
+	}
+	if got := payload.Items[len(payload.Items)-1].Text; got != "tool-11" {
+		t.Fatalf("latest retained tool = %q, want tool-11", got)
+	}
+	if payload.Counts.Reasoning != 1 || payload.Counts.Tools != 12 {
+		t.Fatalf("cumulative shared progress counts = %#v", payload.Counts)
+	}
+}
+
 func TestConversationMirror_NotificationModesDoNotLoseOrDuplicateFinalResponse(t *testing.T) {
 	tests := []struct {
 		name           string

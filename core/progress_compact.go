@@ -841,9 +841,46 @@ func (w *compactProgressWriter) flushLocked(force bool) (bool, func(any), any) {
 	return true, nil, nil
 }
 
+// TrimProgressCardEntriesByLane keeps the latest entries from the reasoning,
+// tool, and other lanes while preserving their original relative order.
+func TrimProgressCardEntriesByLane(items []ProgressCardEntry, perLaneLimit int) ([]ProgressCardEntry, bool) {
+	keep, keptCount, truncated := progressCardEntryKeepMaskByLane(items, perLaneLimit)
+	if !truncated {
+		return items, false
+	}
+
+	trimmedItems := make([]ProgressCardEntry, 0, keptCount)
+	for i, item := range items {
+		if keep[i] {
+			trimmedItems = append(trimmedItems, item)
+		}
+	}
+	return trimmedItems, true
+}
+
 func trimProgressCardEntriesByLane(items []ProgressCardEntry, entries []string, perLaneLimit int) ([]ProgressCardEntry, []string, bool) {
-	if perLaneLimit <= 0 || len(items) == 0 {
+	keep, keptCount, truncated := progressCardEntryKeepMaskByLane(items, perLaneLimit)
+	if !truncated {
 		return items, entries, false
+	}
+
+	trimmedItems := make([]ProgressCardEntry, 0, keptCount)
+	trimmedEntries := make([]string, 0, keptCount)
+	for i, item := range items {
+		if !keep[i] {
+			continue
+		}
+		trimmedItems = append(trimmedItems, item)
+		if i < len(entries) {
+			trimmedEntries = append(trimmedEntries, entries[i])
+		}
+	}
+	return trimmedItems, trimmedEntries, true
+}
+
+func progressCardEntryKeepMaskByLane(items []ProgressCardEntry, perLaneLimit int) ([]bool, int, bool) {
+	if perLaneLimit <= 0 || len(items) == 0 {
+		return nil, len(items), false
 	}
 
 	const (
@@ -874,22 +911,7 @@ func trimProgressCardEntriesByLane(items []ProgressCardEntry, entries []string, 
 		counts[lane]++
 		keep[i] = true
 	}
-	if !truncated {
-		return items, entries, false
-	}
-
-	trimmedItems := make([]ProgressCardEntry, 0, counts[reasoningLane]+counts[toolLane]+counts[otherLane])
-	trimmedEntries := make([]string, 0, cap(trimmedItems))
-	for i, item := range items {
-		if !keep[i] {
-			continue
-		}
-		trimmedItems = append(trimmedItems, item)
-		if i < len(entries) {
-			trimmedEntries = append(trimmedEntries, entries[i])
-		}
-	}
-	return trimmedItems, trimmedEntries, true
+	return keep, counts[reasoningLane] + counts[toolLane] + counts[otherLane], truncated
 }
 
 func (w *compactProgressWriter) recordSuccessfulUpdateLocked() {

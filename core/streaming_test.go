@@ -93,22 +93,31 @@ func TestRichTurnPresentation_MergesToolResultsByItemID(t *testing.T) {
 	}
 }
 
-func TestRichTurnPresentation_ProgressItemsKeepLatestTen(t *testing.T) {
+func TestRichTurnPresentation_ProgressItemsKeepLatestTenPerLane(t *testing.T) {
 	display := DisplayCfg{ThinkingMessages: true, ToolMessages: true, ThinkingMaxLen: 300, ToolMaxLen: 500}
-	events := make([]Event, 0, 12)
+	events := make([]Event, 0, 24)
 	for i := 0; i < 12; i++ {
-		events = append(events, Event{Type: EventThinking, Content: fmt.Sprintf("step-%02d", i)})
+		events = append(events, Event{Type: EventThinking, Content: fmt.Sprintf("reasoning-%02d", i)})
+	}
+	for i := 0; i < 12; i++ {
+		events = append(events, Event{Type: EventToolUse, ToolName: "Bash", ToolInput: fmt.Sprintf("tool-%02d", i)})
 	}
 	presentation := richTurnPresentationFromEvents(events, display)
 
-	if !presentation.ProgressTruncated || len(presentation.ProgressItems) != richProgressMaxEntries {
+	if !presentation.ProgressTruncated || len(presentation.ProgressItems) != 2*richProgressMaxEntriesPerLane {
 		t.Fatalf("bounded progress = %#v, truncated = %t", presentation.ProgressItems, presentation.ProgressTruncated)
 	}
-	if got := presentation.ProgressItems[0].Text; got != "step-02" {
-		t.Fatalf("first visible progress item = %q, want step-02", got)
+	if got := presentation.ProgressItems[0]; got.Kind != ProgressEntryThinking || got.Text != "reasoning-02" {
+		t.Fatalf("first visible reasoning item = %#v, want reasoning-02", got)
 	}
-	if got := presentation.ProgressCounts.Reasoning; got != 12 {
-		t.Fatalf("cumulative reasoning count = %d, want 12", got)
+	if got := presentation.ProgressItems[richProgressMaxEntriesPerLane]; got.Kind != ProgressEntryToolUse || got.Text != "tool-02" {
+		t.Fatalf("first visible tool item = %#v, want tool-02", got)
+	}
+	if got := presentation.ProgressItems[len(presentation.ProgressItems)-1].Text; got != "tool-11" {
+		t.Fatalf("latest visible tool item = %q, want tool-11", got)
+	}
+	if got := presentation.ProgressCounts; got.Reasoning != 12 || got.Tools != 12 {
+		t.Fatalf("cumulative progress counts = %#v, want 12 reasoning and 12 tools", got)
 	}
 }
 

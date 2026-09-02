@@ -73,6 +73,11 @@ web/tsconfig.tsbuildinfo
 # ============================================================================
 test/
 scripts/
+# Bundled Task Skill executables are source files, not local scratch scripts.
+!skills/task/scripts/
+!skills/task/scripts/**
+__pycache__/
+*.py[cod]
 tmp/
 temp/
 *.tmp

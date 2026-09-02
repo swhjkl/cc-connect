@@ -1,0 +1,3836 @@
+#!/usr/bin/env python3
+"""Reconcile deterministic task lifecycle infrastructure from one command."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from typing import Any, Iterable
+from urllib.parse import urlparse
+
+
+SCRIPT_VERSION = "0.4.1"
+STATE_SCHEMA_VERSION = 1
+CC_SCHEMA_VERSION = 1
+ARCHIVE_SCHEMA_VERSION = 1
+ARCHIVE_KIND = "task-worktree-ignored-content"
+ARCHIVE_ROOT_KIND = "task-worktree-archive-root"
+ARCHIVE_ROOT_MARKER = ".task-archive.json"
+ARCHIVE_RETENTION_MONTHS = 3
+DEFAULT_WORKSPACE_ROOT = Path(
+    os.environ.get("CC_CONNECT_TASK_WORKSPACE_ROOT", Path.home() / "workspace")
+).expanduser()
+
+
+def configured_cc_data_dir() -> Path:
+    """Resolve the cc-connect state directory used by lifecycle control."""
+    return Path(
+        os.environ.get(
+            "CC_CONNECT_TASK_DATA_DIR", Path.home() / ".cc-connect" / "data"
+        )
+    ).expanduser()
+
+
+DEFAULT_CC_DATA_DIR = configured_cc_data_dir()
+DEFAULT_CC_PROJECT = os.environ.get("CC_CONNECT_TASK_PROJECT", "workspace").strip()
+LARK_CLI_BOT_APP_ID = os.environ.get(
+    "CC_CONNECT_TASK_LARK_CLI_BOT_APP_ID", ""
+).strip()
+CURRENT_USER_OPEN_ID = os.environ.get(
+    "CC_CONNECT_TASK_USER_OPEN_ID", ""
+).strip()
+CC_CONNECT_BOT_APP_ID = os.environ.get(
+    "CC_CONNECT_TASK_BOT_APP_ID", ""
+).strip()
+DOCUMENT_REMOTE_HOSTS = frozenset(
+    host.strip().lower().rstrip(".")
+    for host in os.environ.get("CC_CONNECT_TASK_DOCUMENT_REMOTE_HOSTS", "").split(",")
+    if host.strip()
+)
+MAX_HANDOFF_BYTES = 12 * 1024
+MAX_LARK_CHAT_DESCRIPTION_CHARS = 100
+BRANCH_PATTERN = re.compile(r"^ws/[a-z][a-z0-9-]*/[a-z0-9][a-z0-9-]*$")
+CONTEXTUAL_PROMPT_TEMPLATE = """The task infrastructure is already initialized. Do not invoke $task init again.
+Verify and read the task handoff at `{path}` (SHA-256: `{digest}`), investigate the described task, and produce a decision-complete Plan for review. Do not implement before review."""
+
+
+class LifecycleError(RuntimeError):
+    """A deterministic task lifecycle conflict or command failure."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.code = code
+        self.details = details or {}
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class CompletedCommand:
+    args: tuple[str, ...]
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+@dataclass
+class LocalArchiveTransaction:
+    """Untracked worktree content staged until Git detaches the worktree."""
+
+    staging_path: Path
+    final_path: Path
+    files_path: Path
+    manifest: dict[str, Any]
+    moved_paths: list[str]
+
+
+class CommandRunner:
+    """Shell-free process runner used by the lifecycle reconciler."""
+
+    def run(
+        self,
+        args: Iterable[str | Path],
+        *,
+        cwd: Path | None = None,
+        allowed: tuple[int, ...] = (0,),
+        label: str | None = None,
+    ) -> CompletedCommand:
+        command = tuple(str(item) for item in args)
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(cwd) if cwd is not None else None,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise LifecycleError(
+                "command_not_found",
+                f"required command was not found: {command[0]}",
+            ) from exc
+        result = CompletedCommand(
+            command,
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+        )
+        if result.returncode not in allowed:
+            detail = (result.stderr or result.stdout).strip()
+            raise LifecycleError(
+                "command_failed",
+                f"{label or command[0]} failed with exit {result.returncode}: "
+                f"{detail or 'no diagnostic output'}",
+                {"command": list(command), "exitCode": result.returncode},
+            )
+        return result
+
+    def json(
+        self,
+        args: Iterable[str | Path],
+        *,
+        cwd: Path | None = None,
+        allowed: tuple[int, ...] = (0,),
+        label: str | None = None,
+    ) -> tuple[CompletedCommand, dict[str, Any]]:
+        completed = self.run(args, cwd=cwd, allowed=allowed, label=label)
+        payload = parse_json_output(completed.stdout, label or completed.args[0])
+        return completed, payload
+
+
+def parse_json_output(output: str, label: str) -> dict[str, Any]:
+    """Parse the last complete JSON object, tolerating CLI progress lines."""
+    decoder = json.JSONDecoder()
+    candidates = [0]
+    candidates.extend(index + 1 for index, char in enumerate(output) if char == "\n")
+    parsed: list[dict[str, Any]] = []
+    for start in candidates:
+        fragment = output[start:].lstrip()
+        if not fragment.startswith("{"):
+            continue
+        try:
+            value, end = decoder.raw_decode(fragment)
+        except json.JSONDecodeError:
+            continue
+        if not fragment[end:].strip() and isinstance(value, dict):
+            parsed.append(value)
+    if not parsed:
+        raise LifecycleError(
+            "invalid_json",
+            f"{label} did not return one parseable JSON object",
+        )
+    return parsed[-1]
+
+
+def resolve_codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+
+
+def canonical_existing_directory(value: str | Path | None, label: str) -> Path:
+    if not isinstance(value, (str, Path)):
+        raise LifecycleError("invalid_path", f"{label} path is missing or invalid")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise LifecycleError("invalid_path", f"{label} must be absolute: {path}")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise LifecycleError("invalid_path", f"could not resolve {label} {path}: {exc}") from exc
+    if not resolved.is_dir():
+        raise LifecycleError("invalid_path", f"{label} is not a directory: {resolved}")
+    return resolved
+
+
+def require_under(path: Path, root: Path, label: str) -> None:
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise LifecycleError(
+            "path_outside_workspace",
+            f"{label} {path} is outside workspace root {root}",
+        ) from exc
+
+
+def git(
+    runner: CommandRunner,
+    repo: Path,
+    *args: str,
+    allowed: tuple[int, ...] = (0,),
+) -> CompletedCommand:
+    return runner.run(
+        ("git", "-C", repo, *args),
+        allowed=allowed,
+        label=f"git {' '.join(args[:2])}",
+    )
+
+
+def git_common_dir(runner: CommandRunner, repo: Path) -> Path:
+    raw = git(
+        runner,
+        repo,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ).stdout.strip()
+    return canonical_existing_directory(raw, "Git common directory")
+
+
+def validate_stable_repo(
+    runner: CommandRunner,
+    repo_value: str,
+    workspace_root: Path,
+) -> tuple[Path, Path]:
+    repo = canonical_existing_directory(repo_value, "stable repository")
+    root = git(runner, repo, "rev-parse", "--show-toplevel").stdout.strip()
+    if canonical_existing_directory(root, "Git root") != repo:
+        raise LifecycleError("repo_conflict", f"stable repository is not its Git root: {repo}")
+    require_under(repo, workspace_root, "stable repository")
+    if repo.parent.name != repo.name:
+        raise LifecycleError(
+            "layout_conflict",
+            f"stable repository must use <workspace>/<repo>/<repo> layout: {repo}",
+        )
+    return repo, git_common_dir(runner, repo)
+
+
+def remote_url_host(remote_url: str) -> str | None:
+    """Extract an exact host from URL and scp-like Git remote syntax."""
+    if "://" in remote_url:
+        parsed = urlparse(remote_url)
+        return parsed.hostname.lower().rstrip(".") if parsed.hostname else None
+    match = re.fullmatch(
+        r"(?:[^@/:\s]+@)?(?P<host>[^/:\s]+):.+",
+        remote_url,
+    )
+    if match is None:
+        return None
+    return match.group("host").lower().rstrip(".")
+
+
+def configured_remote_hosts(runner: CommandRunner, repo: Path) -> list[str]:
+    hosts: set[str] = set()
+    remotes = sorted(
+        line for line in git(runner, repo, "remote").stdout.splitlines() if line
+    )
+    for remote in remotes:
+        urls = git(
+            runner, repo, "remote", "get-url", "--all", remote
+        ).stdout.splitlines()
+        for remote_url in urls:
+            host = remote_url_host(remote_url.strip())
+            if host:
+                hosts.add(host)
+    return sorted(hosts)
+
+
+def task_document_policy(
+    runner: CommandRunner,
+    stable_repo: Path,
+) -> dict[str, Any]:
+    """Require a task record when a remote matches a configured exact host."""
+    remote_hosts = configured_remote_hosts(runner, stable_repo)
+    matched_hosts = sorted(DOCUMENT_REMOTE_HOSTS.intersection(remote_hosts))
+    enabled = bool(matched_hosts)
+    return {
+        "enabled": enabled,
+        "status": (
+            "required"
+            if enabled
+            else "not applicable (no configured document remote)"
+        ),
+        "reason": (
+            f"configured remote: {', '.join(matched_hosts)}"
+            if enabled
+            else "no remote matched CC_CONNECT_TASK_DOCUMENT_REMOTE_HOSTS"
+        ),
+        "remoteHosts": remote_hosts,
+        "matchedHosts": matched_hosts,
+        "verified": True,
+    }
+
+
+def parse_worktree_porcelain(output: str) -> list[dict[str, str | bool]]:
+    records: list[dict[str, str | bool]] = []
+    current: dict[str, str | bool] = {}
+    for field in output.split("\0"):
+        if not field:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, separator, value = field.partition(" ")
+        current[key] = value if separator else True
+    if current:
+        records.append(current)
+    return records
+
+
+def worktree_inventory(runner: CommandRunner, repo: Path) -> list[dict[str, str | bool]]:
+    output = git(runner, repo, "worktree", "list", "--porcelain", "-z").stdout
+    records = parse_worktree_porcelain(output)
+    for record in records:
+        raw = record.get("worktree")
+        if isinstance(raw, str):
+            record["resolved"] = str(Path(raw).resolve(strict=False))
+    return records
+
+
+def preferred_remote(runner: CommandRunner, repo: Path) -> str:
+    remotes = [line for line in git(runner, repo, "remote").stdout.splitlines() if line]
+    if "origin" in remotes:
+        return "origin"
+    elif len(remotes) == 1:
+        return remotes[0]
+    raise LifecycleError(
+        "remote_ambiguous",
+        "cannot derive one remote default ref",
+        {"remotes": remotes},
+    )
+
+
+def cached_remote_default_ref(runner: CommandRunner, repo: Path) -> str | None:
+    remotes = [line for line in git(runner, repo, "remote").stdout.splitlines() if line]
+    if not remotes:
+        return None
+    remote = preferred_remote(runner, repo)
+    symbolic = git(
+        runner,
+        repo,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        f"refs/remotes/{remote}/HEAD",
+        allowed=(0, 1),
+    )
+    return symbolic.stdout.strip() if symbolic.returncode == 0 else None
+
+
+def remote_default_ref(runner: CommandRunner, repo: Path) -> str:
+    remote = preferred_remote(runner, repo)
+    git(runner, repo, "fetch", "--prune", remote)
+    symbolic = git(
+        runner,
+        repo,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        f"refs/remotes/{remote}/HEAD",
+        allowed=(0, 1),
+    )
+    if symbolic.returncode == 0 and symbolic.stdout.strip():
+        return symbolic.stdout.strip()
+    advertised = git(runner, repo, "ls-remote", "--symref", remote, "HEAD").stdout
+    match = re.search(r"^ref:\s+refs/heads/([^\s]+)\s+HEAD$", advertised, re.MULTILINE)
+    if match is None:
+        raise LifecycleError(
+            "remote_default_missing",
+            f"could not derive the default branch for remote {remote!r}; pass --base-ref",
+        )
+    candidate = f"refs/remotes/{remote}/{match.group(1)}"
+    exists = git(
+        runner,
+        repo,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        candidate,
+        allowed=(0, 1),
+    )
+    if exists.returncode != 0:
+        raise LifecycleError("remote_default_missing", f"fetched ref is missing: {candidate}")
+    return candidate
+
+
+def split_remote_default_ref(remote_ref: str) -> tuple[str, str]:
+    normalized = remote_ref.removeprefix("refs/remotes/")
+    remote, separator, branch = normalized.partition("/")
+    if not separator or not remote or not branch:
+        raise LifecycleError(
+            "remote_default_missing", f"invalid remote default ref: {remote_ref}"
+        )
+    return remote, branch
+
+
+def ensure_worktree(
+    runner: CommandRunner,
+    stable_repo: Path,
+    common_dir: Path,
+    workspace_root: Path,
+    branch: str,
+    base_ref: str | None,
+) -> dict[str, Any]:
+    if BRANCH_PATTERN.fullmatch(branch) is None:
+        raise LifecycleError(
+            "invalid_branch",
+            "branch must match ws/<angular-type>/<lowercase-hyphen-slug>",
+        )
+    target = stable_repo.parent / "worktrees" / branch.replace("/", "_")
+    target = target.resolve(strict=False)
+    require_under(target, workspace_root, "task worktree")
+    branch_ref = f"refs/heads/{branch}"
+    inventory = worktree_inventory(runner, stable_repo)
+    target_records = [item for item in inventory if item.get("resolved") == str(target)]
+    branch_records = [item for item in inventory if item.get("branch") == branch_ref]
+    if len(target_records) > 1 or len(branch_records) > 1:
+        raise LifecycleError("worktree_ambiguous", f"ambiguous worktree state for {branch}")
+    if branch_records and branch_records[0].get("resolved") != str(target):
+        raise LifecycleError(
+            "branch_checked_out_elsewhere",
+            f"branch {branch} is checked out at {branch_records[0].get('worktree')}",
+        )
+    if target_records and target_records[0].get("branch") != branch_ref:
+        raise LifecycleError(
+            "worktree_conflict",
+            f"target worktree {target} is attached to {target_records[0].get('branch')!r}",
+        )
+
+    created = False
+    if not target_records:
+        if target.exists():
+            raise LifecycleError(
+                "path_conflict",
+                f"target worktree path exists but is not a registered worktree: {target}",
+            )
+        branch_exists = git(
+            runner,
+            stable_repo,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            branch_ref,
+            allowed=(0, 1),
+        ).returncode == 0
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if branch_exists:
+            git(runner, stable_repo, "worktree", "add", str(target), branch)
+        else:
+            start_ref = base_ref or remote_default_ref(runner, stable_repo)
+            resolved_start = git(
+                runner,
+                stable_repo,
+                "rev-parse",
+                "--verify",
+                f"{start_ref}^{{commit}}",
+            ).stdout.strip()
+            git(
+                runner,
+                stable_repo,
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(target),
+                resolved_start,
+            )
+        created = True
+
+    worktree = canonical_existing_directory(target, "task worktree")
+    actual_root = canonical_existing_directory(
+        git(runner, worktree, "rev-parse", "--show-toplevel").stdout.strip(),
+        "task Git root",
+    )
+    actual_branch = git(runner, worktree, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    if actual_root != worktree or actual_branch != branch:
+        raise LifecycleError(
+            "worktree_conflict",
+            f"worktree identity mismatch at {worktree}: branch={actual_branch!r}",
+        )
+    if git_common_dir(runner, worktree) != common_dir:
+        raise LifecycleError("worktree_conflict", "task and stable worktrees have different Git common dirs")
+    return {
+        "path": str(worktree),
+        "branch": branch,
+        "created": created,
+        "head": git(runner, worktree, "rev-parse", "HEAD").stdout.strip(),
+    }
+
+
+def command_json_verified(
+    runner: CommandRunner,
+    args: list[str | Path],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    _, payload = runner.json(args, label=label)
+    if payload.get("verified") is not True:
+        raise LifecycleError("verification_failed", f"{label} did not report verified:true")
+    return payload
+
+
+def codex_command(
+    runner: CommandRunner,
+    executable: Path,
+    command: str,
+    *,
+    thread_id: str | None = None,
+    socket_path: str | None = None,
+    extra: Iterable[str | Path] = (),
+) -> dict[str, Any]:
+    args: list[str | Path] = [executable]
+    if thread_id is not None:
+        args.extend(("--thread", thread_id))
+    if socket_path is not None:
+        args.extend(("--socket", socket_path))
+    args.extend(("--json", command, *extra))
+    return command_json_verified(runner, args, label=f"codex-task-control {command}")
+
+
+def ensure_codex_thread(
+    runner: CommandRunner,
+    executable: Path,
+    worktree: Path,
+    branch: str,
+    existing_thread_id: str | None,
+    model: str | None,
+    socket_path: str | None,
+) -> dict[str, Any]:
+    extra: list[str | Path] = ["--cwd", worktree, "--name", branch]
+    if model:
+        extra.extend(("--model", model))
+    result = codex_command(
+        runner,
+        executable,
+        "ensure-thread",
+        thread_id=existing_thread_id,
+        socket_path=socket_path,
+        extra=extra,
+    )
+    if result.get("cwd") != str(worktree) or result.get("name") != branch:
+        raise LifecycleError("thread_conflict", "Codex thread identity verification failed")
+    if result.get("ephemeral") is not False or not isinstance(result.get("threadId"), str):
+        raise LifecycleError("thread_conflict", "Codex task thread is not persistent")
+    return result
+
+
+def git_path_state(runner: CommandRunner, worktree: Path, relative: str) -> dict[str, bool]:
+    tracked = git(
+        runner,
+        worktree,
+        "ls-files",
+        "--error-unmatch",
+        "--",
+        relative,
+        allowed=(0, 1),
+    ).returncode == 0
+    staged = bool(
+        git(
+            runner,
+            worktree,
+            "diff",
+            "--cached",
+            "--name-only",
+            "--",
+            relative,
+        ).stdout.strip()
+    )
+    ignored = git(
+        runner,
+        worktree,
+        "check-ignore",
+        "--quiet",
+        "--",
+        relative,
+        allowed=(0, 1),
+    ).returncode == 0
+    return {"tracked": tracked, "staged": staged, "ignored": ignored}
+
+
+def ensure_handoff(
+    runner: CommandRunner,
+    worktree: Path,
+    content: bytes | None,
+    expected_digest: str | None,
+) -> dict[str, Any]:
+    handoff = worktree / "handoff.md"
+    if handoff.parent != worktree:
+        raise LifecycleError("handoff_conflict", "handoff lexical parent is not the worktree")
+    flags = git_path_state(runner, worktree, "handoff.md")
+    if any(flags.values()):
+        raise LifecycleError("handoff_conflict", "handoff.md is tracked, staged, or ignored", flags)
+    try:
+        metadata = handoff.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is None:
+        if content is None:
+            raise LifecycleError("handoff_missing", f"contextual handoff is missing: {handoff}")
+        if len(content) > MAX_HANDOFF_BYTES:
+            raise LifecycleError(
+                "handoff_too_large",
+                f"handoff exceeds {MAX_HANDOFF_BYTES} bytes",
+            )
+        descriptor = os.open(handoff, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    else:
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise LifecycleError("handoff_conflict", f"handoff is not a non-symlink regular file: {handoff}")
+        if content is not None and handoff.read_bytes() != content:
+            raise LifecycleError("handoff_conflict", f"existing handoff bytes differ: {handoff}")
+    if handoff.stat().st_size > MAX_HANDOFF_BYTES:
+        raise LifecycleError(
+            "handoff_too_large",
+            f"handoff exceeds {MAX_HANDOFF_BYTES} bytes",
+        )
+    if handoff.resolve(strict=True).parent != worktree:
+        raise LifecycleError("handoff_conflict", "handoff resolved outside the worktree")
+    digest = hashlib.sha256(handoff.read_bytes()).hexdigest()
+    if expected_digest is not None and digest != expected_digest:
+        raise LifecycleError(
+            "handoff_conflict",
+            f"handoff digest {digest} differs from recorded {expected_digest}",
+        )
+    status_output = git(
+        runner,
+        worktree,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--",
+        "handoff.md",
+    ).stdout
+    if status_output != "?? handoff.md\n":
+        raise LifecycleError(
+            "handoff_conflict",
+            f"handoff must be exactly untracked, got {status_output!r}",
+        )
+    return {
+        "path": str(handoff),
+        "sha256": digest,
+        "bytes": handoff.stat().st_size,
+        "gitStatus": "?? handoff.md",
+    }
+
+
+def read_optional_bytes(path: str | None, label: str) -> bytes | None:
+    if path is None:
+        return None
+    source = Path(path).expanduser().resolve(strict=True)
+    if not source.is_file() or source.is_symlink():
+        raise LifecycleError("invalid_input", f"{label} must be a non-symlink regular file: {source}")
+    return source.read_bytes()
+
+
+def read_request(args: argparse.Namespace) -> str | None:
+    supplied = sum(
+        value is not None and value is not False
+        for value in (args.request, args.request_file, args.request_stdin)
+    )
+    if supplied > 1:
+        raise LifecycleError(
+            "invalid_input",
+            "pass only one of --request, --request-file, and --request-stdin",
+        )
+    if args.request_stdin:
+        return sys.stdin.read()
+    if args.request_file is not None:
+        raw = Path(args.request_file).expanduser().resolve(strict=True).read_text(encoding="utf-8")
+        return raw
+    return args.request
+
+
+def reconcile_input(
+    runner: CommandRunner,
+    worktree: Path,
+    input_mode: str,
+    request: str | None,
+    handoff_content: bytes | None,
+    recorded: dict[str, Any],
+) -> dict[str, Any]:
+    if recorded and recorded.get("mode") != input_mode:
+        raise LifecycleError("input_conflict", "input mode differs from the reconciled input")
+    if input_mode == "direct":
+        if request is None or not request.strip():
+            raise LifecycleError("invalid_input", "Direct init requires a non-empty --request")
+        if handoff_content is not None:
+            raise LifecycleError("invalid_input", "Direct init must not include a handoff")
+        desired = {"mode": "direct", "queuePayload": request, "handoff": None}
+    elif input_mode == "contextual":
+        if request is not None:
+            raise LifecycleError("invalid_input", "Contextual init takes --handoff-file, not --request")
+        recorded_handoff = recorded.get("handoff") if recorded else None
+        if not recorded and handoff_content is None:
+            raise LifecycleError(
+                "invalid_input",
+                "Contextual init requires explicit handoff content on first reconciliation",
+            )
+        if handoff_content is not None and not handoff_content.strip():
+            raise LifecycleError("invalid_input", "Contextual handoff must not be empty")
+        expected = recorded_handoff.get("sha256") if isinstance(recorded_handoff, dict) else None
+        handoff = ensure_handoff(runner, worktree, handoff_content, expected)
+        desired = {
+            "mode": "contextual",
+            "queuePayload": CONTEXTUAL_PROMPT_TEMPLATE.format(
+                path=handoff["path"], digest=handoff["sha256"]
+            ),
+            "handoff": handoff,
+        }
+    elif input_mode == "deferred":
+        if request is not None or handoff_content is not None:
+            raise LifecycleError("invalid_input", "Deferred init takes no request or handoff")
+        desired = {"mode": "deferred", "queuePayload": None, "handoff": None}
+    else:
+        raise LifecycleError("invalid_input", f"unsupported input mode: {input_mode}")
+    if recorded:
+        stable_recorded = {
+            "mode": recorded.get("mode"),
+            "queuePayload": recorded.get("queuePayload"),
+            "handoff": recorded.get("handoff"),
+        }
+        if desired != stable_recorded:
+            raise LifecycleError("input_conflict", "input payload differs from the reconciled input")
+    return desired
+
+
+def lark_json(
+    runner: CommandRunner,
+    lark_cli: str,
+    args: Iterable[str],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    _, payload = runner.json((lark_cli, *args), label=label)
+    if payload.get("ok") is not True:
+        raise LifecycleError("lark_failed", f"{label} returned ok:false", {"response": payload})
+    return payload
+
+
+def search_groups(
+    runner: CommandRunner,
+    lark_cli: str,
+    group_name: str,
+    identity: str,
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    token: str | None = None
+    seen: set[str] = set()
+    for _ in range(100):
+        args = [
+            "im",
+            "+chat-search",
+            "--query",
+            group_name,
+            "--chat-modes",
+            "group",
+            "--disable-search-by-user",
+            "--page-size",
+            "100",
+            "--as",
+            identity,
+            "--format",
+            "json",
+        ]
+        if token:
+            args.extend(("--page-token", token))
+        payload = lark_json(runner, lark_cli, args, label=f"Lark group search ({identity})")
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            raise LifecycleError("lark_invalid", "Lark chat search returned invalid data")
+        chats = data.get("chats")
+        if chats is None:
+            chats = []
+        if not isinstance(chats, list):
+            raise LifecycleError("lark_invalid", "Lark chat search returned invalid chats")
+        matches.extend(
+            item for item in chats if isinstance(item, dict) and item.get("name") == group_name
+        )
+        if not data.get("has_more"):
+            return matches
+        token = data.get("page_token")
+        if not isinstance(token, str) or not token or token in seen:
+            raise LifecycleError("lark_invalid", "Lark chat search returned an invalid cursor")
+        seen.add(token)
+    raise LifecycleError("lark_invalid", "Lark group search exceeded 10,000 pages")
+
+
+def find_exact_groups(
+    runner: CommandRunner,
+    lark_cli: str,
+    group_name: str,
+) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    for identity in ("bot", "user"):
+        for item in search_groups(runner, lark_cli, group_name, identity):
+            chat_id = item.get("chat_id")
+            if isinstance(chat_id, str):
+                by_id[chat_id] = item
+    return list(by_id.values())
+
+
+def create_group(
+    runner: CommandRunner,
+    lark_cli: str,
+    group_name: str,
+    session_id: str,
+) -> dict[str, Any]:
+    session_id = validate_group_session_description(session_id)
+    payload = lark_json(
+        runner,
+        lark_cli,
+        (
+            "im",
+            "+chat-create",
+            "--name",
+            group_name,
+            "--description",
+            session_id,
+            "--users",
+            CURRENT_USER_OPEN_ID,
+            "--bots",
+            CC_CONNECT_BOT_APP_ID,
+            "--type",
+            "private",
+            "--chat-mode",
+            "group",
+            "--as",
+            "bot",
+            "--format",
+            "json",
+        ),
+        label="Lark group create",
+    )
+    data = payload.get("data", {})
+    chat_id = data.get("chat_id") if isinstance(data, dict) else None
+    if not isinstance(chat_id, str) or not chat_id.startswith("oc_"):
+        raise LifecycleError("lark_invalid", "Lark group create returned no chat_id")
+    return {
+        "chatId": chat_id,
+        "name": group_name,
+        "shareLink": data.get("share_link"),
+        "description": session_id,
+        "creatorAppId": LARK_CLI_BOT_APP_ID,
+        "createdByLifecycle": True,
+    }
+
+
+def validate_group_session_description(session_id: str) -> str:
+    if not isinstance(session_id, str) or not session_id:
+        raise LifecycleError(
+            "group_description_invalid",
+            "native session ID must be a non-empty string",
+        )
+    if len(session_id) > MAX_LARK_CHAT_DESCRIPTION_CHARS:
+        raise LifecycleError(
+            "group_description_invalid",
+            "native session ID exceeds the Lark chat description limit",
+            {
+                "characters": len(session_id),
+                "limit": MAX_LARK_CHAT_DESCRIPTION_CHARS,
+            },
+        )
+    return session_id
+
+
+def read_group_description(
+    runner: CommandRunner,
+    lark_cli: str,
+    chat_id: str,
+) -> str:
+    payload = lark_json(
+        runner,
+        lark_cli,
+        (
+            "im",
+            "chats",
+            "get",
+            "--chat-id",
+            chat_id,
+            "--as",
+            "bot",
+            "--format",
+            "json",
+        ),
+        label="Lark group description read",
+    )
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise LifecycleError(
+            "lark_invalid", "Lark chat get returned invalid data"
+        )
+    description = data.get("description")
+    if description is None:
+        return ""
+    if not isinstance(description, str):
+        raise LifecycleError(
+            "lark_invalid", "Lark chat get returned an invalid description"
+        )
+    return description
+
+
+def ensure_group_session_description(
+    runner: CommandRunner,
+    lark_cli: str,
+    chat_id: str,
+    session_id: str,
+) -> dict[str, Any]:
+    session_id = validate_group_session_description(session_id)
+    previous = read_group_description(runner, lark_cli, chat_id)
+    updated = previous != session_id
+    if updated:
+        lark_json(
+            runner,
+            lark_cli,
+            (
+                "im",
+                "+chat-update",
+                "--chat-id",
+                chat_id,
+                "--description",
+                session_id,
+                "--as",
+                "bot",
+                "--format",
+                "json",
+            ),
+            label="Lark group description update",
+        )
+        actual = read_group_description(runner, lark_cli, chat_id)
+        if actual != session_id:
+            raise LifecycleError(
+                "group_description_conflict",
+                f"task group {chat_id} description did not match the native session ID",
+                {
+                    "expected": session_id,
+                    "actual": actual,
+                },
+            )
+    return {
+        "value": session_id,
+        "updated": updated,
+        "verified": True,
+    }
+
+
+def verify_group_members(
+    runner: CommandRunner,
+    lark_cli: str,
+    chat_id: str,
+) -> dict[str, Any]:
+    payload = lark_json(
+        runner,
+        lark_cli,
+        (
+            "im",
+            "+chat-members-list",
+            "--chat-id",
+            chat_id,
+            "--member-types",
+            "user,bot",
+            "--page-all",
+            "--page-limit",
+            "0",
+            "--page-delay",
+            "0",
+            "--as",
+            "bot",
+            "--format",
+            "json",
+        ),
+        label="Lark group member verification",
+    )
+    data = payload.get("data", {})
+    if not isinstance(data, dict) or data.get("has_more") is True or data.get("truncations"):
+        raise LifecycleError("group_incomplete", "Lark group member result is incomplete")
+    users = data.get("users", [])
+    bots = data.get("bots", [])
+    user_ids = {
+        item.get("member_id") for item in users if isinstance(item, dict)
+    } if isinstance(users, list) else set()
+    bot_ids = {
+        item.get("app_id") for item in bots if isinstance(item, dict)
+    } if isinstance(bots, list) else set()
+    expected_users = {CURRENT_USER_OPEN_ID}
+    expected_bots = {LARK_CLI_BOT_APP_ID, CC_CONNECT_BOT_APP_ID}
+    if user_ids != expected_users or bot_ids != expected_bots:
+        raise LifecycleError(
+            "group_membership_conflict",
+            f"task group {chat_id} has unexpected members",
+            {"users": sorted(user_ids), "bots": sorted(bot_ids)},
+        )
+    if data.get("user_total") != 1 or data.get("bot_total") != 2:
+        raise LifecycleError("group_membership_conflict", "task group totals do not match")
+    return {"users": sorted(user_ids), "bots": sorted(bot_ids), "verified": True}
+
+
+def verify_recorded_group(
+    runner: CommandRunner,
+    lark_cli: str,
+    group_name: str,
+    group: dict[str, Any],
+) -> dict[str, Any]:
+    if (
+        group.get("creatorAppId") != LARK_CLI_BOT_APP_ID
+        or group.get("createdByLifecycle") is not True
+    ):
+        raise LifecycleError("group_creator_conflict", "recorded group lacks CLI Bot creator proof")
+    chat_id = group.get("chatId")
+    if not isinstance(chat_id, str):
+        raise LifecycleError("group_state_invalid", "recorded group has no chatId")
+    matches = find_exact_groups(runner, lark_cli, group_name)
+    match_ids = {item.get("chat_id") for item in matches}
+    if match_ids != {chat_id}:
+        raise LifecycleError(
+            "group_collision",
+            f"exact-name group set differs from recorded task group: {sorted(str(x) for x in match_ids)}",
+        )
+    verify_group_members(runner, lark_cli, chat_id)
+    return group
+
+
+def ensure_feed_shortcut(
+    runner: CommandRunner,
+    lark_cli: str,
+    chat_id: str,
+) -> dict[str, Any]:
+    token: str | None = None
+    seen: set[str] = set()
+    found = False
+    for _ in range(100):
+        args = ["im", "+feed-shortcut-list", "--as", "user", "--no-detail"]
+        if token:
+            args.extend(("--page-token", token))
+        payload = lark_json(runner, lark_cli, args, label="Lark Feed Shortcut list")
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            raise LifecycleError("lark_invalid", "Feed Shortcut list returned invalid data")
+        shortcuts = data.get("shortcuts")
+        if shortcuts is None:
+            shortcuts = []
+        if not isinstance(shortcuts, list):
+            raise LifecycleError("lark_invalid", "Feed Shortcut list returned invalid data")
+        if any(
+            isinstance(item, dict) and item.get("feed_card_id") == chat_id
+            for item in shortcuts
+        ):
+            found = True
+        if not data.get("has_more"):
+            break
+        token = data.get("page_token")
+        if not isinstance(token, str) or not token or token in seen:
+            raise LifecycleError("lark_invalid", "Feed Shortcut list returned invalid cursor")
+        seen.add(token)
+    else:
+        raise LifecycleError("lark_invalid", "Feed Shortcut list exceeded 100 pages")
+    if found:
+        return {"present": True, "changed": False, "verified": True}
+    payload = lark_json(
+        runner,
+        lark_cli,
+        (
+            "im",
+            "+feed-shortcut-create",
+            "--as",
+            "user",
+            "--chat-id",
+            chat_id,
+            "--head",
+        ),
+        label="Lark Feed Shortcut create",
+    )
+    data = payload.get("data", {})
+    if (
+        not isinstance(data, dict)
+        or data.get("total") != 1
+        or data.get("success_count") != 1
+        or data.get("failure_count") != 0
+        or data.get("failed_shortcuts")
+    ):
+        raise LifecycleError("shortcut_failed", "Feed Shortcut create ledger was not a full success")
+    if chat_id not in list_feed_shortcuts(runner, lark_cli):
+        raise LifecycleError("shortcut_failed", "Feed Shortcut is absent after creation")
+    return {"present": True, "changed": True, "verified": True}
+
+
+def list_feed_shortcuts(
+    runner: CommandRunner,
+    lark_cli: str,
+) -> set[str]:
+    found: set[str] = set()
+    token: str | None = None
+    seen: set[str] = set()
+    for _ in range(100):
+        args = ["im", "+feed-shortcut-list", "--as", "user", "--no-detail"]
+        if token:
+            args.extend(("--page-token", token))
+        payload = lark_json(runner, lark_cli, args, label="Lark Feed Shortcut list")
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            raise LifecycleError("lark_invalid", "Feed Shortcut list returned invalid data")
+        shortcuts = data.get("shortcuts")
+        if shortcuts is None:
+            shortcuts = []
+        if not isinstance(shortcuts, list):
+            raise LifecycleError("lark_invalid", "Feed Shortcut list returned invalid data")
+        found.update(
+            item.get("feed_card_id")
+            for item in shortcuts
+            if isinstance(item, dict) and isinstance(item.get("feed_card_id"), str)
+        )
+        if not data.get("has_more"):
+            return found
+        token = data.get("page_token")
+        if not isinstance(token, str) or not token or token in seen:
+            raise LifecycleError("lark_invalid", "Feed Shortcut list returned invalid cursor")
+        seen.add(token)
+    raise LifecycleError("lark_invalid", "Feed Shortcut list exceeded 100 pages")
+
+
+def remove_feed_shortcut(
+    runner: CommandRunner,
+    lark_cli: str,
+    chat_id: str,
+) -> dict[str, Any]:
+    if chat_id not in list_feed_shortcuts(runner, lark_cli):
+        return {"present": False, "changed": False, "verified": True}
+    payload = lark_json(
+        runner,
+        lark_cli,
+        (
+            "im",
+            "+feed-shortcut-remove",
+            "--as",
+            "user",
+            "--chat-id",
+            chat_id,
+        ),
+        label="Lark Feed Shortcut remove",
+    )
+    data = payload.get("data", {})
+    if (
+        not isinstance(data, dict)
+        or data.get("total") != 1
+        or data.get("failure_count") != 0
+        or data.get("failed_shortcuts")
+    ):
+        raise LifecycleError("shortcut_failed", "Feed Shortcut remove ledger was not a full success")
+    if chat_id in list_feed_shortcuts(runner, lark_cli):
+        raise LifecycleError("shortcut_failed", "Feed Shortcut is still present after removal")
+    return {"present": False, "changed": True, "verified": True}
+
+
+def list_chat_messages(
+    runner: CommandRunner,
+    lark_cli: str,
+    chat_id: str,
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    token: str | None = None
+    seen: set[str] = set()
+    for _ in range(1000):
+        args = [
+            "im",
+            "+chat-messages-list",
+            "--chat-id",
+            chat_id,
+            "--order",
+            "asc",
+            "--page-size",
+            "50",
+            "--no-reactions",
+            "--as",
+            "bot",
+            "--format",
+            "json",
+        ]
+        if token:
+            args.extend(("--page-token", token))
+        payload = lark_json(runner, lark_cli, args, label="Lark task-group history")
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            raise LifecycleError("lark_invalid", "task-group history returned invalid data")
+        page = data.get("messages")
+        if page is None:
+            page = []
+        if not isinstance(page, list) or not all(isinstance(item, dict) for item in page):
+            raise LifecycleError("lark_invalid", "task-group history returned invalid messages")
+        messages.extend(page)
+        if not data.get("has_more"):
+            return messages
+        token = data.get("page_token")
+        if not isinstance(token, str) or not token or token in seen:
+            raise LifecycleError("lark_invalid", "task-group history returned invalid cursor")
+        seen.add(token)
+    raise LifecycleError("lark_invalid", "task-group history exceeded 50,000 messages")
+
+
+def canonical_record_message(record_url: str) -> str:
+    parsed = urlparse(record_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or re.fullmatch(r"/docx/[A-Za-z0-9]+/?", parsed.path) is None
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or any(character.isspace() for character in record_url)
+    ):
+        raise LifecycleError("invalid_record_url", "--record-url must be one bare HTTPS /docx/ URL")
+    return f"Task record: {record_url}"
+
+
+def validate_finish_document_input(
+    policy: dict[str, Any],
+    record_url: str | None,
+    document_ready: bool,
+) -> str | None:
+    if policy.get("enabled") is True:
+        if not document_ready:
+            raise LifecycleError(
+                "document_not_ready",
+                "finish-cleanup requires --document-ready after recording cleanup pending",
+            )
+        if record_url is None:
+            raise LifecycleError(
+                "document_not_ready",
+                "finish-cleanup requires --record-url when the task document is enabled",
+            )
+        canonical_record_message(record_url)
+        return record_url
+    if record_url is not None or document_ready:
+        raise LifecycleError(
+            "document_not_applicable",
+            "repositories without a configured document remote must omit "
+            "--record-url and --document-ready",
+        )
+    return None
+
+
+def validate_finish_document_finalized(
+    policy: dict[str, Any],
+    document_finalized: bool,
+) -> None:
+    if policy.get("enabled") is True:
+        if not document_finalized:
+            raise LifecycleError(
+                "document_not_finalized",
+                "finish-close requires --document-finalized after recording cleanup results",
+            )
+        return
+    if document_finalized:
+        raise LifecycleError(
+            "document_not_applicable",
+            "repositories without a configured document remote must omit "
+            "--document-finalized",
+        )
+
+
+def find_record_message(
+    messages: list[dict[str, Any]],
+    expected: str,
+) -> dict[str, Any] | None:
+    for message in messages:
+        sender = message.get("sender", {})
+        if (
+            message.get("deleted") is not True
+            and message.get("content") == expected
+            and isinstance(sender, dict)
+            and sender.get("id_type") == "app_id"
+            and sender.get("id") == CC_CONNECT_BOT_APP_ID
+        ):
+            return message
+    return None
+
+
+def ensure_record_notification(
+    runner: CommandRunner,
+    lark_cli: str,
+    cc_connect: str,
+    project: str,
+    session_key: str,
+    data_dir: Path,
+    chat_id: str,
+    record_url: str,
+) -> dict[str, Any]:
+    expected = canonical_record_message(record_url)
+    existing = find_record_message(list_chat_messages(runner, lark_cli, chat_id), expected)
+    if existing is not None:
+        return {
+            "messageId": existing.get("message_id"),
+            "text": expected,
+            "reused": True,
+            "verified": True,
+        }
+    completed = runner.run(
+        (
+            cc_connect,
+            "send",
+            "--project",
+            project,
+            "--session",
+            session_key,
+            "--data-dir",
+            data_dir,
+            "--message",
+            expected,
+        ),
+        allowed=tuple(range(256)),
+        label="cc-connect task-record notification",
+    )
+    sent = find_record_message(list_chat_messages(runner, lark_cli, chat_id), expected)
+    if sent is None:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise LifecycleError(
+            "record_notification_failed",
+            "canonical task-record notification is absent after cc-connect send"
+            + (f": {detail}" if detail else ""),
+            {"exitCode": completed.returncode},
+        )
+    return {
+        "messageId": sent.get("message_id"),
+        "text": expected,
+        "reused": False,
+        "verified": True,
+    }
+
+
+def git_operation_markers(runner: CommandRunner, repo: Path) -> list[str]:
+    markers = (
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "rebase-merge",
+        "rebase-apply",
+    )
+    active: list[str] = []
+    for marker in markers:
+        raw = git(runner, repo, "rev-parse", "--git-path", marker).stdout.strip()
+        path = Path(raw)
+        if not path.is_absolute():
+            path = repo / path
+        if path.exists():
+            active.append(marker)
+    return active
+
+
+def verify_no_git_operation(runner: CommandRunner, repo: Path, label: str) -> None:
+    markers = git_operation_markers(runner, repo)
+    if markers:
+        raise LifecycleError(
+            "git_operation_in_progress",
+            f"{label} has an active Git operation: {', '.join(markers)}",
+        )
+
+
+def resolve_finish_preflight_executable() -> Path:
+    path = Path(__file__).resolve().with_name("task-finish-git-preflight")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise LifecycleError(
+            "command_not_found", f"could not resolve finish preflight helper: {exc}"
+        ) from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise LifecycleError(
+            "command_not_found", f"finish preflight is not executable: {resolved}"
+        )
+    return resolved
+
+
+def finish_preflight_command(
+    runner: CommandRunner,
+    executable: Path,
+    stable_repo: Path,
+    target_commit: str,
+) -> dict[str, Any]:
+    completed, payload = runner.json(
+        (executable, "--stable", stable_repo, "--target", target_commit, "--json"),
+        allowed=(0, 1, 2),
+        label="task-finish-git-preflight",
+    )
+    if payload.get("verified") is not True:
+        raise LifecycleError(
+            "stable_preflight_failed",
+            "stable checkout preflight could not verify its result",
+            {"response": payload, "exitCode": completed.returncode},
+        )
+    return payload
+
+
+def changed_paths_between(
+    runner: CommandRunner,
+    repo: Path,
+    left: str,
+    right: str,
+) -> set[str]:
+    output = git(
+        runner,
+        repo,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        left,
+        right,
+        "--",
+    ).stdout
+    return {path for path in output.split("\0") if path}
+
+
+def task_changes_in_main(
+    runner: CommandRunner,
+    repo: Path,
+    task_head: str,
+    main_head: str,
+) -> dict[str, Any]:
+    task_commit = git(
+        runner, repo, "rev-parse", "--verify", f"{task_head}^{{commit}}"
+    ).stdout.strip()
+    main_commit = git(
+        runner, repo, "rev-parse", "--verify", f"{main_head}^{{commit}}"
+    ).stdout.strip()
+    ancestry = git(
+        runner,
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        task_commit,
+        main_commit,
+        allowed=(0, 1),
+    )
+    if ancestry.returncode == 0:
+        return {
+            "contained": True,
+            "method": "ancestor",
+            "taskHead": task_commit,
+            "mainHead": main_commit,
+            "differingPaths": [],
+            "verified": True,
+        }
+    merge_base = git(
+        runner, repo, "merge-base", task_commit, main_commit
+    ).stdout.strip()
+    task_paths = changed_paths_between(
+        runner, repo, merge_base, task_commit
+    )
+    differing_paths = sorted(
+        task_paths
+        & changed_paths_between(runner, repo, task_commit, main_commit)
+    )
+    return {
+        "contained": not differing_paths,
+        "method": "changed-path-tree",
+        "taskHead": task_commit,
+        "mainHead": main_commit,
+        "mergeBase": merge_base,
+        "taskChangedPathCount": len(task_paths),
+        "differingPaths": differing_paths[:100],
+        "differingPathCount": len(differing_paths),
+        "verified": True,
+    }
+
+
+def validate_stable_default_branch(
+    runner: CommandRunner,
+    stable_repo: Path,
+    remote_ref: str,
+) -> tuple[str, str]:
+    remote, default_branch = split_remote_default_ref(remote_ref)
+    stable_branch = git(
+        runner, stable_repo, "symbolic-ref", "--short", "HEAD"
+    ).stdout.strip()
+    if stable_branch != default_branch:
+        raise LifecycleError(
+            "stable_branch_conflict",
+            f"stable checkout is on {stable_branch!r}, expected {default_branch!r}",
+            {"remote": remote, "remoteDefaultRef": remote_ref},
+        )
+    return remote, default_branch
+
+
+def update_stable_to_remote_default(
+    runner: CommandRunner,
+    stable_repo: Path,
+) -> dict[str, Any]:
+    remote_ref = remote_default_ref(runner, stable_repo)
+    remote, default_branch = validate_stable_default_branch(
+        runner, stable_repo, remote_ref
+    )
+    original_head = git(runner, stable_repo, "rev-parse", "HEAD").stdout.strip()
+    target = git(
+        runner, stable_repo, "rev-parse", "--verify", f"{remote_ref}^{{commit}}"
+    ).stdout.strip()
+    ancestry = git(
+        runner,
+        stable_repo,
+        "merge-base",
+        "--is-ancestor",
+        original_head,
+        target,
+        allowed=(0, 1),
+    )
+    if ancestry.returncode != 0:
+        raise LifecycleError(
+            "stable_not_fast_forward",
+            "stable default branch cannot fast-forward to its fetched remote",
+            {"head": original_head, "target": target, "remoteDefaultRef": remote_ref},
+        )
+
+    preflight = None
+    if original_head != target:
+        executable = resolve_finish_preflight_executable()
+        preflight = finish_preflight_command(
+            runner, executable, stable_repo, target
+        )
+        if (
+            preflight.get("safe") is not True
+            or preflight.get("head") != original_head
+            or preflight.get("target") != target
+            or preflight.get("needsFastForward") is not True
+        ):
+            raise LifecycleError(
+                "stable_preflight_failed",
+                "stable checkout cannot be safely fast-forwarded",
+                {"response": preflight},
+            )
+        current = git(runner, stable_repo, "rev-parse", "HEAD").stdout.strip()
+        if current != original_head:
+            raise LifecycleError(
+                "stable_changed",
+                "stable HEAD changed after its update preflight",
+                {"expected": original_head, "actual": current},
+            )
+        repeated = finish_preflight_command(
+            runner, executable, stable_repo, target
+        )
+        if (
+            repeated.get("safe") is not True
+            or repeated.get("head") != current
+            or repeated.get("target") != target
+            or repeated.get("needsFastForward") is not True
+        ):
+            raise LifecycleError(
+                "stable_preflight_failed",
+                "repeated stable checkout preflight rejected the update",
+                {"response": repeated},
+            )
+        git(runner, stable_repo, "merge", "--ff-only", target)
+
+    final_head = git(runner, stable_repo, "rev-parse", "HEAD").stdout.strip()
+    if final_head != target:
+        raise LifecycleError(
+            "stable_update_failed",
+            "stable checkout did not reach the fetched remote default",
+            {"expected": target, "actual": final_head},
+        )
+    return {
+        "remote": remote,
+        "defaultBranch": default_branch,
+        "remoteDefaultRef": remote_ref,
+        "previousHead": original_head,
+        "head": final_head,
+        "updated": original_head != final_head,
+        "preflight": preflight,
+        "verified": True,
+    }
+
+
+def ensure_task_changes_in_main(
+    runner: CommandRunner,
+    stable_repo: Path,
+    branch: str,
+    task_head: str,
+) -> dict[str, Any]:
+    verify_no_git_operation(runner, stable_repo, "stable checkout")
+    cached_ref = cached_remote_default_ref(runner, stable_repo)
+    stable_branch = git(
+        runner, stable_repo, "symbolic-ref", "--short", "HEAD"
+    ).stdout.strip()
+    initial = None
+    default_branch = None
+    if cached_ref is not None:
+        _, default_branch = validate_stable_default_branch(
+            runner, stable_repo, cached_ref
+        )
+    elif stable_branch in ("main", "master"):
+        default_branch = stable_branch
+
+    if default_branch is not None:
+        local_head = git(runner, stable_repo, "rev-parse", "HEAD").stdout.strip()
+        initial = task_changes_in_main(
+            runner, stable_repo, task_head, local_head
+        )
+        if initial["contained"] is True:
+            return {
+                "branch": branch,
+                "taskHead": initial["taskHead"],
+                "defaultBranch": default_branch,
+                "initial": initial,
+                "refresh": None,
+                "final": initial,
+                "verified": True,
+            }
+
+    refresh = update_stable_to_remote_default(runner, stable_repo)
+    final = task_changes_in_main(
+        runner, stable_repo, task_head, refresh["head"]
+    )
+    result = {
+        "branch": branch,
+        "taskHead": final["taskHead"],
+        "defaultBranch": refresh["defaultBranch"],
+        "initial": initial,
+        "refresh": refresh,
+        "final": final,
+        "verified": True,
+    }
+    if final["contained"] is not True:
+        raise LifecycleError(
+            "task_not_integrated",
+            f"task branch changes are not present in latest {refresh['defaultBranch']}; "
+            f"merge or cherry-pick {branch} and rerun $task finish",
+            result,
+        )
+    return result
+
+
+def cc_control(
+    runner: CommandRunner,
+    executable: str,
+    domain: str,
+    operation: str,
+    *,
+    project: str,
+    session_key: str,
+    data_dir: Path,
+    worktree: Path | None = None,
+    agent_session_id: str | None = None,
+    expected_agent_session_id: str | None = None,
+) -> dict[str, Any]:
+    args = [
+        executable,
+        domain,
+        operation,
+        "--project",
+        project,
+        "--session",
+        session_key,
+        "--data-dir",
+        str(data_dir),
+        "--json",
+    ]
+    if worktree is not None:
+        args.extend(("--worktree", str(worktree)))
+    if agent_session_id is not None:
+        args.extend(("--agent-session-id", agent_session_id))
+    if expected_agent_session_id is not None:
+        args.extend(("--expected-agent-session-id", expected_agent_session_id))
+    completed, payload = runner.json(
+        args,
+        allowed=(0, 1, 2, 3, 4, 5),
+        label=f"cc-connect {domain} {operation}",
+    )
+    if (
+        completed.returncode != 0
+        or payload.get("ok") is not True
+        or payload.get("schema_version") != CC_SCHEMA_VERSION
+    ):
+        error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        raise LifecycleError(
+            "cc_control_failed",
+            f"cc-connect {domain} {operation} failed: {error.get('message') or payload}",
+            {"exitCode": completed.returncode, "response": payload},
+        )
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = payload.get("result")
+    if not isinstance(data, dict):
+        raise LifecycleError(
+            "cc_control_invalid",
+            "cc-connect returned no lifecycle result object",
+            {"response": payload},
+        )
+    returned_project = payload.get("project", data.get("project"))
+    returned_session = payload.get(
+        "session_key", data.get("session_key", data.get("session"))
+    )
+    if returned_project != project or returned_session != session_key:
+        raise LifecycleError("cc_control_invalid", "cc-connect returned another project or session")
+    # Keep one stable internal shape while tolerating both the approved `data`
+    # envelope and the deployed API's equivalent `result` envelope.
+    normalized = dict(payload)
+    normalized["project"] = returned_project
+    normalized["session_key"] = returned_session
+    normalized["data"] = data
+    return normalized
+
+
+def route_path(route: Any) -> str | None:
+    if isinstance(route, str):
+        return route
+    if not isinstance(route, dict):
+        return None
+    for key in ("workspace", "worktree", "path", "canonical_path"):
+        value = route.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def verify_cc_state(
+    workspace_payload: dict[str, Any],
+    sessions_payload: dict[str, Any],
+    worktree: Path,
+    thread_id: str,
+) -> None:
+    workspace_data = workspace_payload.get("data", {})
+    sessions_data = sessions_payload.get("data", {})
+    effective_route = (
+        workspace_data.get("effective_route") if isinstance(workspace_data, dict) else None
+    )
+    session_worktree = (
+        sessions_data.get("workspace", sessions_data.get("worktree"))
+        if isinstance(sessions_data, dict)
+        else None
+    )
+    if (
+        not isinstance(workspace_data, dict)
+        or route_path(effective_route) != str(worktree)
+        or workspace_data.get("shared_route") not in (None, {})
+        or not isinstance(sessions_data, dict)
+        or session_worktree != str(worktree)
+        or sessions_data.get("agent_session_id") != thread_id
+    ):
+        raise LifecycleError(
+            "cc_control_invalid",
+            "cc-connect status does not match the exact task route and thread",
+            {"workspace": workspace_data, "sessions": sessions_data},
+        )
+
+
+def current_codex_thread_id() -> str | None:
+    value = os.environ.get("CODEX_THREAD_ID", "").strip()
+    return value or None
+
+
+def inspect_thread_for_worktree(
+    runner: CommandRunner,
+    codex_control: Path,
+    thread_id: str,
+    worktree: Path,
+    socket_path: str | None,
+) -> dict[str, Any]:
+    inspected = codex_command(
+        runner,
+        codex_control,
+        "inspect",
+        thread_id=thread_id,
+        socket_path=socket_path,
+    )
+    if (
+        inspected.get("threadId") != thread_id
+        or inspected.get("cwd") != str(worktree)
+        or inspected.get("ephemeral") is not False
+    ):
+        raise LifecycleError(
+            "thread_conflict",
+            "native thread does not match the exact persistent task worktree",
+            {"thread": inspected, "worktree": str(worktree)},
+        )
+    return inspected
+
+
+def resolve_invoking_finish_thread(
+    runner: CommandRunner,
+    codex_control: Path,
+    worktree: Path,
+    socket_path: str | None,
+) -> dict[str, Any] | None:
+    """Verify the native thread whose active turn invoked finish."""
+    invoking_id = current_codex_thread_id()
+    if invoking_id is None:
+        return None
+    inspected = inspect_thread_for_worktree(
+        runner, codex_control, invoking_id, worktree, socket_path
+    )
+    if inspected.get("status") != "active":
+        raise LifecycleError(
+            "thread_conflict",
+            "the invoking native finish thread is not active",
+            {"thread": inspected},
+        )
+    return {**inspected, "identitySource": "invoking-thread"}
+
+
+def discover_active_cc_attachment(
+    data_dir: Path,
+    project: str,
+    thread_id: str,
+) -> dict[str, Any] | None:
+    """Reverse-resolve one active cc-connect session from an exact native ID."""
+    sessions_dir = data_dir / "sessions"
+    if not sessions_dir.exists():
+        return None
+    sessions_dir = canonical_existing_directory(
+        sessions_dir, "cc-connect sessions directory"
+    )
+    candidates: list[dict[str, Any]] = []
+    prefix = f"{project}_"
+    for path in sorted(sessions_dir.iterdir(), key=lambda item: item.name):
+        if not (
+            path.name.endswith(".json")
+            and (path.name == f"{project}.json" or path.name.startswith(prefix))
+        ):
+            continue
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise LifecycleError(
+                "cc_control_invalid",
+                f"cc-connect session snapshot has an unsafe file type: {path}",
+            )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeError, OSError) as exc:
+            raise LifecycleError(
+                "cc_control_invalid",
+                f"could not read cc-connect session snapshot {path.name}: {exc}",
+            ) from exc
+        if not isinstance(payload, dict) or "sessions" not in payload:
+            continue
+        sessions = payload.get("sessions")
+        active = payload.get("active_session")
+        user_sessions = payload.get("user_sessions")
+        user_meta = payload.get("user_meta", {})
+        if not all(isinstance(value, dict) for value in (sessions, active, user_sessions)):
+            raise LifecycleError(
+                "cc_control_invalid",
+                f"cc-connect session snapshot has an invalid shape: {path.name}",
+            )
+        for internal_id, session in sessions.items():
+            if not (
+                isinstance(internal_id, str)
+                and isinstance(session, dict)
+                and session.get("agent_session_id") == thread_id
+            ):
+                continue
+            owners = [
+                key
+                for key, identifiers in user_sessions.items()
+                if isinstance(key, str)
+                and isinstance(identifiers, list)
+                and internal_id in identifiers
+            ]
+            if len(owners) != 1:
+                raise LifecycleError(
+                    "cc_control_invalid",
+                    "the exact native thread has an ambiguous cc-connect owner",
+                    {"threadId": thread_id, "owners": owners},
+                )
+            session_key = owners[0]
+            if active.get(session_key) != internal_id:
+                continue
+            meta = user_meta.get(session_key, {}) if isinstance(user_meta, dict) else {}
+            candidates.append(
+                {
+                    "project": project,
+                    "sessionKey": session_key,
+                    "internalSessionId": internal_id,
+                    "agentSessionId": thread_id,
+                    "chatName": (
+                        meta.get("chat_name") if isinstance(meta, dict) else None
+                    ),
+                    "verified": True,
+                }
+            )
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise LifecycleError(
+            "cc_control_conflict",
+            "multiple active cc-connect sessions reference the invoking native thread",
+            {
+                "threadId": thread_id,
+                "sessions": sorted(item["sessionKey"] for item in candidates),
+            },
+        )
+    return candidates[0]
+
+
+def feishu_chat_id_from_session_key(session_key: str) -> str | None:
+    match = re.search(r"(?:^|:)feishu:(oc_[A-Za-z0-9]+)$", session_key)
+    return match.group(1) if match is not None else None
+
+
+def discover_attachment_group(
+    runner: CommandRunner,
+    lark_cli: str,
+    attachment: dict[str, Any] | None,
+    group_name: str | None,
+) -> dict[str, Any] | None:
+    """Resolve the exact Feishu group owning a verified cc-connect attachment."""
+    if attachment is None:
+        if group_name is not None:
+            raise LifecycleError(
+                "group_missing",
+                "--group-name cannot be used without an exact current-thread attachment",
+            )
+        return None
+    session_key = attachment.get("sessionKey")
+    if not isinstance(session_key, str):
+        raise LifecycleError("cc_control_invalid", "attachment has no exact session key")
+    chat_id = feishu_chat_id_from_session_key(session_key)
+    if chat_id is None:
+        if group_name is not None:
+            raise LifecycleError(
+                "group_missing", "the attached cc-connect session is not a Feishu group"
+            )
+        return None
+    if group_name is not None:
+        group = discover_group(runner, lark_cli, group_name)
+        assert group is not None
+        if group.get("chatId") != chat_id:
+            raise LifecycleError(
+                "group_collision",
+                "--group-name resolves to another cc-connect session",
+                {"expectedChatId": chat_id, "actualChatId": group.get("chatId")},
+            )
+        return {**group, "identitySource": "current-thread-attachment"}
+    return {
+        "chatId": chat_id,
+        "name": attachment.get("chatName"),
+        "membership": verify_group_members(runner, lark_cli, chat_id),
+        "identitySource": "current-thread-attachment",
+        "verified": True,
+    }
+
+
+def resolve_bound_finish_thread(
+    runner: CommandRunner,
+    codex_control: Path,
+    worktree: Path,
+    exact_thread: dict[str, Any] | None,
+    workspace_payload: dict[str, Any],
+    sessions_payload: dict[str, Any],
+    socket_path: str | None,
+) -> dict[str, Any]:
+    """Resolve a legacy-named finish target only from the invoking bound thread."""
+    sessions_data = sessions_payload.get("data", {})
+    bound_id = (
+        sessions_data.get("agent_session_id")
+        if isinstance(sessions_data, dict)
+        else None
+    )
+    if not isinstance(bound_id, str) or not bound_id:
+        raise LifecycleError(
+            "cc_control_invalid",
+            "the routed cc-connect session has no native thread identity",
+            {"sessions": sessions_data},
+        )
+    verify_cc_state(workspace_payload, sessions_payload, worktree, bound_id)
+    if exact_thread is not None:
+        if exact_thread.get("threadId") != bound_id:
+            raise LifecycleError(
+                "cc_control_conflict",
+                "the exact task thread and bound cc-connect thread differ",
+                {
+                    "taskThreadId": exact_thread.get("threadId"),
+                    "boundThreadId": bound_id,
+                },
+            )
+        return exact_thread
+
+    invoking_id = current_codex_thread_id()
+    if invoking_id != bound_id:
+        raise LifecycleError(
+            "cc_control_conflict",
+            "a legacy-named task thread must be both bound and currently invoking finish",
+            {"invokingThreadId": invoking_id, "boundThreadId": bound_id},
+        )
+    inspected = resolve_invoking_finish_thread(
+        runner, codex_control, worktree, socket_path
+    )
+    if inspected is None:
+        raise LifecycleError(
+            "cc_control_conflict",
+            "the invoking native thread identity disappeared during finish verification",
+        )
+    return {**inspected, "identitySource": "bound-invoking-thread"}
+
+
+def active_other_thread_ids(
+    listed: dict[str, Any],
+    worktree: Path,
+    target_id: str | None,
+) -> list[str]:
+    threads = listed.get("threads", [])
+    if not isinstance(threads, list):
+        raise LifecycleError("thread_conflict", "Codex returned an invalid thread list")
+    target_matches = 0
+    active_others: list[str] = []
+    for item in threads:
+        if (
+            not isinstance(item, dict)
+            or item.get("cwd") != str(worktree)
+            or not isinstance(item.get("threadId"), str)
+        ):
+            raise LifecycleError(
+                "thread_conflict",
+                "Codex returned an invalid task-worktree thread identity",
+                {"thread": item},
+            )
+        thread_id = item["threadId"]
+        if thread_id == target_id:
+            if item.get("ephemeral") is not False:
+                raise LifecycleError(
+                    "thread_conflict",
+                    "the selected finish thread is not persistent",
+                    {"thread": item},
+                )
+            target_matches += 1
+        elif item.get("status") == "active":
+            active_others.append(thread_id)
+    if target_id is not None and target_matches != 1:
+        raise LifecycleError(
+            "thread_conflict",
+            "the selected finish thread is missing or ambiguous in the task worktree",
+            {"threadId": target_id, "matches": target_matches},
+        )
+    return active_others
+
+
+def add_finish_target_arguments(command: argparse.ArgumentParser) -> None:
+    """Require an explicit removable-worktree or preserved-stable target."""
+    target = command.add_mutually_exclusive_group(required=True)
+    target.add_argument("--branch", help="exact ws/<type>/<slug> task branch")
+    target.add_argument(
+        "--stable-checkout",
+        action="store_true",
+        help=(
+            "finish only the invoking thread and its exact external lifecycle "
+            "resources; preserve the canonical stable checkout and every local file"
+        ),
+    )
+
+
+def stable_checkout_finish(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "stable_checkout", False))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="task-lifecycle-control",
+        description="Reconcile deterministic task lifecycle infrastructure.",
+    )
+    parser.add_argument("--json", action="store_true", help="emit one JSON result")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {SCRIPT_VERSION}")
+    parser.add_argument("--workspace-root", default=str(DEFAULT_WORKSPACE_ROOT))
+    parser.add_argument("--codex-socket", help="override the Codex App Server socket")
+    parser.add_argument("--codex-control", help="override codex-task-control executable")
+    parser.add_argument("--cc-connect", default="cc-connect")
+    parser.add_argument("--cc-data-dir", default=str(DEFAULT_CC_DATA_DIR))
+    parser.add_argument("--lark-cli", default="lark-cli")
+    commands = parser.add_subparsers(dest="command", required=True)
+    init = commands.add_parser("init", help="create/reuse and dispatch one task")
+    init.add_argument("--repo", required=True, help="canonical stable repository checkout")
+    init.add_argument("--branch", required=True, help="exact ws/<type>/<slug> branch")
+    init.add_argument("--base-ref", help="explicit start ref for a new branch")
+    init.add_argument("--group-name", help="defaults to <repo>-<slug>")
+    init.add_argument(
+        "--input-mode",
+        required=True,
+        choices=("direct", "contextual", "deferred"),
+    )
+    init.add_argument("--request", help="exact Direct-mode effective request")
+    init.add_argument("--request-file", help="UTF-8 file containing the Direct request")
+    init.add_argument(
+        "--request-stdin",
+        action="store_true",
+        help="read the exact Direct request as UTF-8 from stdin",
+    )
+    init.add_argument("--handoff-file", help="prepared Contextual handoff bytes")
+    init.add_argument(
+        "--handoff-stdin",
+        action="store_true",
+        help="read prepared Contextual handoff bytes from stdin",
+    )
+    init.add_argument("--model", help="optional model for a newly created Codex thread")
+    init.add_argument("--project", default=DEFAULT_CC_PROJECT, help="exact cc-connect project name")
+    execute = commands.add_parser(
+        "execute",
+        help="move the recorded thread to Default mode and queue its execution continuation",
+    )
+    execute.add_argument("--repo", required=True)
+    execute.add_argument("--branch", required=True)
+    execute.add_argument("--group-name", help="defaults to <repo>-<slug>")
+    execute.add_argument("--project", default=DEFAULT_CC_PROJECT)
+    execute.add_argument("--continuation", default="$task execute")
+    finish_handoff = commands.add_parser(
+        "finish-handoff",
+        help="move the recorded thread to Default mode and queue its finish continuation",
+    )
+    finish_handoff.add_argument("--repo", required=True)
+    add_finish_target_arguments(finish_handoff)
+    finish_handoff.add_argument(
+        "--group-name",
+        help="task-worktree default is <repo>-<slug>; stable mode uses it only as a check",
+    )
+    finish_handoff.add_argument("--project", default=DEFAULT_CC_PROJECT)
+    cleanup = commands.add_parser(
+        "finish-cleanup",
+        help="verify and remove local task infrastructure before final document closeout",
+    )
+    cleanup.add_argument("--repo", required=True)
+    add_finish_target_arguments(cleanup)
+    cleanup.add_argument(
+        "--group-name",
+        help="task-worktree default is <repo>-<slug>; stable mode uses it only as a check",
+    )
+    cleanup.add_argument("--project", default=DEFAULT_CC_PROJECT)
+    cleanup.add_argument(
+        "--record-url",
+        help="bare task-record URL; omit when no remote matches the configured document hosts",
+    )
+    cleanup.add_argument(
+        "--document-ready",
+        action="store_true",
+        help="confirm the task document already records cleanup pending",
+    )
+    close = commands.add_parser(
+        "finish-close",
+        help="remove the Feed Shortcut and archive the native thread as the final operation",
+    )
+    close.add_argument("--repo", required=True)
+    add_finish_target_arguments(close)
+    close.add_argument(
+        "--group-name",
+        help="task-worktree default is <repo>-<slug>; stable mode uses it only as a check",
+    )
+    close.add_argument("--project", default=DEFAULT_CC_PROJECT)
+    close.add_argument(
+        "--thread-id",
+        help="exact native thread ID returned by finish-cleanup",
+    )
+    close.add_argument(
+        "--session-key",
+        help="exact cc-connect session key returned by stable finish-cleanup",
+    )
+    close.add_argument(
+        "--document-finalized",
+        action="store_true",
+        help="confirm the task document contains the completed cleanup result",
+    )
+    status = commands.add_parser("status", help="verify one recorded task")
+    status.add_argument("--repo", required=True)
+    status.add_argument("--branch", required=True)
+    status.add_argument("--group-name", help="defaults to <repo>-<slug>")
+    status.add_argument("--project", default=DEFAULT_CC_PROJECT)
+    return parser
+
+
+def derived_group_name(stable_repo: Path, branch: str) -> str:
+    slug = branch.split("/", 2)[2]
+    return f"{stable_repo.name}-{slug}"
+
+
+def derived_worktree_path(stable_repo: Path, branch: str, workspace_root: Path) -> Path:
+    if BRANCH_PATTERN.fullmatch(branch) is None:
+        raise LifecycleError(
+            "invalid_branch",
+            "branch must match ws/<angular-type>/<lowercase-hyphen-slug>",
+        )
+    path = (stable_repo.parent / "worktrees" / branch.replace("/", "_")).resolve(
+        strict=False
+    )
+    require_under(path, workspace_root, "task worktree")
+    return path
+
+
+def path_exists_no_follow(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def private_directory(path: Path, label: str) -> Path:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise LifecycleError("archive_conflict", f"{label} is not a real directory: {path}")
+    if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+        raise LifecycleError(
+            "archive_permissions",
+            f"{label} must be owned by the current user with mode 0700: {path}",
+        )
+    return path.resolve(strict=True)
+
+
+def write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    if path_exists_no_follow(temporary):
+        raise LifecycleError("archive_conflict", f"temporary manifest exists: {temporary}")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if path_exists_no_follow(temporary):
+            temporary.unlink()
+        raise
+
+
+def archive_root(
+    stable_repo: Path,
+    workspace_root: Path,
+    *,
+    create: bool,
+) -> Path | None:
+    root = stable_repo.parent / "archive"
+    require_under(root.resolve(strict=False), workspace_root, "task archive")
+    created = False
+    if not path_exists_no_follow(root):
+        if not create:
+            return None
+        os.mkdir(root, 0o700)
+        created = True
+    try:
+        resolved = private_directory(root, "task archive root")
+        require_under(resolved, workspace_root, "task archive")
+        marker = resolved / ARCHIVE_ROOT_MARKER
+        if created:
+            write_private_json(
+                marker,
+                {
+                    "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+                    "kind": ARCHIVE_ROOT_KIND,
+                },
+            )
+        else:
+            try:
+                marker_metadata = marker.lstat()
+                if stat.S_ISLNK(marker_metadata.st_mode) or not stat.S_ISREG(
+                    marker_metadata.st_mode
+                ):
+                    raise LifecycleError(
+                        "archive_conflict", f"invalid task archive marker: {marker}"
+                    )
+                marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, UnicodeError) as exc:
+                raise LifecycleError(
+                    "archive_conflict",
+                    f"existing archive directory is not lifecycle-owned: {resolved}",
+                ) from exc
+            if marker_payload != {
+                "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+                "kind": ARCHIVE_ROOT_KIND,
+            }:
+                raise LifecycleError(
+                    "archive_conflict",
+                    f"unexpected task archive marker: {marker}",
+                )
+        return resolved
+    except BaseException:
+        if created and path_exists_no_follow(root):
+            try:
+                root.rmdir()
+            except OSError:
+                pass
+        raise
+
+
+def archive_month_directory(root: Path, month: str) -> Path:
+    if re.fullmatch(r"[0-9]{4}-(?:0[1-9]|1[0-2])", month) is None:
+        raise LifecycleError("archive_conflict", f"invalid archive month: {month!r}")
+    target = root / month
+    if not path_exists_no_follow(target):
+        os.mkdir(target, 0o700)
+    resolved = private_directory(target, "task archive month")
+    if resolved.parent != root:
+        raise LifecycleError("archive_conflict", f"archive month escaped its root: {target}")
+    return resolved
+
+
+def normalized_untracked_path(raw: str) -> str:
+    value = raw[:-1] if raw.endswith("/") else raw
+    candidate = PurePosixPath(value)
+    if (
+        not value
+        or candidate.is_absolute()
+        or str(candidate) != value
+        or any(part in ("", ".", "..") for part in candidate.parts)
+        or candidate.parts[0] == ".git"
+    ):
+        raise LifecycleError(
+            "archive_unsafe_path",
+            f"Git returned an unsafe ignored path: {raw!r}",
+        )
+    return value
+
+
+def untracked_worktree_paths(runner: CommandRunner, worktree: Path) -> list[str]:
+    outputs = [
+        git(
+            runner,
+            worktree,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+            "-z",
+        ).stdout,
+        git(
+            runner,
+            worktree,
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+            "-z",
+        ).stdout,
+    ]
+    paths = sorted(
+        {
+            normalized_untracked_path(raw)
+            for output in outputs
+            for raw in output.split("\0")
+            if raw
+        },
+        key=lambda value: (len(PurePosixPath(value).parts), value),
+    )
+    collapsed: list[str] = []
+    for value in paths:
+        parts = PurePosixPath(value).parts
+        if any(
+            parts[: len(PurePosixPath(parent).parts)]
+            == PurePosixPath(parent).parts
+            for parent in collapsed
+        ):
+            continue
+        source = worktree.joinpath(*parts)
+        try:
+            metadata = source.lstat()
+        except FileNotFoundError as exc:
+            raise LifecycleError(
+                "archive_race", f"untracked path disappeared during inventory: {value!r}"
+            ) from exc
+        if not (
+            stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+        ):
+            raise LifecycleError(
+                "archive_unsafe_type",
+                f"ignored path has an unsupported file type: {value!r}",
+            )
+        collapsed.append(value)
+    return collapsed
+
+
+def tracked_worktree_status(runner: CommandRunner, worktree: Path) -> str:
+    status = git(
+        runner, worktree, "status", "--porcelain=v1", "--untracked-files=all"
+    ).stdout
+    changes = [line for line in status.splitlines() if not line.startswith("?? ")]
+    return "\n".join(changes) + ("\n" if changes else "")
+
+
+def archive_task_component(thread_id: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", thread_id):
+        return thread_id
+    return f"task-{hashlib.sha256(thread_id.encode('utf-8')).hexdigest()[:24]}"
+
+
+def month_start_after(now: datetime, months: int) -> datetime:
+    index = now.year * 12 + now.month - 1 + months
+    return datetime(index // 12, index % 12 + 1, 1, tzinfo=timezone.utc)
+
+
+def archive_entry(worktree: Path, relative: str) -> dict[str, Any]:
+    source = worktree.joinpath(*PurePosixPath(relative).parts)
+    metadata = source.lstat()
+    if stat.S_ISDIR(metadata.st_mode):
+        kind = "directory"
+    elif stat.S_ISLNK(metadata.st_mode):
+        kind = "symlink"
+    elif stat.S_ISREG(metadata.st_mode):
+        kind = "file"
+    else:
+        raise LifecycleError(
+            "archive_unsafe_type",
+            f"ignored path has an unsupported file type: {relative!r}",
+        )
+    return {
+        "path": relative,
+        "type": kind,
+        "lstatBytes": metadata.st_size,
+    }
+
+
+def rollback_local_archive(
+    transaction: LocalArchiveTransaction,
+    worktree: Path,
+) -> None:
+    failures: list[str] = []
+    for relative in reversed(transaction.moved_paths):
+        archived = transaction.files_path.joinpath(*PurePosixPath(relative).parts)
+        original = worktree.joinpath(*PurePosixPath(relative).parts)
+        if not path_exists_no_follow(archived):
+            continue
+        try:
+            original.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if path_exists_no_follow(original):
+                raise FileExistsError(str(original))
+            os.rename(archived, original)
+        except OSError:
+            failures.append(relative)
+    if failures:
+        raise LifecycleError(
+            "archive_rollback_failed",
+            "could not restore untracked content after worktree cleanup failed",
+            {
+                "paths": failures,
+                "stagingPath": str(transaction.staging_path),
+            },
+        )
+    if path_exists_no_follow(transaction.staging_path):
+        shutil.rmtree(transaction.staging_path)
+
+
+def prepare_local_archive(
+    stable_repo: Path,
+    workspace_root: Path,
+    worktree: Path,
+    branch: str,
+    head: str,
+    thread_id: str,
+    paths: list[str],
+    now: datetime,
+) -> LocalArchiveTransaction:
+    root = archive_root(stable_repo, workspace_root, create=True)
+    assert root is not None
+    month = now.astimezone(timezone.utc).strftime("%Y-%m")
+    month_directory = archive_month_directory(root, month)
+    stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    base_name = f"{archive_task_component(thread_id)}-{stamp}"
+    suffix = 0
+    while True:
+        name = base_name if suffix == 0 else f"{base_name}-{suffix}"
+        final_path = month_directory / name
+        staging_path = month_directory / f".{name}.partial"
+        if not path_exists_no_follow(final_path) and not path_exists_no_follow(staging_path):
+            break
+        suffix += 1
+    entries = [archive_entry(worktree, relative) for relative in paths]
+    os.mkdir(staging_path, 0o700)
+    files_path = staging_path / "files"
+    try:
+        os.mkdir(files_path, 0o700)
+    except BaseException:
+        staging_path.rmdir()
+        raise
+    archived_at = now.astimezone(timezone.utc)
+    manifest = {
+        "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+        "kind": ARCHIVE_KIND,
+        "state": "preparing",
+        "taskId": thread_id,
+        "branch": branch,
+        "head": head,
+        "sourceWorktree": str(worktree),
+        "archiveMonth": month,
+        "archivedAt": archived_at.isoformat().replace("+00:00", "Z"),
+        "deleteEligibleAfter": month_start_after(
+            archived_at, ARCHIVE_RETENTION_MONTHS
+        ).isoformat().replace("+00:00", "Z"),
+        "worktreeDetached": False,
+        "entries": entries,
+    }
+    transaction = LocalArchiveTransaction(
+        staging_path=staging_path,
+        final_path=final_path,
+        files_path=files_path,
+        manifest=manifest,
+        moved_paths=[],
+    )
+    try:
+        write_private_json(staging_path / "manifest.json", manifest)
+        for relative in paths:
+            source = worktree.joinpath(*PurePosixPath(relative).parts)
+            destination = files_path.joinpath(*PurePosixPath(relative).parts)
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if path_exists_no_follow(destination):
+                raise LifecycleError(
+                    "archive_conflict",
+                    f"archive destination already exists: {destination}",
+                )
+            os.rename(source, destination)
+            transaction.moved_paths.append(relative)
+        manifest["state"] = "prepared"
+        write_private_json(staging_path / "manifest.json", manifest)
+        return transaction
+    except BaseException:
+        rollback_local_archive(transaction, worktree)
+        raise
+
+
+def finalize_local_archive(
+    transaction: LocalArchiveTransaction,
+    detached_at: datetime,
+) -> dict[str, Any]:
+    transaction.manifest["state"] = "complete"
+    transaction.manifest["worktreeDetached"] = True
+    transaction.manifest["detachedAt"] = detached_at.astimezone(
+        timezone.utc
+    ).isoformat().replace("+00:00", "Z")
+    write_private_json(
+        transaction.staging_path / "manifest.json", transaction.manifest
+    )
+    os.rename(transaction.staging_path, transaction.final_path)
+    return {
+        "path": str(transaction.final_path),
+        "manifest": str(transaction.final_path / "manifest.json"),
+        "month": transaction.manifest["archiveMonth"],
+        "deleteEligibleAfter": transaction.manifest["deleteEligibleAfter"],
+        "entries": transaction.manifest["entries"],
+        "worktreeDetached": True,
+        "verified": True,
+    }
+
+
+def remove_linked_worktree(
+    runner: CommandRunner,
+    stable_repo: Path,
+    worktree: Path,
+) -> None:
+    git(runner, stable_repo, "worktree", "remove", str(worktree))
+    if worktree.exists() or any(
+        item.get("resolved") == str(worktree)
+        for item in worktree_inventory(runner, stable_repo)
+    ):
+        raise LifecycleError("worktree_remove_failed", "Git still lists the task worktree")
+
+
+def archive_and_remove_worktree(
+    runner: CommandRunner,
+    stable_repo: Path,
+    workspace_root: Path,
+    worktree: Path,
+    branch: str,
+    head: str,
+    thread_id: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    archive_time = now or datetime.now(timezone.utc)
+    transaction: LocalArchiveTransaction | None = None
+    local_paths: list[str] = []
+    for attempt in range(3):
+        local_paths = untracked_worktree_paths(runner, worktree)
+        if not local_paths:
+            break
+        transaction = prepare_local_archive(
+            stable_repo,
+            workspace_root,
+            worktree,
+            branch,
+            head,
+            thread_id,
+            local_paths,
+            archive_time,
+        )
+        if not untracked_worktree_paths(runner, worktree):
+            break
+        rollback_local_archive(transaction, worktree)
+        transaction = None
+        if attempt == 2:
+            raise LifecycleError(
+                "archive_race",
+                "untracked content kept changing while task cleanup was archiving it",
+            )
+    try:
+        remove_linked_worktree(runner, stable_repo, worktree)
+    except BaseException:
+        if transaction is not None and worktree.exists():
+            rollback_local_archive(transaction, worktree)
+        raise
+    archive = (
+        finalize_local_archive(transaction, datetime.now(timezone.utc))
+        if transaction is not None
+        else None
+    )
+    return archive, local_paths
+
+
+def archive_month_index(value: str) -> int | None:
+    match = re.fullmatch(r"([0-9]{4})-(0[1-9]|1[0-2])", value)
+    if match is None:
+        return None
+    return int(match.group(1)) * 12 + int(match.group(2)) - 1
+
+
+def purge_expired_archives(
+    stable_repo: Path,
+    workspace_root: Path,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    try:
+        root = archive_root(stable_repo, workspace_root, create=False)
+    except LifecycleError as exc:
+        return {
+            "removed": [],
+            "skipped": [{"path": str(stable_repo.parent / "archive"), "reason": str(exc)}],
+            "verified": True,
+        }
+    if root is None:
+        return {"removed": [], "skipped": [], "verified": True}
+    current_index = current.year * 12 + current.month - 1
+    removed: list[str] = []
+    skipped: list[dict[str, str]] = []
+    for month_directory in sorted(root.iterdir(), key=lambda path: path.name):
+        month_index = archive_month_index(month_directory.name)
+        if month_index is None or current_index - month_index < ARCHIVE_RETENTION_MONTHS:
+            continue
+        try:
+            resolved_month = private_directory(month_directory, "task archive month")
+        except LifecycleError as exc:
+            skipped.append({"path": str(month_directory), "reason": str(exc)})
+            continue
+        if resolved_month.parent != root:
+            skipped.append({"path": str(month_directory), "reason": "month escaped archive root"})
+            continue
+        for item in sorted(resolved_month.iterdir(), key=lambda path: path.name):
+            if item.name.startswith("."):
+                skipped.append({"path": str(item), "reason": "incomplete archive"})
+                continue
+            try:
+                item_metadata = item.lstat()
+                manifest_path = item / "manifest.json"
+                manifest_metadata = manifest_path.lstat()
+                if (
+                    stat.S_ISLNK(item_metadata.st_mode)
+                    or not stat.S_ISDIR(item_metadata.st_mode)
+                    or stat.S_ISLNK(manifest_metadata.st_mode)
+                    or not stat.S_ISREG(manifest_metadata.st_mode)
+                ):
+                    raise ValueError("archive or manifest has an unsafe file type")
+                if item.resolve(strict=True).parent != resolved_month:
+                    raise ValueError("archive escaped its month directory")
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if not (
+                    manifest.get("schemaVersion") == ARCHIVE_SCHEMA_VERSION
+                    and manifest.get("kind") == ARCHIVE_KIND
+                    and manifest.get("state") == "complete"
+                    and manifest.get("worktreeDetached") is True
+                    and manifest.get("archiveMonth") == month_directory.name
+                ):
+                    raise ValueError("archive manifest is not complete and detached")
+            except (FileNotFoundError, json.JSONDecodeError, UnicodeError, ValueError) as exc:
+                skipped.append({"path": str(item), "reason": str(exc)})
+                continue
+            shutil.rmtree(item)
+            removed.append(str(item))
+        try:
+            resolved_month.rmdir()
+        except OSError:
+            pass
+    return {"removed": removed, "skipped": skipped, "verified": True}
+
+
+def discover_worktree(
+    runner: CommandRunner,
+    stable_repo: Path,
+    common_dir: Path,
+    workspace_root: Path,
+    branch: str,
+    *,
+    allow_absent: bool = False,
+) -> dict[str, Any] | None:
+    """Read the exact linked worktree from Git; never consult lifecycle cache."""
+    expected = derived_worktree_path(stable_repo, branch, workspace_root)
+    branch_ref = f"refs/heads/{branch}"
+    inventory = worktree_inventory(runner, stable_repo)
+    matches = [item for item in inventory if item.get("branch") == branch_ref]
+    if not matches:
+        if allow_absent:
+            return None
+        raise LifecycleError("worktree_missing", f"no linked worktree for {branch}")
+    if len(matches) != 1 or matches[0].get("resolved") != str(expected):
+        raise LifecycleError(
+            "worktree_ambiguous",
+            f"branch {branch} is not checked out at its canonical task worktree",
+            {"matches": matches, "expected": str(expected)},
+        )
+    worktree = canonical_existing_directory(expected, "task worktree")
+    if git_common_dir(runner, worktree) != common_dir:
+        raise LifecycleError("worktree_conflict", "task worktree has another Git common dir")
+    actual_branch = git(runner, worktree, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    if actual_branch != branch:
+        raise LifecycleError("worktree_conflict", f"task worktree is on {actual_branch!r}")
+    verify_no_git_operation(runner, worktree, "task worktree")
+    return {
+        "path": str(worktree),
+        "branch": branch,
+        "head": git(runner, worktree, "rev-parse", "HEAD").stdout.strip(),
+    }
+
+
+def discover_thread(
+    runner: CommandRunner,
+    codex_control: Path,
+    worktree: Path,
+    branch: str,
+    socket_path: str | None,
+    *,
+    allow_absent: bool = False,
+) -> dict[str, Any] | None:
+    """Read one exact-name/exact-cwd native thread from Codex."""
+    listed = codex_command(
+        runner,
+        codex_control,
+        "list-threads",
+        socket_path=socket_path,
+        extra=("--cwd", worktree),
+    )
+    matches = [
+        item
+        for item in listed.get("threads", [])
+        if isinstance(item, dict)
+        and item.get("cwd") == str(worktree)
+        and item.get("name") == branch
+        and item.get("ephemeral") is False
+    ]
+    if not matches:
+        if allow_absent:
+            return None
+        raise LifecycleError("thread_missing", f"no native task thread for {branch}")
+    if len(matches) != 1 or not isinstance(matches[0].get("threadId"), str):
+        raise LifecycleError("thread_ambiguous", f"native thread identity is ambiguous for {branch}")
+    inspected = codex_command(
+        runner,
+        codex_control,
+        "inspect",
+        thread_id=matches[0]["threadId"],
+        socket_path=socket_path,
+    )
+    if (
+        inspected.get("cwd") != str(worktree)
+        or inspected.get("name") != branch
+        or inspected.get("ephemeral") is not False
+    ):
+        raise LifecycleError("thread_conflict", "native task thread identity changed")
+    return {**inspected, "threadList": listed}
+
+
+def discover_group(
+    runner: CommandRunner,
+    lark_cli: str,
+    group_name: str,
+    *,
+    allow_absent: bool = False,
+) -> dict[str, Any] | None:
+    """Read one exact-name task group from Lark and verify its full membership."""
+    matches = find_exact_groups(runner, lark_cli, group_name)
+    if not matches:
+        if allow_absent:
+            return None
+        raise LifecycleError("group_missing", f"no exact task group named {group_name!r}")
+    if len(matches) != 1:
+        raise LifecycleError(
+            "group_collision",
+            f"multiple exact-name task groups named {group_name!r}",
+            {"chatIds": sorted(str(item.get("chat_id")) for item in matches)},
+        )
+    chat_id = matches[0].get("chat_id")
+    if not isinstance(chat_id, str):
+        raise LifecycleError("group_state_invalid", "task group has no chat ID")
+    membership = verify_group_members(runner, lark_cli, chat_id)
+    return {
+        "chatId": chat_id,
+        "name": group_name,
+        "membership": membership,
+        "verified": True,
+    }
+
+
+def ensure_task_group(
+    runner: CommandRunner,
+    lark_cli: str,
+    group_name: str,
+    session_id: str,
+) -> dict[str, Any]:
+    """Reconcile one task group and bind its description to the native session."""
+    group = discover_group(runner, lark_cli, group_name, allow_absent=True)
+    if group is None:
+        group = create_group(runner, lark_cli, group_name, session_id)
+        group["membership"] = verify_group_members(
+            runner, lark_cli, group["chatId"]
+        )
+        group["verified"] = True
+    group["sessionDescription"] = ensure_group_session_description(
+        runner, lark_cli, group["chatId"], session_id
+    )
+    return group
+
+
+def resolve_control_executable(explicit: str | None) -> Path:
+    path = Path(explicit).expanduser() if explicit else Path(__file__).resolve().with_name(
+        "codex-task-control"
+    )
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise LifecycleError("command_not_found", f"could not resolve codex control: {exc}") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise LifecycleError("command_not_found", f"codex control is not executable: {resolved}")
+    return resolved
+
+
+def workspace_unbound(payload: dict[str, Any]) -> bool:
+    data = payload.get("data", {})
+    return (
+        isinstance(data, dict)
+        and data.get("project_route") in (None, {})
+        and data.get("shared_route") in (None, {})
+        and data.get("effective_route") in (None, {})
+    )
+
+
+def live_task_evidence(
+    args: argparse.Namespace,
+    runner: CommandRunner,
+    *,
+    require_group: bool = True,
+) -> dict[str, Any]:
+    """Resolve task identity from authoritative services, without lifecycle state."""
+    workspace_root = canonical_existing_directory(args.workspace_root, "workspace root")
+    stable_repo, common_dir = validate_stable_repo(runner, args.repo, workspace_root)
+    worktree = discover_worktree(
+        runner, stable_repo, common_dir, workspace_root, args.branch
+    )
+    assert worktree is not None
+    worktree_path = Path(worktree["path"])
+    codex_control = resolve_control_executable(args.codex_control)
+    thread = discover_thread(
+        runner, codex_control, worktree_path, args.branch, args.codex_socket
+    )
+    assert thread is not None
+    group_name = getattr(args, "group_name", None) or derived_group_name(stable_repo, args.branch)
+    group = discover_group(
+        runner, args.lark_cli, group_name, allow_absent=not require_group
+    )
+    evidence: dict[str, Any] = {
+        "stableRepo": str(stable_repo),
+        "worktree": worktree,
+        "thread": thread,
+        "group": group,
+        "verified": True,
+    }
+    if group is not None:
+        project = getattr(args, "project", DEFAULT_CC_PROJECT)
+        session_key = f"feishu:{group['chatId']}"
+        cc_data_dir = canonical_existing_directory(
+            args.cc_data_dir, "cc-connect data directory"
+        )
+        workspace_status = cc_control(
+            runner,
+            args.cc_connect,
+            "workspace",
+            "status",
+            project=project,
+            session_key=session_key,
+            data_dir=cc_data_dir,
+        )
+        sessions_status = cc_control(
+            runner,
+            args.cc_connect,
+            "sessions",
+            "status",
+            project=project,
+            session_key=session_key,
+            data_dir=cc_data_dir,
+        )
+        verify_cc_state(
+            workspace_status, sessions_status, worktree_path, thread["threadId"]
+        )
+        evidence["ccConnect"] = {
+            "project": project,
+            "sessionKey": session_key,
+            "workspace": workspace_status,
+            "sessions": sessions_status,
+        }
+    return evidence
+
+
+def live_stable_checkout_evidence(
+    args: argparse.Namespace,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    """Verify only the active invoking thread rooted at the stable checkout."""
+    workspace_root = canonical_existing_directory(args.workspace_root, "workspace root")
+    stable_repo, _ = validate_stable_repo(runner, args.repo, workspace_root)
+    codex_control = resolve_control_executable(args.codex_control)
+    thread = resolve_invoking_finish_thread(
+        runner, codex_control, stable_repo, args.codex_socket
+    )
+    if thread is None:
+        raise LifecycleError(
+            "thread_missing",
+            "stable-checkout finish requires CODEX_THREAD_ID for the invoking thread",
+        )
+    return {
+        "targetMode": "stable-checkout",
+        "stableRepo": str(stable_repo),
+        "stableCheckout": {
+            "path": str(stable_repo),
+            "preserved": True,
+            "verified": True,
+        },
+        "worktree": None,
+        "thread": thread,
+        "verified": True,
+    }
+
+
+def init_task(args: argparse.Namespace, runner: CommandRunner) -> dict[str, Any]:
+    workspace_root = canonical_existing_directory(args.workspace_root, "workspace root")
+    stable_repo, common_dir = validate_stable_repo(runner, args.repo, workspace_root)
+    codex_control = resolve_control_executable(args.codex_control)
+    cc_data_dir = canonical_existing_directory(args.cc_data_dir, "cc-connect data directory")
+    group_name = getattr(args, "group_name", None) or derived_group_name(stable_repo, args.branch)
+    request = read_request(args)
+    if args.handoff_file is not None and args.handoff_stdin:
+        raise LifecycleError("invalid_input", "pass only one handoff input")
+    handoff_content = (
+        sys.stdin.buffer.read()
+        if args.handoff_stdin
+        else read_optional_bytes(args.handoff_file, "handoff source")
+    )
+
+    worktree = ensure_worktree(
+        runner, stable_repo, common_dir, workspace_root, args.branch, args.base_ref
+    )
+    worktree_path = canonical_existing_directory(worktree["path"], "task worktree")
+    thread = ensure_codex_thread(
+        runner,
+        codex_control,
+        worktree_path,
+        args.branch,
+        None,
+        args.model,
+        args.codex_socket,
+    )
+    input_state = reconcile_input(
+        runner, worktree_path, args.input_mode, request, handoff_content, {}
+    )
+    group = ensure_task_group(
+        runner, args.lark_cli, group_name, thread["threadId"]
+    )
+    shortcut = ensure_feed_shortcut(runner, args.lark_cli, group["chatId"])
+    session_key = f"feishu:{group['chatId']}"
+    route = cc_control(
+        runner,
+        args.cc_connect,
+        "workspace",
+        "route",
+        project=args.project,
+        session_key=session_key,
+        data_dir=cc_data_dir,
+        worktree=worktree_path,
+    )
+    attach = cc_control(
+        runner,
+        args.cc_connect,
+        "sessions",
+        "attach",
+        project=args.project,
+        session_key=session_key,
+        data_dir=cc_data_dir,
+        agent_session_id=thread["threadId"],
+    )
+    workspace_status = cc_control(
+        runner, args.cc_connect, "workspace", "status",
+        project=args.project, session_key=session_key, data_dir=cc_data_dir,
+    )
+    sessions_status = cc_control(
+        runner, args.cc_connect, "sessions", "status",
+        project=args.project, session_key=session_key, data_dir=cc_data_dir,
+    )
+    verify_cc_state(workspace_status, sessions_status, worktree_path, thread["threadId"])
+    plan = codex_command(
+        runner, codex_control, "plan",
+        thread_id=thread["threadId"], socket_path=args.codex_socket,
+    )
+    payload = input_state.get("queuePayload")
+    queue = (
+        codex_command(
+            runner, codex_control, "queue", thread_id=thread["threadId"],
+            socket_path=args.codex_socket, extra=(payload,),
+        )
+        if isinstance(payload, str)
+        else {"action": "queue", "queued": False, "state": "deferred", "verified": True}
+    )
+    return {
+        "schemaVersion": STATE_SCHEMA_VERSION,
+        "ok": True,
+        "operation": "init",
+        "branch": args.branch,
+        "inputMode": input_state["mode"],
+        "worktree": worktree,
+        "handoff": input_state.get("handoff"),
+        "thread": thread,
+        "group": group,
+        "feedShortcut": shortcut,
+        "ccConnect": {
+            "route": route, "attach": attach,
+            "workspace": workspace_status, "sessions": sessions_status,
+        },
+        "plan": plan,
+        "queue": queue,
+        "verified": True,
+    }
+
+
+def task_status(args: argparse.Namespace, runner: CommandRunner) -> dict[str, Any]:
+    evidence = live_task_evidence(args, runner)
+    return {
+        "schemaVersion": STATE_SCHEMA_VERSION,
+        "ok": True,
+        "operation": "status",
+        "branch": args.branch,
+        **evidence,
+    }
+
+
+def default_mode_handoff_task(
+    args: argparse.Namespace,
+    runner: CommandRunner,
+    *,
+    operation: str,
+    continuation: str,
+) -> dict[str, Any]:
+    if not continuation.strip():
+        raise LifecycleError("invalid_input", "handoff continuation must not be empty")
+    evidence = (
+        live_stable_checkout_evidence(args, runner)
+        if stable_checkout_finish(args)
+        else live_task_evidence(args, runner)
+    )
+    if evidence["thread"].get("status") != "active":
+        raise LifecycleError(
+            "handoff_turn_inactive",
+            "lifecycle handoff requires the target thread's invoking turn to be active",
+            {"threadStatus": evidence["thread"].get("status")},
+        )
+    thread_id = evidence["thread"]["threadId"]
+    codex_control = resolve_control_executable(args.codex_control)
+    mode = codex_command(
+        runner, codex_control, "default",
+        thread_id=thread_id, socket_path=args.codex_socket,
+    )
+    if mode.get("mode") != "default":
+        raise LifecycleError(
+            "mode_handoff_failed",
+            "Codex did not confirm Default mode for the next turn",
+            {"mode": mode},
+        )
+    queue = codex_command(
+        runner, codex_control, "queue", thread_id=thread_id,
+        socket_path=args.codex_socket, extra=("--pending-only", continuation),
+    )
+    if (
+        queue.get("queued") is not True
+        or queue.get("state") != "pending"
+        or not isinstance(queue.get("queuedSubmissionId"), str)
+        or not queue["queuedSubmissionId"]
+    ):
+        raise LifecycleError(
+            "continuation_queue_failed",
+            "Codex did not confirm an exact pending lifecycle continuation",
+            {"queue": queue},
+        )
+    return {
+        "schemaVersion": STATE_SCHEMA_VERSION,
+        "ok": True,
+        "operation": operation,
+        "targetMode": (
+            "stable-checkout" if stable_checkout_finish(args) else "task-worktree"
+        ),
+        "branch": getattr(args, "branch", None),
+        "threadId": thread_id,
+        "preflight": evidence,
+        "mode": mode,
+        "queue": queue,
+        "verified": True,
+    }
+
+
+def execute_task(args: argparse.Namespace, runner: CommandRunner) -> dict[str, Any]:
+    return default_mode_handoff_task(
+        args,
+        runner,
+        operation="execute",
+        continuation=args.continuation,
+    )
+
+
+def finish_handoff_task(args: argparse.Namespace, runner: CommandRunner) -> dict[str, Any]:
+    return default_mode_handoff_task(
+        args,
+        runner,
+        operation="finish-handoff",
+        continuation="$task finish",
+    )
+
+
+def finish_stable_checkout_cleanup(
+    args: argparse.Namespace,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    """Close exact thread-scoped resources without changing any local directory."""
+    evidence = live_stable_checkout_evidence(args, runner)
+    stable_repo = Path(evidence["stableRepo"])
+    thread = evidence["thread"]
+    thread_id = thread["threadId"]
+    cc_data_dir = canonical_existing_directory(
+        args.cc_data_dir, "cc-connect data directory"
+    )
+    project = getattr(args, "project", DEFAULT_CC_PROJECT)
+    attachment = discover_active_cc_attachment(cc_data_dir, project, thread_id)
+    group = discover_attachment_group(
+        runner,
+        args.lark_cli,
+        attachment,
+        getattr(args, "group_name", None),
+    )
+
+    route_status = None
+    sessions_status = None
+    unbind: dict[str, Any] = {
+        "schema_version": CC_SCHEMA_VERSION,
+        "ok": True,
+        "operation": "workspace.unbind",
+        "changed": False,
+        "data": {"already_unbound": True},
+    }
+    unbound = None
+    if attachment is not None:
+        session_key = attachment["sessionKey"]
+        route_status = cc_control(
+            runner,
+            args.cc_connect,
+            "workspace",
+            "status",
+            project=project,
+            session_key=session_key,
+            data_dir=cc_data_dir,
+        )
+        if not workspace_unbound(route_status):
+            sessions_status = cc_control(
+                runner,
+                args.cc_connect,
+                "sessions",
+                "status",
+                project=project,
+                session_key=session_key,
+                data_dir=cc_data_dir,
+            )
+            verify_cc_state(route_status, sessions_status, stable_repo, thread_id)
+
+    notification: dict[str, Any] = {
+        "applicable": False,
+        "reason": "no task record supplied",
+        "verified": True,
+    }
+    if args.record_url is not None:
+        if not args.document_ready:
+            raise LifecycleError(
+                "document_not_ready", "--record-url requires --document-ready"
+            )
+        canonical_record_message(args.record_url)
+        if group is None or attachment is None:
+            raise LifecycleError(
+                "group_missing", "cannot notify a missing current-thread task group"
+            )
+        notification = {
+            **ensure_record_notification(
+                runner,
+                args.lark_cli,
+                args.cc_connect,
+                project,
+                attachment["sessionKey"],
+                cc_data_dir,
+                group["chatId"],
+                args.record_url,
+            ),
+            "applicable": True,
+        }
+
+    if attachment is not None and route_status is not None and not workspace_unbound(
+        route_status
+    ):
+        session_key = attachment["sessionKey"]
+        unbind = cc_control(
+            runner,
+            args.cc_connect,
+            "workspace",
+            "unbind",
+            project=project,
+            session_key=session_key,
+            data_dir=cc_data_dir,
+            worktree=stable_repo,
+            expected_agent_session_id=thread_id,
+        )
+        if (
+            isinstance(sessions_status, dict)
+            and isinstance(sessions_status.get("data"), dict)
+            and sessions_status["data"].get("busy") is True
+        ):
+            data = unbind.get("data", {})
+            guard = data.get("closeout_guard") if isinstance(data, dict) else None
+            if (
+                not isinstance(guard, dict)
+                or guard.get("busy") is not True
+                or guard.get("verified") is not True
+                or guard.get("expected_agent_session_id") != thread_id
+                or guard.get("active_agent_session_id") != thread_id
+                or guard.get("live_agent_session_id") != thread_id
+                or (
+                    guard.get("active_turn_preserved") is not True
+                    and data.get("active_turn_preserved") is not True
+                )
+            ):
+                raise LifecycleError(
+                    "cc_control_invalid",
+                    "busy stable-checkout closeout lacks the exact native-thread guard",
+                    {"response": unbind},
+                )
+        unbound = cc_control(
+            runner,
+            args.cc_connect,
+            "workspace",
+            "status",
+            project=project,
+            session_key=session_key,
+            data_dir=cc_data_dir,
+        )
+        if not workspace_unbound(unbound):
+            raise LifecycleError(
+                "cc_control_invalid",
+                "stable-checkout route remains after exact unbind",
+            )
+    else:
+        unbound = route_status
+
+    return {
+        "schemaVersion": STATE_SCHEMA_VERSION,
+        "ok": True,
+        "operation": "finish-cleanup",
+        "targetMode": "stable-checkout",
+        "branch": None,
+        "closeThreadId": thread_id,
+        "closeSessionKey": (
+            attachment.get("sessionKey") if attachment is not None else None
+        ),
+        "cleanup": {
+            "stableCheckout": evidence["stableCheckout"],
+            "stableCheckoutPreserved": True,
+            "worktree": None,
+            "worktreeRemoved": False,
+            "worktreePreserved": False,
+            "localContent": None,
+            "localArchive": None,
+            "ignoredContent": None,
+            "ignoredArchive": None,
+            "directoryArchive": {
+                "applicable": False,
+                "reason": "stable-checkout mode preserves every local directory",
+                "verified": True,
+            },
+            "expiredArchives": {
+                "applicable": False,
+                "reason": "stable-checkout mode does not purge archive directories",
+                "verified": True,
+            },
+            "mainIntegration": {
+                "applicable": False,
+                "reason": "stable-checkout mode has no task branch integration gate",
+                "verified": True,
+            },
+            "handoff": None,
+            "attachment": attachment,
+            "group": group,
+            "routeBefore": route_status,
+            "sessionsBefore": sessions_status,
+            "unbind": unbind,
+            "routeAfter": unbound,
+            "branchPreserved": None,
+            "recordNotification": notification,
+        },
+        "verified": True,
+    }
+
+
+def finish_cleanup_task(args: argparse.Namespace, runner: CommandRunner) -> dict[str, Any]:
+    if stable_checkout_finish(args):
+        return finish_stable_checkout_cleanup(args, runner)
+    workspace_root = canonical_existing_directory(args.workspace_root, "workspace root")
+    stable_repo, common_dir = validate_stable_repo(runner, args.repo, workspace_root)
+    codex_control = resolve_control_executable(args.codex_control)
+    cc_data_dir = canonical_existing_directory(args.cc_data_dir, "cc-connect data directory")
+    worktree_path = derived_worktree_path(stable_repo, args.branch, workspace_root)
+    worktree = discover_worktree(
+        runner, stable_repo, common_dir, workspace_root, args.branch, allow_absent=True
+    )
+    thread = (
+        discover_thread(
+            runner, codex_control, worktree_path, args.branch, args.codex_socket,
+            allow_absent=True,
+        )
+        if worktree is not None
+        else None
+    )
+    group_name = getattr(args, "group_name", None) or derived_group_name(stable_repo, args.branch)
+    group = discover_group(runner, args.lark_cli, group_name, allow_absent=True)
+
+    local_preflight: list[str] = []
+    if worktree is not None:
+        tracked_status = tracked_worktree_status(runner, worktree_path)
+        if tracked_status:
+            raise LifecycleError(
+                "worktree_dirty",
+                "task worktree has tracked or staged changes; commit or restore them before cleanup",
+                {"status": tracked_status},
+            )
+        local_preflight = untracked_worktree_paths(runner, worktree_path)
+
+    branch_ref = f"refs/heads/{args.branch}"
+    branch_exists = git(
+        runner, stable_repo, "show-ref", "--verify", "--quiet", branch_ref,
+        allowed=(0, 1),
+    ).returncode == 0
+    if not branch_exists:
+        raise LifecycleError(
+            "branch_missing", "cannot verify main integration without the task branch"
+        )
+    task_head = git(
+        runner, stable_repo, "rev-parse", "--verify", f"{branch_ref}^{{commit}}"
+    ).stdout.strip()
+    if worktree is not None and worktree["head"] != task_head:
+        raise LifecycleError(
+            "worktree_conflict",
+            "task worktree HEAD differs from its branch ref",
+            {"worktreeHead": worktree["head"], "branchHead": task_head},
+        )
+    main_integration = ensure_task_changes_in_main(
+        runner, stable_repo, args.branch, task_head
+    )
+
+    if local_preflight:
+        root = archive_root(stable_repo, workspace_root, create=True)
+        assert root is not None
+        archive_month_directory(
+            root, datetime.now(timezone.utc).strftime("%Y-%m")
+        )
+
+    route_status = None
+    sessions_status = None
+    unbind: dict[str, Any] = {
+        "schema_version": CC_SCHEMA_VERSION,
+        "ok": True,
+        "operation": "workspace.unbind",
+        "changed": False,
+        "data": {"already_unbound": True},
+    }
+    if group is not None:
+        session_key = f"feishu:{group['chatId']}"
+        route_status = cc_control(
+            runner, args.cc_connect, "workspace", "status",
+            project=args.project, session_key=session_key, data_dir=cc_data_dir,
+        )
+        if not workspace_unbound(route_status):
+            if worktree is None:
+                raise LifecycleError(
+                    "cc_control_conflict",
+                    "an existing route points at a missing task worktree",
+                )
+            sessions_status = cc_control(
+                runner, args.cc_connect, "sessions", "status",
+                project=args.project, session_key=session_key, data_dir=cc_data_dir,
+            )
+            thread = resolve_bound_finish_thread(
+                runner,
+                codex_control,
+                worktree_path,
+                thread,
+                route_status,
+                sessions_status,
+                args.codex_socket,
+            )
+
+    if worktree is not None:
+        if thread is None:
+            thread = resolve_invoking_finish_thread(
+                runner, codex_control, worktree_path, args.codex_socket
+            )
+        listed = codex_command(
+            runner, codex_control, "list-threads",
+            socket_path=args.codex_socket, extra=("--cwd", worktree_path),
+        )
+        target_id = thread.get("threadId") if thread else None
+        active_others = active_other_thread_ids(listed, worktree_path, target_id)
+        if active_others:
+            raise LifecycleError(
+                "active_thread_conflict",
+                "another active native thread uses the task worktree",
+                {"threadIds": active_others},
+            )
+
+    expired_archives = purge_expired_archives(stable_repo, workspace_root)
+
+    notification: dict[str, Any] = {
+        "applicable": False, "reason": "no task record supplied", "verified": True
+    }
+    if args.record_url is not None:
+        if not args.document_ready:
+            raise LifecycleError("document_not_ready", "--record-url requires --document-ready")
+        canonical_record_message(args.record_url)
+        if group is None:
+            raise LifecycleError("group_missing", "cannot notify a missing task group")
+
+    if group is not None and args.record_url is not None:
+        notification = {
+            **ensure_record_notification(
+                runner, args.lark_cli, args.cc_connect, args.project,
+                f"feishu:{group['chatId']}", cc_data_dir, group["chatId"], args.record_url,
+            ),
+            "applicable": True,
+        }
+
+    if worktree is not None:
+        tracked_status = tracked_worktree_status(runner, worktree_path)
+        if tracked_status:
+            raise LifecycleError(
+                "worktree_dirty",
+                "task worktree acquired tracked or staged changes during cleanup",
+                {"status": tracked_status},
+            )
+    if group is not None and route_status is not None and not workspace_unbound(route_status):
+        if thread is None:
+            raise LifecycleError(
+                "cc_control_conflict",
+                "the routed task has no verified native finish thread",
+            )
+        unbind = cc_control(
+            runner, args.cc_connect, "workspace", "unbind",
+            project=args.project, session_key=f"feishu:{group['chatId']}",
+            data_dir=cc_data_dir, worktree=worktree_path,
+            expected_agent_session_id=thread["threadId"],
+        )
+        if (
+            isinstance(sessions_status, dict)
+            and isinstance(sessions_status.get("data"), dict)
+            and sessions_status["data"].get("busy") is True
+        ):
+            data = unbind.get("data", {})
+            guard = data.get("closeout_guard") if isinstance(data, dict) else None
+            if (
+                not isinstance(guard, dict)
+                or guard.get("busy") is not True
+                or guard.get("verified") is not True
+                or guard.get("expected_agent_session_id") != thread["threadId"]
+                or guard.get("active_agent_session_id") != thread["threadId"]
+                or guard.get("live_agent_session_id") != thread["threadId"]
+                or (
+                    guard.get("active_turn_preserved") is not True
+                    and data.get("active_turn_preserved") is not True
+                )
+            ):
+                raise LifecycleError(
+                    "cc_control_invalid",
+                    "busy closeout lacks the exact verified native-thread guard",
+                    {"response": unbind},
+                )
+        unbound = cc_control(
+            runner, args.cc_connect, "workspace", "status",
+            project=args.project, session_key=f"feishu:{group['chatId']}",
+            data_dir=cc_data_dir,
+        )
+        if not workspace_unbound(unbound):
+            raise LifecycleError("cc_control_invalid", "workspace route remains after exact unbind")
+    else:
+        unbound = route_status
+
+    worktree_removed = False
+    local_archive = None
+    local_paths: list[str] = []
+    if worktree is not None:
+        if thread is None:
+            raise LifecycleError(
+                "thread_conflict",
+                "cannot archive task-local content without a verified native thread",
+            )
+        local_archive, local_paths = archive_and_remove_worktree(
+            runner,
+            stable_repo,
+            workspace_root,
+            worktree_path,
+            args.branch,
+            worktree["head"],
+            thread["threadId"],
+        )
+        worktree_removed = True
+    branch_preserved = git(
+        runner, stable_repo, "show-ref", "--verify", "--quiet",
+        branch_ref, allowed=(0, 1),
+    ).returncode == 0
+    if worktree is not None and not branch_preserved:
+        raise LifecycleError("branch_missing", "task branch disappeared during cleanup")
+    return {
+        "schemaVersion": STATE_SCHEMA_VERSION,
+        "ok": True,
+        "operation": "finish-cleanup",
+        "branch": args.branch,
+        "closeThreadId": thread.get("threadId") if thread else None,
+        "cleanup": {
+            "worktree": worktree,
+            "worktreeRemoved": worktree_removed,
+            "worktreePreserved": worktree is not None and not worktree_removed,
+            "localContent": (
+                "\n".join(local_paths) or None
+            ),
+            "localArchive": local_archive,
+            # Compatibility aliases for existing callers.
+            "ignoredContent": (
+                "\n".join(local_paths) or None
+            ),
+            "ignoredArchive": local_archive,
+            "expiredArchives": expired_archives,
+            "mainIntegration": main_integration,
+            "handoff": None,
+            "routeBefore": route_status,
+            "sessionsBefore": sessions_status,
+            "unbind": unbind,
+            "routeAfter": unbound,
+            "branchPreserved": branch_preserved,
+            "recordNotification": notification,
+        },
+        "verified": True,
+    }
+
+
+def finish_stable_checkout_close(
+    args: argparse.Namespace,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    """Remove exact external entry points, then archive only the invoking thread."""
+    evidence = live_stable_checkout_evidence(args, runner)
+    stable_repo = Path(evidence["stableRepo"])
+    thread = evidence["thread"]
+    thread_id = thread["threadId"]
+    explicit_thread_id = getattr(args, "thread_id", None)
+    if explicit_thread_id is not None and (
+        not isinstance(explicit_thread_id, str)
+        or not explicit_thread_id
+        or explicit_thread_id != explicit_thread_id.strip()
+    ):
+        raise LifecycleError("invalid_input", "--thread-id must be one exact non-empty ID")
+    if explicit_thread_id is not None and explicit_thread_id != thread_id:
+        raise LifecycleError(
+            "thread_conflict",
+            "stable-checkout close may archive only the currently invoking native thread",
+            {
+                "threadId": explicit_thread_id,
+                "invokingThreadId": thread_id,
+            },
+        )
+    cc_data_dir = canonical_existing_directory(
+        args.cc_data_dir, "cc-connect data directory"
+    )
+    project = getattr(args, "project", DEFAULT_CC_PROJECT)
+    attachment = discover_active_cc_attachment(cc_data_dir, project, thread_id)
+    expected_session_key = getattr(args, "session_key", None)
+    if expected_session_key is not None and (
+        not isinstance(expected_session_key, str)
+        or not expected_session_key
+        or expected_session_key != expected_session_key.strip()
+    ):
+        raise LifecycleError(
+            "invalid_input", "--session-key must be one exact non-empty key"
+        )
+    actual_session_key = (
+        attachment.get("sessionKey") if attachment is not None else None
+    )
+    if expected_session_key is not None and actual_session_key != expected_session_key:
+        raise LifecycleError(
+            "cc_control_conflict",
+            "the current-thread cc-connect attachment changed after cleanup",
+            {
+                "expectedSessionKey": expected_session_key,
+                "actualSessionKey": actual_session_key,
+            },
+        )
+    group = discover_attachment_group(
+        runner,
+        args.lark_cli,
+        attachment,
+        getattr(args, "group_name", None),
+    )
+    shortcut = (
+        remove_feed_shortcut(runner, args.lark_cli, group["chatId"])
+        if group is not None
+        else {
+            "applicable": False,
+            "reason": "no exact current-thread Feishu attachment",
+            "verified": True,
+        }
+    )
+    prepared = {
+        "schemaVersion": STATE_SCHEMA_VERSION,
+        "ok": True,
+        "operation": "finish-close",
+        "targetMode": "stable-checkout",
+        "branch": None,
+        "stableCheckout": {
+            "path": str(stable_repo),
+            "preserved": True,
+            "verified": True,
+        },
+        "attachment": attachment,
+        "group": group,
+        "feedShortcut": shortcut,
+        "verified": True,
+    }
+
+    # Native archival remains the final external operation.
+    codex_control = resolve_control_executable(args.codex_control)
+    archive = codex_command(
+        runner,
+        codex_control,
+        "archive",
+        thread_id=thread_id,
+        socket_path=args.codex_socket,
+    )
+    if archive.get("verified") is not True or not (
+        archive.get("archived") is True or archive.get("scheduled") is True
+    ):
+        raise LifecycleError("archive_failed", "native archive returned an invalid outcome")
+    prepared["archive"] = archive
+    return prepared
+
+
+def finish_close_task(args: argparse.Namespace, runner: CommandRunner) -> dict[str, Any]:
+    if stable_checkout_finish(args):
+        return finish_stable_checkout_close(args, runner)
+    if getattr(args, "session_key", None) is not None:
+        raise LifecycleError(
+            "invalid_input", "--session-key is supported only with --stable-checkout"
+        )
+    workspace_root = canonical_existing_directory(args.workspace_root, "workspace root")
+    stable_repo, _ = validate_stable_repo(runner, args.repo, workspace_root)
+    worktree_path = derived_worktree_path(stable_repo, args.branch, workspace_root)
+    codex_control = resolve_control_executable(args.codex_control)
+    group_name = getattr(args, "group_name", None) or derived_group_name(stable_repo, args.branch)
+    group = discover_group(runner, args.lark_cli, group_name, allow_absent=True)
+    explicit_thread_id = getattr(args, "thread_id", None)
+    invoking_thread_id = current_codex_thread_id()
+    if explicit_thread_id is not None and (
+        not isinstance(explicit_thread_id, str)
+        or not explicit_thread_id
+        or explicit_thread_id != explicit_thread_id.strip()
+    ):
+        raise LifecycleError("invalid_input", "--thread-id must be one exact non-empty ID")
+    selected_thread_id = explicit_thread_id
+    if selected_thread_id is not None:
+        thread = inspect_thread_for_worktree(
+            runner,
+            codex_control,
+            selected_thread_id,
+            worktree_path,
+            args.codex_socket,
+        )
+        if thread.get("name") != args.branch and invoking_thread_id != selected_thread_id:
+            raise LifecycleError(
+                "thread_conflict",
+                "a legacy-named close target must be the currently invoking native thread",
+                {
+                    "threadId": selected_thread_id,
+                    "threadName": thread.get("name"),
+                    "invokingThreadId": invoking_thread_id,
+                },
+            )
+    elif worktree_path.exists():
+        thread = discover_thread(
+            runner, codex_control, worktree_path, args.branch, args.codex_socket,
+            allow_absent=True,
+        )
+    else:
+        thread = None
+    shortcut = (
+        remove_feed_shortcut(runner, args.lark_cli, group["chatId"])
+        if group is not None
+        else {"applicable": False, "reason": "task group absent", "verified": True}
+    )
+    prepared = {
+        "schemaVersion": STATE_SCHEMA_VERSION,
+        "ok": True,
+        "operation": "finish-close",
+        "branch": args.branch,
+        "group": group,
+        "feedShortcut": shortcut,
+        "verified": True,
+    }
+    if thread is None:
+        prepared["archive"] = {
+            "applicable": False, "reason": "native task thread absent", "verified": True
+        }
+        return prepared
+
+    # Native archival remains the final external operation.
+    archive = codex_command(
+        runner, codex_control, "archive",
+        thread_id=thread["threadId"], socket_path=args.codex_socket,
+    )
+    if archive.get("verified") is not True or not (
+        archive.get("archived") is True or archive.get("scheduled") is True
+    ):
+        raise LifecycleError("archive_failed", "native archive returned an invalid outcome")
+    prepared["archive"] = archive
+    return prepared
+
+
+def emit(result: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return
+    print(
+        f"task {result.get('branch', '')}: {result['operation']} complete; "
+        f"verified={str(result.get('verified', False)).lower()}"
+    )
+
+
+def validate_runtime_configuration() -> None:
+    required = {
+        "CC_CONNECT_TASK_LARK_CLI_BOT_APP_ID": LARK_CLI_BOT_APP_ID,
+        "CC_CONNECT_TASK_USER_OPEN_ID": CURRENT_USER_OPEN_ID,
+        "CC_CONNECT_TASK_BOT_APP_ID": CC_CONNECT_BOT_APP_ID,
+        "CC_CONNECT_TASK_PROJECT": DEFAULT_CC_PROJECT,
+    }
+    missing = sorted(name for name, value in required.items() if not value)
+    if DOCUMENT_REMOTE_HOSTS:
+        for name in (
+            "CC_CONNECT_TASK_DOCUMENT_FOLDER_URL",
+            "CC_CONNECT_TASK_DOCUMENT_FOLDER_TOKEN",
+        ):
+            if not os.environ.get(name, "").strip():
+                missing.append(name)
+    missing.sort()
+    if missing:
+        raise LifecycleError(
+            "configuration_missing",
+            "task skill configuration is incomplete",
+            {"missingEnvironmentVariables": missing},
+        )
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    runner = CommandRunner()
+    try:
+        validate_runtime_configuration()
+        if args.command == "init":
+            result = init_task(args, runner)
+        elif args.command == "execute":
+            result = execute_task(args, runner)
+        elif args.command == "finish-handoff":
+            result = finish_handoff_task(args, runner)
+        elif args.command == "finish-cleanup":
+            result = finish_cleanup_task(args, runner)
+        elif args.command == "finish-close":
+            result = finish_close_task(args, runner)
+        elif args.command == "status":
+            result = task_status(args, runner)
+        else:
+            raise LifecycleError("unsupported_command", f"unsupported command: {args.command}")
+        emit(result, args.json)
+        return 0
+    except (LifecycleError, OSError, UnicodeError) as exc:
+        if isinstance(exc, LifecycleError):
+            payload = {
+                "schemaVersion": STATE_SCHEMA_VERSION,
+                "ok": False,
+                "error": {
+                    "code": exc.code,
+                    "message": str(exc),
+                    "details": exc.details,
+                },
+            }
+        else:
+            payload = {
+                "schemaVersion": STATE_SCHEMA_VERSION,
+                "ok": False,
+                "error": {"code": "internal_error", "message": str(exc), "details": {}},
+            }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print(f"task-lifecycle-control: error: {payload['error']['message']}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

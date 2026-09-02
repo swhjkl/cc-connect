@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Switch explicit Task execution and finish prompts to Default mode."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from typing import Any, Callable
+
+
+CONTROL = Path(__file__).resolve().with_name("codex-task-control")
+CONTROL_TIMEOUT_SECONDS = 15.0
+TASK_TRANSITION = re.compile(
+    r"^\s*[$/]task\s+([a-z]+)\s*$", re.IGNORECASE | re.ASCII
+)
+TASK_PRIMITIVES = ("execute", "finish")
+MIN_PRIMITIVE_PREFIX_LENGTH = 3
+
+CC_CONNECT_ENVELOPE_PREFIX = (
+    "The user is asking you to execute the following skill.\n\n"
+)
+CC_CONNECT_INSTRUCTIONS_MARKER = "\n## Skill Instructions:\n"
+CC_CONNECT_ARGUMENTS_MARKER = "\n\n## User Arguments:\n"
+CC_CONNECT_ENVELOPE_TRAILER = (
+    "\n\nPlease follow the skill instructions above to complete the task."
+)
+CC_CONNECT_TASK_METADATA = re.compile(
+    r"^## Skill:\s*task\s*\n(?:## Description:[^\n]*\n)?$",
+    re.IGNORECASE | re.ASCII,
+)
+
+DEFAULT_MODE_CONTEXT = """<collaboration_mode>
+# Collaboration Mode: Default
+
+The task lifecycle hook verified that this thread is now in Default mode. Any prior
+Plan-mode instructions are no longer active. Continue the explicit task execute or
+finish request in this turn. Do not run or queue another collaboration-mode handoff.
+</collaboration_mode>"""
+
+
+def canonical_primitive(prefix: Any) -> str | None:
+    """Normalize one unadorned primitive prefix."""
+    if not isinstance(prefix, str) or not prefix.isascii() or not prefix.isalpha():
+        return None
+    prefix = prefix.lower()
+    if len(prefix) < MIN_PRIMITIVE_PREFIX_LENGTH:
+        return None
+    matches = [
+        primitive for primitive in TASK_PRIMITIVES if primitive.startswith(prefix)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def cc_connect_transition_primitive(prompt: str) -> str | None:
+    """Read a transition from cc-connect's legacy Task skill envelope."""
+    if not prompt.startswith(CC_CONNECT_ENVELOPE_PREFIX):
+        return None
+    if not prompt.endswith(CC_CONNECT_ENVELOPE_TRAILER):
+        return None
+
+    body = prompt[
+        len(CC_CONNECT_ENVELOPE_PREFIX) : -len(CC_CONNECT_ENVELOPE_TRAILER)
+    ]
+    metadata, marker, remainder = body.partition(CC_CONNECT_INSTRUCTIONS_MARKER)
+    if not marker or not CC_CONNECT_TASK_METADATA.fullmatch(metadata):
+        return None
+
+    _, marker, argument = remainder.rpartition(CC_CONNECT_ARGUMENTS_MARKER)
+    if not marker or not argument or argument != argument.strip():
+        return None
+    return canonical_primitive(argument)
+
+
+def transition_primitive(prompt: Any) -> str | None:
+    """Return the canonical primitive for a complete Task transition prompt."""
+    if not isinstance(prompt, str):
+        return None
+    matched = TASK_TRANSITION.fullmatch(prompt)
+    if matched:
+        return canonical_primitive(matched.group(1))
+    return cc_connect_transition_primitive(prompt)
+
+
+def blocked(reason: str) -> dict[str, Any]:
+    """Return a fail-closed UserPromptSubmit response."""
+    compact = " ".join(reason.split())[:500]
+    return {
+        "decision": "block",
+        "reason": (
+            "Task collaboration-mode transition failed before the Agent turn: "
+            f"{compact}. The task request was not delivered; fix the hook or App "
+            "Server control path, then retry it."
+        ),
+    }
+
+
+def control_command(thread_id: str) -> list[str]:
+    """Build the verified native App Server mode-transition command."""
+    command = [str(CONTROL), "--thread", thread_id]
+    socket_override = os.environ.get("CODEX_TASK_CONTROL_SOCKET", "").strip()
+    if socket_override:
+        command.extend(("--socket", socket_override))
+    command.extend(("--json", "default"))
+    return command
+
+
+def run_transition(
+    thread_id: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Switch the persistent thread to Default and verify the helper receipt."""
+    try:
+        completed = runner(
+            control_command(thread_id),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=CONTROL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"controller exited {completed.returncode}"
+        raise RuntimeError(detail)
+    try:
+        result = json.loads(completed.stdout.strip())
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("controller returned an invalid JSON receipt") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("controller returned a non-object receipt")
+    expected = {
+        "action": "mode",
+        "threadId": thread_id,
+        "mode": "default",
+        "verified": True,
+    }
+    mismatched = [key for key, value in expected.items() if result.get(key) != value]
+    if mismatched:
+        raise RuntimeError(
+            "controller receipt failed verification for " + ", ".join(mismatched)
+        )
+    return result
+
+
+def process_event(
+    event: Any,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any] | None:
+    """Handle one Codex UserPromptSubmit event."""
+    if not isinstance(event, dict):
+        return blocked("hook input is not a JSON object")
+    primitive = transition_primitive(event.get("prompt"))
+    if primitive is None:
+        return None
+    thread_id = event.get("session_id")
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return blocked("the lifecycle hook event has no session_id")
+    thread_id = thread_id.strip()
+    try:
+        receipt = run_transition(thread_id, runner=runner)
+    except RuntimeError as exc:
+        return blocked(str(exc))
+    verification = receipt.get("verification", "verified receipt")
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": (
+                f"{DEFAULT_MODE_CONTEXT}\n\n"
+                f"Task mode transition receipt: primitive={primitive}, "
+                f"thread={thread_id}, verification={verification}."
+            ),
+        }
+    }
+
+
+def main() -> int:
+    try:
+        event = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"task-user-prompt-submit: invalid hook input: {exc}", file=sys.stderr)
+        return 2
+    result = process_event(event)
+    if result is not None:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

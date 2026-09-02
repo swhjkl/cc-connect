@@ -646,6 +646,8 @@ Notes:
 ## 📚 Documentation
 
 - [Usage Guide](docs/usage.md) — Complete feature documentation
+- [Task Skill Workflow](docs/task-skill-workflow.md) — Local Codex and Feishu lifecycle (Chinese)
+- [Task Skill Configuration](docs/task-skill-configuration.md) — Codex hook, cc-connect, and Feishu setup (Chinese)
 - [INSTALL.md](INSTALL.md) — AI-agent-friendly installation guide
 - [config.example.toml](config.example.toml) — Configuration template
 - [CONTRIBUTING.md](CONTRIBUTING.md) — How to report issues and contribute pull requests

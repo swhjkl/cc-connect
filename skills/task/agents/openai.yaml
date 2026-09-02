@@ -1,0 +1,6 @@
+interface:
+  display_name: "Task"
+  short_description: "Initialize, execute, or finish a coding task"
+  default_prompt: "Use $task init to initialize the current coding task."
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Read-only safety check for a task-finish stable-checkout fast-forward."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from typing import Any
+
+
+OPERATION_PATHS = (
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "rebase-apply",
+    "rebase-merge",
+    "sequencer",
+)
+
+
+def git(stable: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", os.fspath(stable), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def decode(value: bytes) -> str:
+    return os.fsdecode(value).strip()
+
+
+def split_paths(value: bytes) -> list[bytes]:
+    return [path for path in value.split(b"\0") if path]
+
+
+def paths_collide(left: bytes, right: bytes) -> bool:
+    left_parts = left.split(b"/")
+    right_parts = right.split(b"/")
+    shared = min(len(left_parts), len(right_parts))
+    return left_parts[:shared] == right_parts[:shared]
+
+
+def emit(payload: dict[str, Any], json_output: bool, exit_code: int) -> int:
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    elif payload.get("safe"):
+        print("stable fast-forward preflight is safe")
+    else:
+        print(payload.get("message", payload.get("reason", "preflight failed")), file=sys.stderr)
+    return exit_code
+
+
+def fail(
+    *,
+    stable: Path,
+    reason: str,
+    message: str,
+    json_output: bool,
+    verified: bool,
+    head: str | None = None,
+    target: str | None = None,
+    details: dict[str, Any] | None = None,
+    exit_code: int = 1,
+) -> int:
+    payload: dict[str, Any] = {
+        "safe": False,
+        "verified": verified,
+        "stable": os.fspath(stable),
+        "reason": reason,
+        "message": message,
+    }
+    if head is not None:
+        payload["head"] = head
+    if target is not None:
+        payload["target"] = target
+        payload["needsFastForward"] = head != target
+    if details:
+        payload["details"] = details
+    return emit(payload, json_output, exit_code)
+
+
+def operation_in_progress(stable: Path) -> list[str]:
+    found: list[str] = []
+    for name in OPERATION_PATHS:
+        result = git(stable, "rev-parse", "--git-path", name)
+        if result.returncode != 0:
+            continue
+        raw_path = Path(decode(result.stdout))
+        path = raw_path if raw_path.is_absolute() else stable / raw_path
+        if path.exists():
+            found.append(name)
+    return found
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Verify that a stable checkout can reach a target commit without overwriting local state."
+    )
+    parser.add_argument("--stable", required=True, help="exact stable checkout path")
+    parser.add_argument("--target", required=True, help="fetched target commit or ref")
+    parser.add_argument("--json", action="store_true", help="emit a JSON result")
+    args = parser.parse_args()
+
+    stable = Path(args.stable).resolve()
+    top = git(stable, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        return fail(
+            stable=stable,
+            reason="invalid_stable_checkout",
+            message=decode(top.stderr) or "stable path is not a Git worktree",
+            json_output=args.json,
+            verified=False,
+            exit_code=2,
+        )
+    if Path(decode(top.stdout)).resolve() != stable:
+        return fail(
+            stable=stable,
+            reason="stable_root_mismatch",
+            message="--stable must resolve to the exact Git worktree root",
+            json_output=args.json,
+            verified=True,
+        )
+
+    head_result = git(stable, "rev-parse", "--verify", "HEAD^{commit}")
+    target_result = git(stable, "rev-parse", "--verify", f"{args.target}^{{commit}}")
+    if head_result.returncode != 0 or target_result.returncode != 0:
+        return fail(
+            stable=stable,
+            reason="unresolved_commit",
+            message=decode(head_result.stderr or target_result.stderr),
+            json_output=args.json,
+            verified=False,
+            exit_code=2,
+        )
+    head = decode(head_result.stdout)
+    target = decode(target_result.stdout)
+
+    operations = operation_in_progress(stable)
+    if operations:
+        return fail(
+            stable=stable,
+            reason="git_operation_in_progress",
+            message="stable checkout has a Git operation in progress",
+            json_output=args.json,
+            verified=True,
+            head=head,
+            target=target,
+            details={"operations": operations},
+        )
+
+    ancestor = git(stable, "merge-base", "--is-ancestor", head, target)
+    if ancestor.returncode != 0:
+        verified = ancestor.returncode == 1
+        return fail(
+            stable=stable,
+            reason="not_fast_forward" if verified else "git_error",
+            message="target cannot update stable HEAD by fast-forward" if verified else decode(ancestor.stderr),
+            json_output=args.json,
+            verified=verified,
+            head=head,
+            target=target,
+            exit_code=1 if verified else 2,
+        )
+
+    if head == target:
+        return emit(
+            {
+                "safe": True,
+                "verified": True,
+                "stable": os.fspath(stable),
+                "head": head,
+                "target": target,
+                "needsFastForward": False,
+                "ignoredCollisions": [],
+            },
+            args.json,
+            0,
+        )
+
+    dry_run = git(stable, "read-tree", "-n", "-u", "-m", head, target)
+    if dry_run.returncode != 0:
+        return fail(
+            stable=stable,
+            reason="checkout_conflict",
+            message=decode(dry_run.stderr) or "Git dry-run rejected the fast-forward",
+            json_output=args.json,
+            verified=True,
+            head=head,
+            target=target,
+        )
+
+    ignored = git(stable, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
+    writes = git(
+        stable,
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "--diff-filter=ACMRTUXB",
+        head,
+        target,
+        "--",
+    )
+    if ignored.returncode != 0 or writes.returncode != 0:
+        return fail(
+            stable=stable,
+            reason="git_error",
+            message=decode(ignored.stderr or writes.stderr),
+            json_output=args.json,
+            verified=False,
+            head=head,
+            target=target,
+            exit_code=2,
+        )
+
+    collisions = sorted(
+        {
+            os.fsdecode(local)
+            for local in split_paths(ignored.stdout)
+            for changed in split_paths(writes.stdout)
+            if paths_collide(local, changed)
+        }
+    )
+    if collisions:
+        return fail(
+            stable=stable,
+            reason="ignored_path_collision",
+            message="ignored stable-checkout paths would be overwritten by fast-forward",
+            json_output=args.json,
+            verified=True,
+            head=head,
+            target=target,
+            details={"paths": collisions},
+        )
+
+    return emit(
+        {
+            "safe": True,
+            "verified": True,
+            "stable": os.fspath(stable),
+            "head": head,
+            "target": target,
+            "needsFastForward": True,
+            "ignoredCollisions": [],
+        },
+        args.json,
+        0,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

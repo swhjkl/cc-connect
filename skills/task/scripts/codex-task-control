@@ -1,0 +1,1373 @@
+#!/usr/bin/env python3
+"""Create and control native Codex task threads."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+from typing import Any, Callable
+
+
+CLIENT_NAME = "codex_task_control"
+CLIENT_TITLE = "Codex Task Control"
+CLIENT_VERSION = "0.4.1"
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+ARCHIVE_POLL_SECONDS = 0.5
+ARCHIVE_HEARTBEAT_SECONDS = 5.0
+ARCHIVE_STARTUP_SECONDS = 10.0
+THREAD_SOURCE_KINDS = (
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+    "unknown",
+)
+
+
+class ControlError(RuntimeError):
+    """An actionable task-control failure."""
+
+
+class JsonRpcError(ControlError):
+    """An App Server JSON-RPC error."""
+
+    def __init__(self, method: str, error: dict[str, Any]) -> None:
+        self.method = method
+        self.code = error.get("code")
+        self.message = str(error.get("message", "unknown JSON-RPC error"))
+        super().__init__(f"{method} failed ({self.code}): {self.message}")
+
+
+class UnixWebSocket:
+    """A minimal RFC 6455 client for the App Server Unix socket."""
+
+    def __init__(self, socket_path: Path, timeout: float) -> None:
+        self.socket_path = socket_path
+        self.timeout = timeout
+        self.sock: socket.socket | None = None
+        self.buffer = bytearray()
+
+    def connect(self) -> None:
+        if not self.socket_path.exists():
+            raise ControlError(
+                f"App Server socket not found: {self.socket_path}; "
+                "start it with `codex app-server daemon start`"
+            )
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(str(self.socket_path))
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            request = (
+                "GET / HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            sock.sendall(request.encode("ascii"))
+            response = bytearray()
+            while b"\r\n\r\n" not in response:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ControlError("App Server closed during WebSocket upgrade")
+                response.extend(chunk)
+                if len(response) > 64 * 1024:
+                    raise ControlError("App Server returned an oversized HTTP upgrade response")
+
+            head, pending = bytes(response).split(b"\r\n\r\n", 1)
+            lines = head.decode("latin1").split("\r\n")
+            if not lines or " 101 " not in f" {lines[0]} ":
+                raise ControlError(f"WebSocket upgrade failed: {lines[0] if lines else 'empty response'}")
+
+            headers: dict[str, str] = {}
+            for line in lines[1:]:
+                if ":" in line:
+                    name, value = line.split(":", 1)
+                    headers[name.strip().lower()] = value.strip()
+            expected = base64.b64encode(
+                hashlib.sha1((key + WEBSOCKET_GUID).encode("ascii")).digest()
+            ).decode("ascii")
+            if headers.get("sec-websocket-accept") != expected:
+                raise ControlError("App Server returned an invalid WebSocket accept key")
+
+            self.sock = sock
+            self.buffer.extend(pending)
+        except Exception:
+            sock.close()
+            raise
+
+    def set_timeout(self, timeout: float) -> None:
+        if self.sock is None:
+            raise ControlError("WebSocket is not connected")
+        self.sock.settimeout(max(timeout, 0.001))
+
+    def close(self) -> None:
+        if self.sock is None:
+            return
+        try:
+            self.send_frame(b"", opcode=0x8)
+        except OSError:
+            pass
+        self.sock.close()
+        self.sock = None
+
+    def _read_exact(self, size: int) -> bytes:
+        if self.sock is None:
+            raise ControlError("WebSocket is not connected")
+        while len(self.buffer) < size:
+            try:
+                chunk = self.sock.recv(max(4096, size - len(self.buffer)))
+            except socket.timeout as exc:
+                raise ControlError("timed out waiting for App Server") from exc
+            if not chunk:
+                raise ControlError("App Server closed the WebSocket")
+            self.buffer.extend(chunk)
+        data = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return data
+
+    def send_frame(self, payload: bytes | str, opcode: int = 0x1) -> None:
+        if self.sock is None:
+            raise ControlError("WebSocket is not connected")
+        data = payload.encode("utf-8") if isinstance(payload, str) else payload
+        mask = os.urandom(4)
+        frame = bytearray([0x80 | opcode])
+        length = len(data)
+        if length < 126:
+            frame.append(0x80 | length)
+        elif length < 65_536:
+            frame.append(0x80 | 126)
+            frame.extend(struct.pack("!H", length))
+        else:
+            frame.append(0x80 | 127)
+            frame.extend(struct.pack("!Q", length))
+        frame.extend(mask)
+        frame.extend(value ^ mask[index % 4] for index, value in enumerate(data))
+        self.sock.sendall(frame)
+
+    def receive_message(self) -> str:
+        parts: list[bytes] = []
+        message_opcode: int | None = None
+        message_size = 0
+        while True:
+            first, second = self._read_exact(2)
+            if first & 0x70:
+                raise ControlError("App Server sent a WebSocket frame with unsupported RSV bits")
+            final = bool(first & 0x80)
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else None
+            payload = self._read_exact(length)
+            if mask is not None:
+                payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+
+            if opcode == 0x8:
+                raise ControlError("App Server closed the WebSocket")
+            if opcode == 0x9:
+                self.send_frame(payload, opcode=0xA)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2):
+                if message_opcode is not None:
+                    raise ControlError("App Server started a new fragmented message too early")
+                message_opcode = opcode
+            elif opcode != 0x0 or message_opcode is None:
+                raise ControlError(f"App Server sent unsupported WebSocket opcode {opcode}")
+
+            parts.append(payload)
+            message_size += len(payload)
+            if message_size > MAX_MESSAGE_BYTES:
+                raise ControlError("App Server message exceeded the 16 MiB safety limit")
+            if final:
+                if message_opcode != 0x1:
+                    raise ControlError("App Server sent an unexpected binary message")
+                try:
+                    return b"".join(parts).decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ControlError("App Server sent invalid UTF-8") from exc
+
+
+class AppServerClient:
+    """Short-lived JSON-RPC client with response and notification matching."""
+
+    def __init__(self, socket_path: Path, timeout: float) -> None:
+        self.timeout = timeout
+        self.websocket = UnixWebSocket(socket_path, timeout)
+        self.next_request_id = 1
+        self.pending: list[dict[str, Any]] = []
+        self.server_user_agent: str | None = None
+
+    def __enter__(self) -> "AppServerClient":
+        self.websocket.connect()
+        result = self.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": CLIENT_NAME,
+                    "title": CLIENT_TITLE,
+                    "version": CLIENT_VERSION,
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+        )
+        self.server_user_agent = result.get("userAgent")
+        self.notify("initialized", {})
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.websocket.close()
+
+    def _send(self, message: dict[str, Any]) -> None:
+        self.websocket.send_frame(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
+
+    def _receive(self, deadline: float) -> dict[str, Any]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ControlError("timed out waiting for App Server")
+        self.websocket.set_timeout(remaining)
+        try:
+            message = json.loads(self.websocket.receive_message())
+        except json.JSONDecodeError as exc:
+            raise ControlError("App Server sent invalid JSON") from exc
+        if not isinstance(message, dict):
+            raise ControlError("App Server sent a non-object JSON-RPC message")
+        return message
+
+    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        self._send({"method": method, "id": request_id, "params": params})
+        deadline = time.monotonic() + self.timeout
+        while True:
+            message = self._receive(deadline)
+            if message.get("id") == request_id:
+                if "error" in message:
+                    error = message["error"]
+                    if not isinstance(error, dict):
+                        error = {"message": str(error)}
+                    raise JsonRpcError(method, error)
+                result = message.get("result", {})
+                if not isinstance(result, dict):
+                    raise ControlError(f"{method} returned a non-object result")
+                return result
+            self.pending.append(message)
+            if len(self.pending) > 4096:
+                raise ControlError("too many unrelated App Server messages")
+
+    def notify(self, method: str, params: dict[str, Any]) -> None:
+        self._send({"method": method, "params": params})
+
+    def wait_notification(
+        self,
+        method: str,
+        predicate: Callable[[dict[str, Any]], bool],
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + self.timeout
+        while True:
+            for index, message in enumerate(self.pending):
+                if message.get("method") == method and predicate(message):
+                    return self.pending.pop(index)
+            message = self._receive(deadline)
+            if message.get("method") == method and predicate(message):
+                return message
+            self.pending.append(message)
+            if len(self.pending) > 4096:
+                raise ControlError("too many unrelated App Server messages")
+
+    def take_pending_notification(
+        self,
+        method: str,
+        predicate: Callable[[dict[str, Any]], bool],
+    ) -> dict[str, Any] | None:
+        """Remove a matching notification already observed before a response."""
+        for index, message in enumerate(self.pending):
+            if message.get("method") == method and predicate(message):
+                return self.pending.pop(index)
+        return None
+
+
+def resolve_thread_id(explicit: str | None) -> str:
+    thread_id = explicit or os.environ.get("CODEX_THREAD_ID")
+    if not thread_id:
+        raise ControlError("pass --thread or run inside a Codex turn with CODEX_THREAD_ID")
+    return thread_id
+
+
+def resolve_codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+
+
+def resolve_socket_path(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return resolve_codex_home() / "app-server-control" / "app-server-control.sock"
+
+
+def resolve_existing_directory(value: str, option: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ControlError(f"{option} must be an absolute path")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ControlError(f"could not resolve {option} {path}: {exc}") from exc
+    if not resolved.is_dir():
+        raise ControlError(f"{option} is not a directory: {resolved}")
+    return resolved
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def archive_state_path(thread_id: str) -> Path:
+    safe = (
+        0 < len(thread_id) <= 128
+        and thread_id not in (".", "..")
+        and all(character.isalnum() or character in "._-" for character in thread_id)
+    )
+    key = thread_id if safe else hashlib.sha256(thread_id.encode("utf-8")).hexdigest()
+    return resolve_codex_home() / "task-control" / "archive" / f"{key}.json"
+
+
+def archive_lock_path(state_path: Path) -> Path:
+    return state_path.with_name(f"{state_path.name}.lock")
+
+
+@contextmanager
+def archive_state_lock(state_path: Path) -> Any:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = archive_lock_path(state_path)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def read_archive_state(state_path: Path, thread_id: str) -> dict[str, Any] | None:
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError(f"could not read archive state {state_path}: {exc}") from exc
+    if not isinstance(state, dict):
+        raise ControlError(f"archive state is not a JSON object: {state_path}")
+    if state.get("threadId") != thread_id:
+        raise ControlError(f"archive state belongs to another thread: {state_path}")
+    return state
+
+
+def write_archive_state_unlocked(state_path: Path, state: dict[str, Any]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = state_path.with_name(
+        f".{state_path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    )
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, state_path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def process_is_alive(pid: Any) -> bool:
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def resume_thread(client: AppServerClient, thread_id: str) -> dict[str, Any]:
+    result = client.request(
+        "thread/resume",
+        {"threadId": thread_id, "excludeTurns": True},
+    )
+    returned_id = result.get("thread", {}).get("id")
+    if returned_id != thread_id:
+        raise ControlError(f"thread/resume returned unexpected thread id {returned_id!r}")
+    return result
+
+
+def read_thread(
+    client: AppServerClient,
+    thread_id: str,
+    *,
+    include_turns: bool,
+) -> dict[str, Any]:
+    result = client.request(
+        "thread/read",
+        {"threadId": thread_id, "includeTurns": include_turns},
+    )
+    thread = result.get("thread")
+    if not isinstance(thread, dict) or thread.get("id") != thread_id:
+        raise ControlError(f"thread/read returned unexpected thread {thread!r}")
+    return thread
+
+
+def thread_cwd(thread: dict[str, Any], *, require_existing: bool = True) -> Path:
+    raw = thread.get("cwd")
+    if not isinstance(raw, str) or not raw:
+        raise ControlError(f"thread {thread.get('id')!r} has no cwd")
+    if require_existing:
+        return resolve_existing_directory(raw, "thread cwd")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ControlError(f"thread {thread.get('id')!r} cwd must be absolute")
+    return path.resolve(strict=False)
+
+
+def thread_result(
+    thread: dict[str, Any],
+    *,
+    action: str,
+    reused: bool,
+    require_existing_cwd: bool = True,
+) -> dict[str, Any]:
+    turns = thread.get("turns")
+    turn_count = len(turns) if isinstance(turns, list) else None
+    status = thread.get("status")
+    status_type = status.get("type") if isinstance(status, dict) else None
+    result: dict[str, Any] = {
+        "action": action,
+        "threadId": thread.get("id"),
+        "name": thread.get("name"),
+        "cwd": str(thread_cwd(thread, require_existing=require_existing_cwd)),
+        "ephemeral": thread.get("ephemeral"),
+        "status": status_type,
+        "reused": reused,
+        "verified": True,
+    }
+    if turn_count is not None:
+        result["turnCount"] = turn_count
+        result["empty"] = turn_count == 0
+    git_info = thread.get("gitInfo")
+    if isinstance(git_info, dict):
+        result["gitInfo"] = git_info
+    return result
+
+
+def list_threads_for_cwd(client: AppServerClient, cwd: Path) -> list[dict[str, Any]]:
+    threads: list[dict[str, Any]] = []
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    for _ in range(100):
+        params: dict[str, Any] = {
+            "cwd": str(cwd),
+            "archived": False,
+            "limit": 100,
+            "modelProviders": [],
+            "sourceKinds": list(THREAD_SOURCE_KINDS),
+            "sortKey": "created_at",
+            "sortDirection": "desc",
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = client.request("thread/list", params)
+        data = page.get("data", [])
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            raise ControlError("thread/list returned invalid data")
+        threads.extend(data)
+        cursor = page.get("nextCursor")
+        if cursor is None:
+            return threads
+        if not isinstance(cursor, str) or cursor in seen_cursors:
+            raise ControlError("thread/list returned an invalid or repeated cursor")
+        seen_cursors.add(cursor)
+    raise ControlError("thread listing exceeded the 10,000-thread inspection limit")
+
+
+@contextmanager
+def thread_ensure_lock(cwd: Path, name: str) -> Any:
+    key = hashlib.sha256(f"{cwd}\0{name}".encode("utf-8")).hexdigest()
+    lock_path = resolve_codex_home() / "task-control" / "thread-locks" / f"{key}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def verify_task_thread(
+    thread: dict[str, Any],
+    cwd: Path,
+    name: str,
+) -> dict[str, Any]:
+    if thread_cwd(thread) != cwd:
+        raise ControlError(
+            f"thread {thread.get('id')!r} belongs to {thread.get('cwd')!r}, expected {str(cwd)!r}"
+        )
+    if thread.get("ephemeral") is not False:
+        raise ControlError(f"thread {thread.get('id')!r} is not persistent")
+    actual_name = thread.get("name")
+    if actual_name != name:
+        raise ControlError(
+            f"thread {thread.get('id')!r} is named {actual_name!r}, expected {name!r}"
+        )
+    return thread
+
+
+def ensure_thread(
+    socket_path: Path,
+    timeout: float,
+    cwd: Path,
+    name: str,
+    explicit_thread_id: str | None,
+    model: str | None,
+    approval_policy: str,
+    approvals_reviewer: str,
+    sandbox: str,
+) -> dict[str, Any]:
+    if not name.strip():
+        raise ControlError("--name must not be empty")
+    with thread_ensure_lock(cwd, name):
+        with AppServerClient(socket_path, timeout) as client:
+            if explicit_thread_id is not None:
+                thread = read_thread(client, explicit_thread_id, include_turns=True)
+                verify_task_thread(thread, cwd, name)
+                result = thread_result(thread, action="ensure-thread", reused=True)
+                result["server"] = client.server_user_agent
+                return result
+
+            summaries = list_threads_for_cwd(client, cwd)
+            matching_ids = [
+                item.get("id")
+                for item in summaries
+                if item.get("name") == name and isinstance(item.get("id"), str)
+            ]
+            if len(matching_ids) > 1:
+                raise ControlError(
+                    f"multiple non-archived threads named {name!r} exist for {cwd}: "
+                    + ", ".join(matching_ids)
+                )
+            if matching_ids:
+                thread = read_thread(client, matching_ids[0], include_turns=True)
+                verify_task_thread(thread, cwd, name)
+                result = thread_result(thread, action="ensure-thread", reused=True)
+                result["server"] = client.server_user_agent
+                return result
+
+            params: dict[str, Any] = {
+                "cwd": str(cwd),
+                "ephemeral": False,
+                "approvalPolicy": approval_policy,
+                "approvalsReviewer": approvals_reviewer,
+                "sandbox": sandbox,
+                "serviceName": CLIENT_NAME,
+            }
+            if model is not None:
+                params["model"] = model
+            started = client.request("thread/start", params)
+            thread = started.get("thread")
+            thread_id = thread.get("id") if isinstance(thread, dict) else None
+            if not isinstance(thread_id, str) or not thread_id:
+                raise ControlError("thread/start did not return a thread id")
+            client.request("thread/name/set", {"threadId": thread_id, "name": name})
+            created = read_thread(client, thread_id, include_turns=True)
+            verify_task_thread(created, cwd, name)
+            turns = created.get("turns")
+            if not isinstance(turns, list) or turns:
+                raise ControlError(f"new thread {thread_id!r} is not empty")
+            result = thread_result(created, action="ensure-thread", reused=False)
+            result["server"] = client.server_user_agent
+            return result
+
+
+def inspect_thread(
+    socket_path: Path,
+    timeout: float,
+    thread_id: str,
+) -> dict[str, Any]:
+    with AppServerClient(socket_path, timeout) as client:
+        thread = read_thread(client, thread_id, include_turns=True)
+        # Closeout can inspect a thread after its clean Git worktree has been
+        # removed. Keep strict cwd checks for creation/listing, but preserve the
+        # authoritative absolute cwd value for this ID-based inspection.
+        result = thread_result(
+            thread,
+            action="inspect",
+            reused=True,
+            require_existing_cwd=False,
+        )
+        result["server"] = client.server_user_agent
+        return result
+
+
+def list_threads(
+    socket_path: Path,
+    timeout: float,
+    cwd: Path,
+) -> dict[str, Any]:
+    with AppServerClient(socket_path, timeout) as client:
+        threads = []
+        for item in list_threads_for_cwd(client, cwd):
+            summary = thread_result(item, action="thread", reused=True)
+            # thread/list carries no authoritative turn history even when it
+            # serializes a placeholder empty turns array.
+            summary.pop("turnCount", None)
+            summary.pop("empty", None)
+            threads.append(summary)
+        return {
+            "action": "list-threads",
+            "cwd": str(cwd),
+            "count": len(threads),
+            "threads": threads,
+            "verified": True,
+            "server": client.server_user_agent,
+        }
+
+
+def set_mode(
+    socket_path: Path,
+    timeout: float,
+    thread_id: str,
+    mode: str,
+) -> dict[str, Any]:
+    with AppServerClient(socket_path, timeout) as client:
+        resumed = resume_thread(client, thread_id)
+        presets = client.request("collaborationMode/list", {}).get("data", [])
+        preset = next(
+            (item for item in presets if isinstance(item, dict) and item.get("mode") == mode),
+            None,
+        )
+        if preset is None:
+            raise ControlError(f"App Server did not advertise the {mode!r} collaboration mode")
+        model = preset.get("model") or resumed.get("model")
+        if not model:
+            raise ControlError("thread/resume did not return a model")
+        effort = preset.get("reasoning_effort")
+        client.request(
+            "thread/settings/update",
+            {
+                "threadId": thread_id,
+                "collaborationMode": {
+                    "mode": mode,
+                    "settings": {
+                        "model": model,
+                        "reasoning_effort": effort,
+                        "developer_instructions": None,
+                    },
+                },
+            },
+        )
+        notification = client.take_pending_notification(
+            "thread/settings/updated",
+            lambda item: item.get("params", {}).get("threadId") == thread_id,
+        )
+        settings: dict[str, Any] = {}
+        verification = "requestAcknowledged"
+        if notification is not None:
+            settings = notification.get("params", {}).get("threadSettings", {})
+            applied = settings.get("collaborationMode", {})
+            if applied.get("mode") != mode:
+                raise ControlError(
+                    f"thread/settings/updated reported mode {applied.get('mode')!r}, expected {mode!r}"
+                )
+            verification = "notification"
+        return {
+            "action": "mode",
+            "threadId": thread_id,
+            "mode": mode,
+            "model": settings.get("model", model),
+            "reasoningEffort": settings.get("effort", effort),
+            "verification": verification,
+            "verified": True,
+            "server": client.server_user_agent,
+        }
+
+
+def list_queued_submissions(
+    client: AppServerClient,
+    thread_id: str,
+) -> list[dict[str, Any]]:
+    submissions: list[dict[str, Any]] = []
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    for _ in range(100):
+        params: dict[str, Any] = {"threadId": thread_id, "limit": 100}
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = client.request("thread/queue/list", params)
+        data = page.get("data", [])
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            raise ControlError("thread/queue/list returned invalid data")
+        submissions.extend(data)
+        cursor = page.get("nextCursor")
+        if cursor is None:
+            return submissions
+        if not isinstance(cursor, str) or cursor in seen_cursors:
+            raise ControlError("thread/queue/list returned an invalid or repeated cursor")
+        seen_cursors.add(cursor)
+    raise ControlError("thread queue exceeded the 10,000-item inspection limit")
+
+
+def find_queued_message(
+    socket_path: Path,
+    timeout: float,
+    thread_id: str,
+    message: str,
+) -> dict[str, Any] | None:
+    with AppServerClient(socket_path, timeout) as client:
+        resume_thread(client, thread_id)
+        for submission in list_queued_submissions(client, thread_id):
+            inputs = submission.get("input", [])
+            if (
+                isinstance(inputs, list)
+                and len(inputs) == 1
+                and isinstance(inputs[0], dict)
+                and inputs[0].get("type") == "text"
+                and inputs[0].get("text") == message
+            ):
+                return submission
+    return None
+
+
+def find_submitted_message(
+    socket_path: Path,
+    timeout: float,
+    thread_id: str,
+    message: str,
+) -> dict[str, Any] | None:
+    with AppServerClient(socket_path, timeout) as client:
+        thread = read_thread(client, thread_id, include_turns=True)
+        turns = thread.get("turns", [])
+        if not isinstance(turns, list):
+            raise ControlError("thread/read returned invalid turns")
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            for item in turn.get("items", []):
+                if not isinstance(item, dict) or item.get("type") != "userMessage":
+                    continue
+                content = item.get("content", [])
+                texts = [
+                    part.get("text")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ] if isinstance(content, list) else []
+                if len(texts) == 1 and texts[0] == message:
+                    return {
+                        "turnId": turn.get("id"),
+                        "turnStatus": turn.get("status"),
+                    }
+    return None
+
+
+def queue_result(
+    thread_id: str,
+    submission: dict[str, Any] | None,
+    reused: bool,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "action": "queue",
+        "threadId": thread_id,
+        "queued": True,
+        "reused": reused,
+        "verified": True,
+    }
+    if submission is not None:
+        result["queuedSubmissionId"] = submission.get("id")
+        result["state"] = "pending"
+    else:
+        result["state"] = "accepted"
+    return result
+
+
+def submitted_queue_result(
+    thread_id: str,
+    submitted: dict[str, Any],
+) -> dict[str, Any]:
+    result = queue_result(thread_id, submission=None, reused=True)
+    result["state"] = submitted.get("turnStatus") or "submitted"
+    result["turnId"] = submitted.get("turnId")
+    result["source"] = "turnHistory"
+    return result
+
+
+def queue_message(
+    socket_path: Path,
+    timeout: float,
+    thread_id: str,
+    message: str,
+    *,
+    pending_only: bool = False,
+) -> dict[str, Any]:
+    if not message.strip():
+        raise ControlError("queue message must not be empty")
+    if not pending_only:
+        submitted = find_submitted_message(socket_path, timeout, thread_id, message)
+        if submitted is not None:
+            return submitted_queue_result(thread_id, submitted)
+    existing = find_queued_message(socket_path, timeout, thread_id, message)
+    if existing is not None:
+        return queue_result(thread_id, existing, reused=True)
+    codex = shutil.which("codex")
+    if codex is None:
+        raise ControlError("could not find `codex` on PATH")
+    command = [
+        codex,
+        "queue",
+        "--remote",
+        f"unix://{socket_path}",
+        "--thread",
+        thread_id,
+        "--message",
+        message,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(timeout, 15.0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        existing = find_queued_message(socket_path, timeout, thread_id, message)
+        if existing is not None:
+            return queue_result(thread_id, existing, reused=True)
+        raise ControlError(
+            "`codex queue` timed out and the prompt is not pending; inspect the thread before retrying"
+        ) from exc
+    if completed.returncode != 0:
+        existing = find_queued_message(socket_path, timeout, thread_id, message)
+        if existing is not None:
+            return queue_result(thread_id, existing, reused=True)
+        detail = (completed.stderr or completed.stdout).strip()
+        raise ControlError(f"`codex queue` failed: {detail or f'exit {completed.returncode}'}")
+    accepted = find_queued_message(socket_path, timeout, thread_id, message)
+    if pending_only and accepted is None:
+        raise ControlError(
+            "`codex queue` succeeded but the exact follow-up is not pending; "
+            "inspect the thread before retrying"
+        )
+    return queue_result(thread_id, accepted, reused=False)
+
+
+def read_thread_status(client: AppServerClient, thread_id: str) -> str:
+    result = client.request(
+        "thread/read",
+        {"threadId": thread_id, "includeTurns": False},
+    )
+    status = result.get("thread", {}).get("status", {})
+    status_type = status.get("type") if isinstance(status, dict) else None
+    if status_type not in ("active", "idle", "notLoaded", "systemError"):
+        raise ControlError(f"thread/read returned invalid status {status_type!r}")
+    return status_type
+
+
+def request_archive(client: AppServerClient, thread_id: str) -> None:
+    client.request("thread/archive", {"threadId": thread_id})
+    client.wait_notification(
+        "thread/archived",
+        lambda item: item.get("params", {}).get("threadId") == thread_id,
+    )
+
+
+def archive_result_from_state(
+    state_path: Path,
+    state: dict[str, Any],
+    reused: bool,
+) -> dict[str, Any]:
+    archived = state.get("state") == "archived"
+    result: dict[str, Any] = {
+        "action": "archive",
+        "threadId": state["threadId"],
+        "archived": archived,
+        "scheduled": not archived,
+        "state": state.get("state"),
+        "stateFile": str(state_path),
+        "verified": state.get("verified") is True,
+        "reused": reused,
+    }
+    watcher_pid = state.get("watcherPid")
+    if isinstance(watcher_pid, int):
+        result["watcherPid"] = watcher_pid
+    server = state.get("server")
+    if server:
+        result["server"] = server
+    return result
+
+
+def update_worker_archive_state(
+    state_path: Path,
+    thread_id: str,
+    schedule_token: str,
+    changes: dict[str, Any],
+) -> dict[str, Any]:
+    with archive_state_lock(state_path):
+        state = read_archive_state(state_path, thread_id)
+        if state is None:
+            raise ControlError(f"archive schedule disappeared: {state_path}")
+        if state.get("state") == "archived":
+            return state
+        if (
+            state.get("scheduleToken") != schedule_token
+            or state.get("watcherPid") != os.getpid()
+        ):
+            raise ControlError("archive schedule was superseded by another watcher")
+        state.update(changes)
+        state["updatedAt"] = utc_now()
+        write_archive_state_unlocked(state_path, state)
+        return state
+
+
+def wait_for_worker_schedule(
+    state_path: Path,
+    thread_id: str,
+    schedule_token: str,
+) -> None:
+    deadline = time.monotonic() + ARCHIVE_STARTUP_SECONDS
+    while time.monotonic() < deadline:
+        with archive_state_lock(state_path):
+            state = read_archive_state(state_path, thread_id)
+        if state is not None and state.get("state") == "archived":
+            return
+        if (
+            state is not None
+            and state.get("scheduleToken") == schedule_token
+            and state.get("watcherPid") == os.getpid()
+        ):
+            return
+        time.sleep(0.05)
+    raise ControlError("parent did not confirm the deferred archive schedule")
+
+
+def archive_after_idle_worker(
+    socket_path: Path,
+    timeout: float,
+    archive_wait_timeout: float,
+    thread_id: str,
+    state_path: Path,
+    schedule_token: str,
+) -> int:
+    try:
+        wait_for_worker_schedule(state_path, thread_id, schedule_token)
+        deadline_epoch = time.time() + archive_wait_timeout
+        deadline_monotonic = time.monotonic() + archive_wait_timeout
+        update_worker_archive_state(
+            state_path,
+            thread_id,
+            schedule_token,
+            {
+                "state": "waiting",
+                "archived": False,
+                "scheduled": True,
+                "verified": True,
+                "deadlineEpoch": deadline_epoch,
+            },
+        )
+        last_heartbeat = 0.0
+        last_error: str | None = None
+        while time.monotonic() < deadline_monotonic:
+            try:
+                with AppServerClient(socket_path, timeout) as client:
+                    resume_thread(client, thread_id)
+                    while time.monotonic() < deadline_monotonic:
+                        status = read_thread_status(client, thread_id)
+                        if status != "active":
+                            request_archive(client, thread_id)
+                            update_worker_archive_state(
+                                state_path,
+                                thread_id,
+                                schedule_token,
+                                {
+                                    "state": "archived",
+                                    "archived": True,
+                                    "scheduled": False,
+                                    "verified": True,
+                                    "threadStatusBeforeArchive": status,
+                                    "archivedAt": utc_now(),
+                                    "server": client.server_user_agent,
+                                    "lastError": None,
+                                },
+                            )
+                            return 0
+                        now = time.monotonic()
+                        if now - last_heartbeat >= ARCHIVE_HEARTBEAT_SECONDS:
+                            update_worker_archive_state(
+                                state_path,
+                                thread_id,
+                                schedule_token,
+                                {
+                                    "state": "waiting",
+                                    "threadStatus": status,
+                                    "lastError": last_error,
+                                },
+                            )
+                            last_heartbeat = now
+                        time.sleep(ARCHIVE_POLL_SECONDS)
+            except (ControlError, OSError) as exc:
+                last_error = str(exc)
+                current = update_worker_archive_state(
+                    state_path,
+                    thread_id,
+                    schedule_token,
+                    {
+                        "state": "waiting",
+                        "lastError": last_error,
+                    },
+                )
+                if current.get("state") == "archived":
+                    return 0
+                time.sleep(min(1.0, max(0.0, deadline_monotonic - time.monotonic())))
+        raise ControlError(
+            f"thread remained active or unreachable for {archive_wait_timeout:g} seconds"
+            + (f"; last error: {last_error}" if last_error else "")
+        )
+    except Exception as exc:
+        # Detached watcher stderr is discarded, so persist every terminal failure.
+        try:
+            update_worker_archive_state(
+                state_path,
+                thread_id,
+                schedule_token,
+                {
+                    "state": "error",
+                    "archived": False,
+                    "scheduled": False,
+                    "verified": False,
+                    "error": str(exc),
+                },
+            )
+        except Exception:
+            pass
+        return 1
+
+
+def archive_thread(
+    socket_path: Path,
+    timeout: float,
+    archive_wait_timeout: float,
+    thread_id: str,
+) -> dict[str, Any]:
+    state_path = archive_state_path(thread_id)
+    with archive_state_lock(state_path):
+        state = read_archive_state(state_path, thread_id)
+        if state is not None and state.get("state") == "archived":
+            return archive_result_from_state(state_path, state, reused=True)
+        if (
+            state is not None
+            and state.get("state") in ("scheduled", "waiting")
+            and process_is_alive(state.get("watcherPid"))
+        ):
+            return archive_result_from_state(state_path, state, reused=True)
+
+        with AppServerClient(socket_path, timeout) as client:
+            resume_thread(client, thread_id)
+            status = read_thread_status(client, thread_id)
+            if status != "active":
+                request_archive(client, thread_id)
+                completed_state = {
+                    "threadId": thread_id,
+                    "state": "archived",
+                    "archived": True,
+                    "scheduled": False,
+                    "verified": True,
+                    "threadStatusBeforeArchive": status,
+                    "archivedAt": utc_now(),
+                    "createdAt": utc_now(),
+                    "updatedAt": utc_now(),
+                    "watcherPid": None,
+                    "server": client.server_user_agent,
+                }
+                write_archive_state_unlocked(state_path, completed_state)
+                return archive_result_from_state(state_path, completed_state, reused=False)
+
+            schedule_token = secrets.token_urlsafe(24)
+            scheduled_state = {
+                "threadId": thread_id,
+                "state": "scheduled",
+                "archived": False,
+                "scheduled": True,
+                "verified": False,
+                "threadStatus": status,
+                "scheduleToken": schedule_token,
+                "watcherPid": None,
+                "createdAt": utc_now(),
+                "updatedAt": utc_now(),
+                "server": client.server_user_agent,
+            }
+            write_archive_state_unlocked(state_path, scheduled_state)
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--thread",
+                thread_id,
+                "--socket",
+                str(socket_path),
+                "--timeout",
+                str(timeout),
+                "--archive-wait-timeout",
+                str(archive_wait_timeout),
+                "_archive-after-idle",
+                "--state-file",
+                str(state_path),
+                "--schedule-token",
+                schedule_token,
+            ]
+            try:
+                watcher = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            except OSError as exc:
+                scheduled_state.update(
+                    {
+                        "state": "error",
+                        "scheduled": False,
+                        "error": f"could not start archive watcher: {exc}",
+                        "updatedAt": utc_now(),
+                    }
+                )
+                write_archive_state_unlocked(state_path, scheduled_state)
+                raise ControlError(scheduled_state["error"]) from exc
+
+            scheduled_state.update(
+                {
+                    "verified": True,
+                    "watcherPid": watcher.pid,
+                    "updatedAt": utc_now(),
+                }
+            )
+            write_archive_state_unlocked(state_path, scheduled_state)
+            if watcher.poll() is not None or not process_is_alive(watcher.pid):
+                scheduled_state.update(
+                    {
+                        "state": "error",
+                        "scheduled": False,
+                        "verified": False,
+                        "error": "archive watcher exited during startup",
+                        "updatedAt": utc_now(),
+                    }
+                )
+                write_archive_state_unlocked(state_path, scheduled_state)
+                raise ControlError(scheduled_state["error"])
+            return archive_result_from_state(state_path, scheduled_state, reused=False)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-task-control",
+        description="Control a native Codex task thread without cc-connect.",
+    )
+    parser.add_argument("--thread", help="target thread id; defaults to CODEX_THREAD_ID")
+    parser.add_argument("--socket", help="App Server Unix socket path")
+    parser.add_argument("--timeout", type=float, default=10.0, help="protocol timeout in seconds")
+    parser.add_argument(
+        "--archive-wait-timeout",
+        type=float,
+        default=300.0,
+        help="maximum seconds a deferred archive waits for an active turn",
+    )
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {CLIENT_VERSION}")
+    commands = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{ensure-thread,list-threads,inspect,plan,default,queue,archive}",
+    )
+    ensure = commands.add_parser(
+        "ensure-thread",
+        help="reuse or create one persistent named thread for an exact cwd",
+    )
+    ensure.add_argument("--cwd", required=True, help="exact existing task working directory")
+    ensure.add_argument("--name", required=True, help="exact task thread name")
+    ensure.add_argument("--model", help="optional model override for a newly created thread")
+    ensure.add_argument(
+        "--approval-policy",
+        choices=("untrusted", "on-request", "never"),
+        default="on-request",
+    )
+    ensure.add_argument(
+        "--approvals-reviewer",
+        choices=("user", "auto_review", "guardian_subagent"),
+        default="auto_review",
+    )
+    ensure.add_argument(
+        "--sandbox",
+        choices=("read-only", "workspace-write", "danger-full-access"),
+        default="workspace-write",
+    )
+    listed = commands.add_parser(
+        "list-threads",
+        help="list every non-archived native thread for an exact cwd",
+    )
+    listed.add_argument("--cwd", required=True, help="exact existing working directory")
+    commands.add_parser("inspect", help="read and verify the target thread")
+    commands.add_parser("plan", help="use Plan mode for subsequent turns")
+    commands.add_parser("default", help="use Default mode for subsequent turns")
+    queue = commands.add_parser("queue", help="queue a prompt for the target thread")
+    queue.add_argument(
+        "--pending-only",
+        action="store_true",
+        help="deduplicate only against a real pending submission",
+    )
+    queue.add_argument("message", help="exact prompt to queue")
+    commands.add_parser(
+        "archive",
+        help="archive now if idle, or schedule archival after the active turn",
+    )
+    worker = commands.add_parser("_archive-after-idle", help=argparse.SUPPRESS)
+    worker.add_argument("--state-file", required=True, help=argparse.SUPPRESS)
+    worker.add_argument("--schedule-token", required=True, help=argparse.SUPPRESS)
+    commands._choices_actions.pop()
+    return parser
+
+
+def emit(result: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return
+    action = result["action"]
+    if action == "ensure-thread":
+        disposition = "reused" if result["reused"] else "created"
+        print(
+            f"thread {result['threadId']}: {disposition} name={result['name']} "
+            f"cwd={result['cwd']} verified"
+        )
+    elif action == "list-threads":
+        print(f"cwd {result['cwd']}: {result['count']} non-archived thread(s) verified")
+    elif action == "inspect":
+        print(
+            f"thread {result['threadId']}: name={result['name']} cwd={result['cwd']} "
+            f"status={result['status']} turns={result.get('turnCount', '?')} verified"
+        )
+    elif action == "mode":
+        print(
+            f"thread {result['threadId']}: mode={result['mode']} "
+            f"model={result['model']} effort={result['reasoningEffort']} verified"
+        )
+    elif action == "queue":
+        print(f"thread {result['threadId']}: prompt queued")
+    elif action == "archive":
+        if result.get("archived"):
+            print(f"thread {result['threadId']}: archived and verified")
+        else:
+            print(
+                f"thread {result['threadId']}: archive scheduled and verified; "
+                f"state={result['stateFile']}"
+            )
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        socket_path = resolve_socket_path(args.socket)
+        if args.timeout <= 0:
+            raise ControlError("--timeout must be positive")
+        if args.archive_wait_timeout <= 0:
+            raise ControlError("--archive-wait-timeout must be positive")
+        thread_id = (
+            args.thread
+            if args.command in ("ensure-thread", "list-threads")
+            else resolve_thread_id(args.thread)
+        )
+        if args.command == "ensure-thread":
+            result = ensure_thread(
+                socket_path,
+                args.timeout,
+                resolve_existing_directory(args.cwd, "--cwd"),
+                args.name,
+                args.thread,
+                args.model,
+                args.approval_policy,
+                args.approvals_reviewer,
+                args.sandbox,
+            )
+        elif args.command == "list-threads":
+            result = list_threads(
+                socket_path,
+                args.timeout,
+                resolve_existing_directory(args.cwd, "--cwd"),
+            )
+        elif args.command == "inspect":
+            result = inspect_thread(socket_path, args.timeout, thread_id)
+        elif args.command in ("plan", "default"):
+            result = set_mode(socket_path, args.timeout, thread_id, args.command)
+        elif args.command == "queue":
+            result = queue_message(
+                socket_path,
+                args.timeout,
+                thread_id,
+                args.message,
+                pending_only=args.pending_only,
+            )
+        elif args.command == "archive":
+            result = archive_thread(
+                socket_path,
+                args.timeout,
+                args.archive_wait_timeout,
+                thread_id,
+            )
+        elif args.command == "_archive-after-idle":
+            return archive_after_idle_worker(
+                socket_path,
+                args.timeout,
+                args.archive_wait_timeout,
+                thread_id,
+                Path(args.state_file).expanduser().resolve(),
+                args.schedule_token,
+            )
+        else:
+            raise ControlError(f"unsupported command: {args.command}")
+        emit(result, args.json)
+        return 0
+    except (ControlError, OSError) as exc:
+        print(f"codex-task-control: error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

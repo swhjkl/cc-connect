@@ -632,6 +632,8 @@ cc-connect send --tts "你好"
 ## 📚 文档
 
 - [使用指南](docs/usage.zh-CN.md) — 完整功能文档
+- [Task Skill 使用工作流](docs/task-skill-workflow.md) — 本地 Codex 与飞书共用的任务生命周期
+- [Task Skill 配置过程](docs/task-skill-configuration.md) — Codex hook、cc-connect 与飞书配置
 - [INSTALL.md](INSTALL.md) — AI Agent 友好的安装指南
 - [config.example.toml](config.example.toml) — 配置模板
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Issue / PR 提交流程与贡献说明

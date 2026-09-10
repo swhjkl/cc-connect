@@ -1223,6 +1223,14 @@ func (e *Engine) deliverConversationTurn(ctx context.Context, mirror *conversati
 			reservation = nil
 		}
 	}
+	// Only an explicitly terminal snapshot is safe to skip without a prompt.
+	// Observe it without guessing a source or claiming a delivery.
+	// Exact foreground reservations and existing deliveries still take priority.
+	if reservation == nil && delivery == nil && conversationPrompt(turn) == "" && conversationTurnTerminal(turn.Status) {
+		slog.Info("track: skipping terminal promptless turn", "destination", binding.Destination,
+			"thread_id", binding.ThreadID, "turn_id", turn.ID, "status", turn.Status, "reason", "terminal_promptless")
+		return true, nil
+	}
 	if reservation == nil && delivery == nil && clientID == "" {
 		active := sessions.GetOrCreateActive(binding.SessionKey)
 		if active.GetAgentSessionID() == binding.ThreadID && active.Busy() {

@@ -1903,6 +1903,28 @@ func TestCUJ_I6_DefaultMirrorCardReplyLifecycle(t *testing.T) {
 	if cardCount != 1 || resultCount != 1 {
 		t.Fatalf("terminal delivery created duplicates: progress_cards=%d results=%d", cardCount, resultCount)
 	}
+
+	// A terminal shell/system turn has no recognized prompt. The next external
+	// task must still appear automatically, without /track or an off/on reset.
+	shell := ConversationTurn{ID: "turn-promptless-shell", Status: ConversationTurnCompleted}
+	later := ConversationTurn{
+		ID: "turn-after-shell", Status: ConversationTurnCompleted,
+		Messages: []ConversationMessage{
+			{Role: "user", Content: "external task after shell"},
+			{Role: "assistant", Content: "result after shell", Phase: "final_answer"},
+		},
+	}
+	agent.setSnapshot(&ConversationSnapshot{SessionID: "thread-1", Turns: []ConversationTurn{completed, shell, later}})
+	agent.events <- Event{Type: EventConversationChanged, ThreadID: "thread-1", TurnID: later.ID}
+	waitMirrorTest(t, "automatic result after promptless turn", func() bool {
+		return strings.Contains(strings.Join(p.getSent(), "\n"), "result after shell")
+	})
+	p.trackMu.Lock()
+	cardCount, resultCount = len(p.starts), len(p.notificationKey)
+	p.trackMu.Unlock()
+	if cardCount != 2 || resultCount != 2 {
+		t.Fatalf("promptless sequence created duplicates: progress_cards=%d results=%d", cardCount, resultCount)
+	}
 }
 
 // CUJ-I8 · A Feishu-originated Codex turn exposes controls only after the

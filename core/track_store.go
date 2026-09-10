@@ -389,6 +389,8 @@ func (s *trackStateStore) resetBaseline(destination string) error {
 	}
 	previous := cloneTrackPersistedState(s.state)
 	binding.Initialized = false
+	// LastTurnID remains the last individually processed turn; establishing
+	// a new baseline observes history without processing or replaying it.
 	binding.Watermark = ""
 	binding.RecentTurnIDs = nil
 	binding.Gap = ""

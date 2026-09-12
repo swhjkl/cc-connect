@@ -2940,6 +2940,86 @@ func TestCmdTrackOnOff_PersistsAndOnAdoptsOnlyActiveTurn(t *testing.T) {
 	}
 }
 
+func TestCmdTrackToggle_PersistsInverseEffectivePreference(t *testing.T) {
+	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+	p := newMirrorTestPlatform()
+	e, binding, key := startMirrorTest(t, agent, p)
+	command := func() {
+		e.handleCommand(p, &Message{
+			SessionKey: key, Platform: p.Name(), UserID: "admin", Content: "/track toggle", ReplyCtx: "ctx",
+		}, "/track toggle")
+	}
+
+	command()
+	waitMirrorTest(t, "mirror disabled by toggle", func() bool {
+		e.trackMu.Lock()
+		defer e.trackMu.Unlock()
+		return e.conversationMirrors[binding.Destination] == nil
+	})
+	if got := e.trackStore.binding(binding.Destination); got == nil || got.Override != trackOverrideOff || e.effectiveTrackEnabled(got) {
+		t.Fatalf("disabled binding = %#v", got)
+	}
+	reloaded := newTrackStateStore(trackStatePath(e.sessions.StorePath()))
+	if got := reloaded.binding(binding.Destination); got == nil || got.Override != trackOverrideOff {
+		t.Fatalf("reloaded disabled binding = %#v", got)
+	}
+
+	command()
+	waitMirrorTest(t, "mirror enabled by toggle", func() bool {
+		e.trackMu.Lock()
+		defer e.trackMu.Unlock()
+		return e.conversationMirrors[binding.Destination] != nil
+	})
+	if got := e.trackStore.binding(binding.Destination); got == nil || got.Override != trackOverrideOn || !e.effectiveTrackEnabled(got) {
+		t.Fatalf("enabled binding = %#v", got)
+	}
+	reloaded = newTrackStateStore(trackStatePath(e.sessions.StorePath()))
+	if got := reloaded.binding(binding.Destination); got == nil || got.Override != trackOverrideOn {
+		t.Fatalf("reloaded enabled binding = %#v", got)
+	}
+}
+
+func TestCmdTrackToggle_UsesConfiguredDefaultWithoutOverride(t *testing.T) {
+	tests := []struct {
+		name           string
+		defaultEnabled bool
+		wantOverride   trackOverride
+		wantEnabled    bool
+	}{
+		{name: "default on toggles off", defaultEnabled: true, wantOverride: trackOverrideOff, wantEnabled: false},
+		{name: "default off toggles on", defaultEnabled: false, wantOverride: trackOverrideOn, wantEnabled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))
+			p := newMirrorTestPlatform()
+			e := NewEngine("test", agent, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+			e.SetAdminFrom("admin")
+			e.SetTrackCfg(TrackCfg{
+				Enabled: true, DefaultEnabled: tt.defaultEnabled, Notify: "never", SharedWrite: "observer_only",
+			})
+			t.Cleanup(e.cancel)
+
+			key := "mirror:chat:admin"
+			session := e.sessions.GetOrCreateActive(key)
+			session.SetAgentSessionID("thread-1", agent.Name())
+			e.sessions.Save()
+			e.handleCommand(p, &Message{
+				SessionKey: key, Platform: p.Name(), UserID: "admin", Content: "/track toggle", ReplyCtx: "ctx",
+			}, "/track toggle")
+
+			destination, err := mirrorDestinationKey(p, key)
+			if err != nil {
+				t.Fatalf("mirrorDestinationKey() error = %v", err)
+			}
+			binding := e.trackStore.binding(destination)
+			if binding == nil || binding.Override != tt.wantOverride || e.effectiveTrackEnabled(binding) != tt.wantEnabled {
+				t.Fatalf("toggled binding = %#v, want override=%q enabled=%v", binding, tt.wantOverride, tt.wantEnabled)
+			}
+		})
+	}
+}
+
 func TestConversationMirror_RestartRestoresCardWithoutDuplicateCreate(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "sessions.json")
 	agent := newMirrorTestAgent(mirrorTestSnapshot("thread-1", ConversationTurn{}))

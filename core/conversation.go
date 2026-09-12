@@ -2032,6 +2032,8 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 			e.cmdTrackOn(p, msg, args)
 		case "off":
 			e.cmdTrackOff(p, msg, args)
+		case "toggle":
+			e.cmdTrackToggle(p, msg, args)
 		case "status":
 			e.cmdTrackStatus(p, msg, args)
 		default:
@@ -2161,6 +2163,27 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 	e.trackers[interactiveKey] = tracker
 	e.trackMu.Unlock()
 	go e.runConversationTracker(ctx, tracker, interactiveKey, msg.SessionKey, provider, p, updater, handle, payload)
+}
+
+func (e *Engine) cmdTrackToggle(p Platform, msg *Message, args []string) {
+	if len(args) != 1 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackUsage))
+		return
+	}
+	destination, err := mirrorDestinationKey(p, msg.SessionKey)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgTrackPersistFailed, err))
+		return
+	}
+	binding := e.trackStore.binding(destination)
+	if binding == nil {
+		binding = &trackBindingState{Destination: destination}
+	}
+	if e.effectiveTrackEnabled(binding) {
+		e.cmdTrackOff(p, msg, []string{"off"})
+		return
+	}
+	e.cmdTrackOn(p, msg, []string{"on"})
 }
 
 func (e *Engine) cmdTrackOn(p Platform, msg *Message, args []string) {

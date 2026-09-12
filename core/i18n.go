@@ -1583,11 +1583,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "❌ Error al leer el historial del agente: %v",
 	},
 	MsgTrackUsage: {
-		LangEnglish:            "Usage: `/track [on|off|status]`",
-		LangChinese:            "用法：`/track [on|off|status]`",
-		LangTraditionalChinese: "用法：`/track [on|off|status]`",
-		LangJapanese:           "使い方: `/track [on|off|status]`",
-		LangSpanish:            "Uso: `/track [on|off|status]`",
+		LangEnglish:            "Usage: `/track [on|off|toggle|status]`",
+		LangChinese:            "用法：`/track [on|off|toggle|status]`",
+		LangTraditionalChinese: "用法：`/track [on|off|toggle|status]`",
+		LangJapanese:           "使い方: `/track [on|off|toggle|status]`",
+		LangSpanish:            "Uso: `/track [on|off|toggle|status]`",
 	},
 	MsgTrackNotSupported: {
 		LangEnglish:            "This agent does not support authoritative turn tracking.",

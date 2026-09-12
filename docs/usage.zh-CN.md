@@ -40,7 +40,7 @@ cc-connect 完整功能使用指南。
 | `/current` | 查看当前会话 |
 | `/history [n]` | 查看最近 n 个已结束 turn；Codex 以自身后端为唯一真值且要求 `admin_from`，单条长度受 `[display].history_max_len` 控制 |
 | `/track` | 刷新最新 Codex turn 卡片，但不改变持久镜像开关（要求 `admin_from`） |
-| `/track on` / `/track off` | 持久开启或关闭当前投递目标的外部 turn 镜像；默认开启 |
+| `/track on` / `/track off` / `/track toggle` | 持久开启、关闭或切换当前投递目标的外部 turn 镜像；默认开启 |
 | `/track status` | 查看有效开关、绑定/恢复状态以及精确 steer、中止和 queue 能力 |
 | `/usage` | 查看账号/模型限额使用情况 |
 | `/provider [...]` | 管理 API Provider |
@@ -60,7 +60,7 @@ cc-connect 完整功能使用指南。
 ```toml
 [projects.track]
 enabled = true
-default_enabled = true
+default_enabled = true       # 尚无 /track 持久覆盖时，新投递目标的默认状态
 notify = "on_finish"       # never | on_finish | on_failure
 shared_write = "observer_only"
 ```

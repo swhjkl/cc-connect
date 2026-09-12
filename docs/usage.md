@@ -39,7 +39,7 @@ Each user gets an independent session with full conversation context. Manage ses
 | `/current` | Show current session info |
 | `/history [n]` | Show completed turns (default 10). Codex reads its backend as the sole source of truth and requires `admin_from`; entries follow `[display].history_max_len` |
 | `/track` | Refresh the latest Codex turn card without changing the persistent mirror preference (`admin_from` required) |
-| `/track on` / `/track off` | Persistently enable or disable external-turn mirroring for this destination; it defaults to on |
+| `/track on` / `/track off` / `/track toggle` | Persistently enable, disable, or toggle external-turn mirroring for this destination; it defaults to on |
 | `/track status` | Show the effective preference, binding/recovery state, and exact steer/interrupt/queue capabilities |
 | `/usage` | Show account/model quota usage (if supported) |
 | `/provider [...]` | Manage API providers |
@@ -58,7 +58,7 @@ With a shared Codex app-server daemon, turns started from another TUI are mirror
 ```toml
 [projects.track]
 enabled = true
-default_enabled = true
+default_enabled = true       # default for destinations without a saved /track override
 notify = "on_finish"       # never | on_finish | on_failure
 shared_write = "observer_only"
 ```

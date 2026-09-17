@@ -645,6 +645,159 @@ func TestAgentGetConversationWindow_PagesUntilWatermark(t *testing.T) {
 	if covered {
 		t.Fatal("missing watermark unexpectedly reported covered")
 	}
+
+	for _, test := range []struct {
+		name      string
+		count     int
+		limit     int
+		watermark string
+		fallback  bool
+		complete  bool
+		covered   bool
+	}{
+		{name: "empty", limit: 10, complete: true},
+		{name: "short page", count: 9, limit: 10, complete: true},
+		{name: "exact page end", count: 10, limit: 10, complete: true},
+		{name: "capped page", count: 11, limit: 10},
+		{name: "final partial page", count: 11, limit: 11, complete: true},
+		{name: "multiple capped pages", count: 21, limit: 20},
+		{name: "reconciliation cap at history end", count: 256, limit: 256, complete: true},
+		{name: "reconciliation cap before history end", count: 257, limit: 256},
+		{name: "covered before end", count: 11, limit: 20, watermark: "turn-000", covered: true},
+		{name: "covered on capped page", count: 11, limit: 10, watermark: "turn-009", covered: true},
+		{name: "covered at history end", count: 11, limit: 11, watermark: "turn-010", covered: true, complete: true},
+		{name: "full fallback", count: 3, limit: 3, fallback: true, complete: true},
+		{name: "truncated fallback", count: 4, limit: 2, fallback: true},
+		{name: "covered truncated fallback", count: 4, limit: 2, fallback: true, watermark: "turn-000", covered: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			daemon := newFakeSharedAppServerDaemon(t)
+			cwd := t.TempDir()
+			turns := make([]map[string]any, test.count)
+			for i := range turns {
+				turns[i] = map[string]any{"id": fmt.Sprintf("turn-%03d", i), "status": "completed", "items": []any{}}
+			}
+			daemon.setConversation(cwd, "thread-coverage", "idle", nil, turns)
+			if test.fallback {
+				ascending := make([]map[string]any, len(turns))
+				for i := range turns {
+					ascending[i] = turns[len(turns)-1-i]
+				}
+				daemon.conversationReply = func(method string, raw json.RawMessage) (any, error) {
+					if method == "thread/turns/list" {
+						return nil, errors.New("method not found")
+					}
+					var params struct{ IncludeTurns bool }
+					if err := json.Unmarshal(raw, &params); err != nil {
+						return nil, err
+					}
+					if params.IncludeTurns {
+						return map[string]any{"thread": map[string]any{"id": "thread-coverage", "cwd": cwd, "turns": ascending}}, nil
+					}
+					return nil, nil
+				}
+			}
+			a := &Agent{backend: "app_server", appServerTransport: appServerTransportDaemon, appServerSocket: daemon.socketPath, workDir: cwd}
+			t.Cleanup(func() { _ = a.Stop() })
+			watermark := test.watermark
+			if watermark == "" {
+				watermark = "removed"
+			}
+			snapshot, covered, err := a.GetConversationWindow(context.Background(), "thread-coverage", watermark, test.limit)
+			if err != nil || snapshot == nil {
+				t.Fatalf("read = %#v, %v", snapshot, err)
+			}
+			if covered != test.covered || snapshot.HistoryComplete != test.complete {
+				t.Fatalf("covered=%v complete=%v, want %v/%v", covered, snapshot.HistoryComplete, test.covered, test.complete)
+			}
+			if len(snapshot.Turns) > test.limit {
+				t.Fatalf("limit exceeded: %d", len(snapshot.Turns))
+			}
+			for i := 1; i < len(snapshot.Turns); i++ {
+				if snapshot.Turns[i-1].ID <= snapshot.Turns[i].ID {
+					t.Fatalf("turns not oldest to newest: %#v", snapshot.Turns)
+				}
+			}
+		})
+	}
+
+	for _, scenario := range []string{"missing data", "duplicate turn", "blank turn", "missing items", "partial items", "missing cursor", "repeated cursor", "blank cursor", "empty page with cursor", "oversized page", "read failure", "fallback failure", "partial fallback", "cancelled response", "deadline during read"} {
+		t.Run(scenario, func(t *testing.T) {
+			daemon := newFakeSharedAppServerDaemon(t)
+			cwd := t.TempDir()
+			daemon.setConversation(cwd, "thread-invalid", "idle", nil, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			if scenario == "deadline during read" {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+			}
+			defer cancel()
+			calls := 0
+			daemon.conversationReply = func(method string, raw json.RawMessage) (any, error) {
+				if method == "thread/read" {
+					var params struct{ IncludeTurns bool }
+					if err := json.Unmarshal(raw, &params); err != nil {
+						return nil, err
+					}
+					if params.IncludeTurns {
+						if scenario == "partial fallback" {
+							return map[string]any{"thread": map[string]any{"id": "thread-invalid", "cwd": cwd, "turns": []any{
+								map[string]any{"id": "turn", "items": []any{}, "itemsView": "summary"},
+							}}}, nil
+						}
+						return nil, errors.New("fallback unavailable")
+					}
+					return nil, nil
+				}
+				calls++
+				turn := map[string]any{"id": fmt.Sprintf("turn-%d", calls), "status": "completed", "items": []any{}}
+				page := map[string]any{"data": []any{turn}, "nextCursor": nil}
+				switch scenario {
+				case "missing data":
+					delete(page, "data")
+				case "duplicate turn":
+					page["data"] = []any{turn, turn}
+				case "blank turn":
+					turn["id"] = " "
+				case "partial items":
+					turn["itemsView"] = "summary"
+				case "missing items":
+					delete(turn, "items")
+				case "missing cursor":
+					delete(page, "nextCursor")
+				case "repeated cursor":
+					page["nextCursor"] = "same"
+				case "blank cursor":
+					page["nextCursor"] = " "
+				case "empty page with cursor":
+					page["data"], page["nextCursor"] = []any{}, "next"
+				case "oversized page":
+					page["data"] = make([]any, 11)
+				case "read failure":
+					if calls > 1 {
+						return nil, errors.New("page unavailable")
+					}
+					page["nextCursor"] = "next"
+				case "fallback failure", "partial fallback":
+					return nil, errors.New("method not found")
+				case "cancelled response":
+					cancel()
+				case "deadline during read":
+					<-ctx.Done()
+				}
+				return page, nil
+			}
+			a := &Agent{backend: "app_server", appServerTransport: appServerTransportDaemon, appServerSocket: daemon.socketPath, workDir: cwd}
+			t.Cleanup(func() { _ = a.Stop() })
+			snapshot, covered, err := a.GetConversationWindow(ctx, "thread-invalid", "removed", 256)
+			if err == nil || snapshot != nil || covered {
+				t.Fatalf("invalid read accepted: snapshot=%#v covered=%v err=%v", snapshot, covered, err)
+			}
+			if scenario == "fallback failure" && !strings.Contains(err.Error(), "fallback unavailable") {
+				t.Fatalf("fallback error was lost: %v", err)
+			}
+		})
+	}
 }
 
 func TestReadAppServerConversation_RejectsOtherWorkspace(t *testing.T) {
@@ -656,7 +809,7 @@ func TestReadAppServerConversation_RejectsOtherWorkspace(t *testing.T) {
 	}
 	defer client.Close()
 
-	_, err = readAppServerConversation(client, "thread-other", t.TempDir(), 1)
+	_, err = readAppServerConversation(context.Background(), client, "thread-other", t.TempDir(), 1)
 	if err == nil || !strings.Contains(err.Error(), "refusing thread") {
 		t.Fatalf("workspace mismatch error = %v", err)
 	}

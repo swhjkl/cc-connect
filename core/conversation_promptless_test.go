@@ -26,7 +26,7 @@ func TestConversationMirror_TerminalPromptlessTurnDoesNotStall(t *testing.T) {
 		t.Run(string(status), func(t *testing.T) {
 			e, a, p, m, b := promptlessMirrorTest(t)
 			observed := ConversationTurn{ID: "observed", Status: ConversationTurnCompleted}
-			if err := e.trackStore.setInitialized(b.Destination, observed.ID, []string{observed.ID}); err != nil {
+			if err := e.trackStore.setInitialized(e.trackStore.binding(b.Destination), observed.ID, []string{observed.ID}); err != nil {
 				t.Fatal(err)
 			}
 			shell := ConversationTurn{ID: "shell", Status: status}
@@ -57,7 +57,7 @@ func TestConversationMirror_UnresolvedPromptlessTurnWaits(t *testing.T) {
 		for _, busy := range []bool{false, true} {
 			t.Run(string(status)+map[bool]string{false: "/idle", true: "/busy"}[busy], func(t *testing.T) {
 				e, a, p, m, b := promptlessMirrorTest(t)
-				if err := e.trackStore.setInitialized(b.Destination, "", nil); err != nil {
+				if err := e.trackStore.setInitialized(e.trackStore.binding(b.Destination), "", nil); err != nil {
 					t.Fatal(err)
 				}
 				s := e.sessions.GetOrCreateActive(b.SessionKey)
@@ -91,7 +91,7 @@ func TestConversationMirror_UnresolvedPromptlessTurnWaits(t *testing.T) {
 
 func TestConversationMirror_PromptlessObservationPersistenceFailure(t *testing.T) {
 	e, _, p, m, b := promptlessMirrorTest(t)
-	if err := e.trackStore.setInitialized(b.Destination, "before", []string{"before"}); err != nil {
+	if err := e.trackStore.setInitialized(e.trackStore.binding(b.Destination), "before", []string{"before"}); err != nil {
 		t.Fatal(err)
 	}
 	blocked := filepath.Join(t.TempDir(), "file")
@@ -100,7 +100,7 @@ func TestConversationMirror_PromptlessObservationPersistenceFailure(t *testing.T
 	}
 	e.trackStore.path = filepath.Join(blocked, "state.json")
 	turns := []ConversationTurn{{ID: "shell", Status: ConversationTurnCompleted}, {ID: "later", Status: ConversationTurnCompleted, Messages: []ConversationMessage{{Role: "user", Content: "later"}}}}
-	err := e.deliverConversationCandidates(e.ctx, m, b, &ConversationSnapshot{SessionID: b.ThreadID, Turns: turns}, turns, e.sessions, p)
+	err := e.deliverConversationCandidates(e.ctx, m, e.trackStore.binding(b.Destination), &ConversationSnapshot{SessionID: b.ThreadID, Turns: turns}, turns, e.sessions, p)
 	if err == nil {
 		t.Fatal("expected observation persistence error")
 	}
@@ -156,7 +156,7 @@ func TestConversationMirror_PromptlessTurnPreservesKnownSource(t *testing.T) {
 
 func TestTrackStore_ResetBaselinePreservesLastProcessedTurn(t *testing.T) {
 	e, _, _, _, b := promptlessMirrorTest(t)
-	if err := e.trackStore.markTurnObserved(b.Destination, "processed"); err != nil {
+	if err := e.trackStore.markTurnObserved(e.trackStore.binding(b.Destination), "processed"); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.trackStore.resetBaseline(b.Destination); err != nil {
@@ -166,7 +166,7 @@ func TestTrackStore_ResetBaselinePreservesLastProcessedTurn(t *testing.T) {
 	if got.Initialized || got.Watermark != "" || len(got.RecentTurnIDs) != 0 || got.LastTurnID != "processed" {
 		t.Fatalf("reset binding = %#v", got)
 	}
-	if err := e.trackStore.setInitialized(b.Destination, "baseline", []string{"baseline"}); err != nil {
+	if err := e.trackStore.setInitialized(e.trackStore.binding(b.Destination), "baseline", []string{"baseline"}); err != nil {
 		t.Fatal(err)
 	}
 	got = newTrackStateStore(e.trackStore.path).binding(b.Destination)

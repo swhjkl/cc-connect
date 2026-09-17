@@ -525,6 +525,9 @@ type ConversationSnapshot struct {
 	ActiveFlags []string
 	Turns       []ConversationTurn
 	RetrievedAt time.Time
+	// HistoryComplete proves Turns contains the entire authoritative history,
+	// without pagination limits or truncation. The default is conservative.
+	HistoryComplete bool
 }
 
 // ConversationProvider exposes an agent backend as the sole source of truth

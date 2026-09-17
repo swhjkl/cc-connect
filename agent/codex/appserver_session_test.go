@@ -1285,6 +1285,7 @@ type fakeSharedAppServerDaemon struct {
 	conversationFlags  []string
 	conversationTurns  map[string][]map[string]any
 	turnListLimits     []int
+	conversationReply  func(string, json.RawMessage) (any, error)
 	interrupts         chan appServerThreadIdentity
 	steers             chan fakeSharedAppServerSteer
 
@@ -1391,6 +1392,24 @@ func (c *fakeSharedAppServerClient) readLoop() {
 		if !hasID {
 			continue
 		}
+		if method == "thread/read" || method == "thread/turns/list" {
+			c.daemon.mu.Lock()
+			reply := c.daemon.conversationReply
+			c.daemon.mu.Unlock()
+			if reply != nil {
+				result, err := reply(method, message["params"])
+				if err != nil {
+					if writeErr := c.writeJSON(map[string]any{"id": rawID, "error": map[string]any{"code": -32000, "message": err.Error()}}); writeErr != nil {
+						c.daemon.reportError(writeErr)
+					}
+					continue
+				}
+				if result != nil {
+					c.writeResponse(rawID, result)
+					continue
+				}
+			}
+		}
 		switch method {
 		case "initialize":
 			c.writeResponse(rawID, map[string]any{"protocolVersion": "2"})
@@ -1444,7 +1463,7 @@ func (c *fakeSharedAppServerClient) readLoop() {
 			cwd := c.daemon.conversationCwd
 			status := c.daemon.conversationStatus
 			flags := append([]string(nil), c.daemon.conversationFlags...)
-			turns := append([]map[string]any(nil), c.daemon.conversationTurns[params.ThreadID]...)
+			turns := append([]map[string]any{}, c.daemon.conversationTurns[params.ThreadID]...)
 			c.daemon.mu.Unlock()
 			if status == "" {
 				status = "idle"
@@ -1471,7 +1490,7 @@ func (c *fakeSharedAppServerClient) readLoop() {
 			}
 			c.daemon.mu.Lock()
 			c.daemon.turnListLimits = append(c.daemon.turnListLimits, params.Limit)
-			turns := append([]map[string]any(nil), c.daemon.conversationTurns[params.ThreadID]...)
+			turns := append([]map[string]any{}, c.daemon.conversationTurns[params.ThreadID]...)
 			c.daemon.mu.Unlock()
 			start := 0
 			if params.Cursor != "" {

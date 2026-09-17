@@ -243,6 +243,9 @@ func (a *mirrorTestAgent) GetConversationWindow(_ context.Context, _ string, wat
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.reads++
+	if a.readErr != nil {
+		return nil, false, a.readErr
+	}
 	covered := watermark == ""
 	if a.snapshot != nil {
 		for _, turn := range a.snapshot.Turns {
@@ -624,7 +627,7 @@ func TestCmdTrack_RepairsPersistedTerminalPlanDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bindConversationMirror() error = %v", err)
 	}
-	if err := e.trackStore.setInitialized(binding.Destination, turn.ID, []string{turn.ID}); err != nil {
+	if err := e.trackStore.setInitialized(e.trackStore.binding(binding.Destination), turn.ID, []string{turn.ID}); err != nil {
 		t.Fatalf("setInitialized() error = %v", err)
 	}
 	delivery, _, err := e.trackStore.claimDelivery(binding, turn.ID, "primary", "external", "")

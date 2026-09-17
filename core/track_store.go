@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"time"
 )
+
+var errTrackBindingChanged = errors.New("track: destination binding changed")
 
 const (
 	trackStateVersion        = 1
@@ -364,12 +367,37 @@ func (s *trackStateStore) setOverride(destination, sessionKey, platform string, 
 	return cloneTrackBinding(binding), nil
 }
 
-func (s *trackStateStore) setInitialized(destination, watermark string, recent []string) error {
+func trackBindingIdentityMatches(current, expected *trackBindingState) bool {
+	return current != nil && expected != nil &&
+		current.Destination == expected.Destination && current.SessionKey == expected.SessionKey &&
+		current.Platform == expected.Platform && current.ThreadID == expected.ThreadID &&
+		current.Generation == expected.Generation
+}
+
+func trackCheckpointMatches(current, expected *trackBindingState) bool {
+	return trackBindingIdentityMatches(current, expected) && current.Watermark == expected.Watermark &&
+		current.Initialized == expected.Initialized && current.Override == expected.Override
+}
+
+// checkpointLocked guards read/modify/write operations against a stale history
+// read, including rebinding and an off/on baseline reset on the same thread.
+func (s *trackStateStore) checkpointLocked(expected *trackBindingState) (*trackBindingState, error) {
+	if expected == nil {
+		return nil, errTrackBindingChanged
+	}
+	binding := s.state.Bindings[expected.Destination]
+	if !trackCheckpointMatches(binding, expected) {
+		return nil, errTrackBindingChanged
+	}
+	return binding, nil
+}
+
+func (s *trackStateStore) setInitialized(expected *trackBindingState, watermark string, recent []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	binding := s.state.Bindings[destination]
-	if binding == nil {
-		return fmt.Errorf("track: destination binding not found")
+	binding, err := s.checkpointLocked(expected)
+	if err != nil {
+		return err
 	}
 	previous := cloneTrackPersistedState(s.state)
 	binding.Initialized = true
@@ -378,6 +406,15 @@ func (s *trackStateStore) setInitialized(destination, watermark string, recent [
 	binding.Gap = ""
 	binding.UpdatedAt = time.Now()
 	return s.commitLocked(previous)
+}
+
+func (s *trackStateStore) rewindWatermark(expected *trackBindingState, anchor string, recent []string) error {
+	if expected == nil || !expected.Initialized || expected.Watermark == "" || anchor == "" ||
+		len(recent) == 0 || recent[len(recent)-1] != anchor {
+		return fmt.Errorf("track: rollback requires an initialized checkpoint and surviving anchor")
+	}
+	// Baseline persistence already preserves LastTurnID and all delivery keys.
+	return s.setInitialized(expected, anchor, recent)
 }
 
 func (s *trackStateStore) resetBaseline(destination string) error {
@@ -398,31 +435,19 @@ func (s *trackStateStore) resetBaseline(destination string) error {
 	return s.commitLocked(previous)
 }
 
-func (s *trackStateStore) setGap(destination, gap string) error {
+func (s *trackStateStore) setGap(expected *trackBindingState, gap string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	binding := s.state.Bindings[destination]
-	if binding == nil {
-		return fmt.Errorf("track: destination binding not found")
+	binding, err := s.checkpointLocked(expected)
+	if err != nil {
+		return err
 	}
-	previous := cloneTrackPersistedState(s.state)
-	binding.Gap = strings.TrimSpace(gap)
-	binding.UpdatedAt = time.Now()
-	return s.commitLocked(previous)
-}
-
-func (s *trackStateStore) clearGap(destination string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	binding := s.state.Bindings[destination]
-	if binding == nil {
-		return fmt.Errorf("track: destination binding not found")
-	}
-	if binding.Gap == "" {
+	gap = strings.TrimSpace(gap)
+	if binding.Gap == gap {
 		return nil
 	}
 	previous := cloneTrackPersistedState(s.state)
-	binding.Gap = ""
+	binding.Gap = gap
 	binding.UpdatedAt = time.Now()
 	return s.commitLocked(previous)
 }
@@ -447,16 +472,16 @@ func boundedRecentTurnIDs(ids []string) []string {
 	return result
 }
 
-func (s *trackStateStore) markTurnObserved(destination, turnID string) error {
+func (s *trackStateStore) markTurnObserved(expected *trackBindingState, turnID string) error {
 	turnID = strings.TrimSpace(turnID)
 	if turnID == "" {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	binding := s.state.Bindings[destination]
-	if binding == nil {
-		return fmt.Errorf("track: destination binding not found")
+	binding, err := s.checkpointLocked(expected)
+	if err != nil {
+		return err
 	}
 	previous := cloneTrackPersistedState(s.state)
 	binding.LastTurnID = turnID
@@ -571,6 +596,9 @@ func (s *trackStateStore) claimDelivery(binding *trackBindingState, turnID, purp
 	key := trackDeliveryKey(binding.Destination, binding.ThreadID, turnID, purpose)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !trackBindingIdentityMatches(s.state.Bindings[binding.Destination], binding) {
+		return nil, false, errTrackBindingChanged
+	}
 	if existing := s.state.Deliveries[key]; existing != nil {
 		return cloneTrackDelivery(existing), false, nil
 	}

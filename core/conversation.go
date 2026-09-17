@@ -60,6 +60,12 @@ type conversationMirror struct {
 	lastVerifiedAt time.Time
 	firstFailureAt time.Time
 	lastSnapshot   *ConversationSnapshot
+	rollback       *conversationRollbackCandidate
+}
+
+type conversationRollbackCandidate struct {
+	binding *trackBindingState
+	turnIDs []string
 }
 
 type conversationElicitation struct {
@@ -976,12 +982,15 @@ func (e *Engine) updateConversationElicitationCard(p Platform, sessionKey string
 	e.updateResolvedAskQuestionCard(p, state.handle, sessionKey, state.question, answer, strings.TrimSpace(answer) == "")
 }
 
-func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conversationMirror, provider ConversationProvider, sessions *SessionManager, p Platform) error {
+func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conversationMirror, provider ConversationProvider, sessions *SessionManager, p Platform) (err error) {
 	mirror.mu.Lock()
 	var terminalQuestionCard conversationElicitationCardState
 	var terminalQuestionCardOK bool
 	var recoveredQuestion *conversationElicitation
 	defer func() {
+		if err != nil {
+			mirror.rollback = nil
+		}
 		mirror.mu.Unlock()
 		if terminalQuestionCardOK {
 			e.updateConversationElicitationCard(p, mirror.sessionKey, terminalQuestionCard, "")
@@ -992,12 +1001,12 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 	}()
 	binding := e.trackStore.binding(mirror.destination)
 	if binding == nil || binding.ThreadID != mirror.threadID || binding.Generation != mirror.generation || !e.effectiveTrackEnabled(binding) {
+		mirror.rollback = nil
 		return nil
 	}
 	readCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	coverageProven := true
 	var snapshot *ConversationSnapshot
-	var err error
 	if binding.Initialized && binding.Watermark != "" {
 		if windowProvider, ok := provider.(ConversationWindowProvider); ok {
 			snapshot, coverageProven, err = windowProvider.GetConversationWindow(readCtx, mirror.threadID, binding.Watermark, trackReconcileMaxTurns)
@@ -1007,6 +1016,9 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 	} else {
 		snapshot, err = provider.GetConversation(readCtx, mirror.threadID, trackRecentTurnLimit)
 	}
+	if err == nil {
+		err = readCtx.Err()
+	}
 	cancel()
 	if err != nil {
 		e.markConversationMirrorUnverifiedLocked(ctx, mirror, binding, p)
@@ -1015,6 +1027,9 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 	if snapshot == nil || snapshot.SessionID != mirror.threadID {
 		e.markConversationMirrorUnverifiedLocked(ctx, mirror, binding, p)
 		return fmt.Errorf("track: backend returned an unexpected conversation")
+	}
+	if err := e.checkConversationMirrorBinding(ctx, mirror, binding); err != nil {
+		return err
 	}
 	verifiedAt := snapshot.RetrievedAt
 	if verifiedAt.IsZero() {
@@ -1065,42 +1080,40 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 			mirror.pending = recoveredQuestion
 		}
 	}
-	if !coverageProven {
-		_ = e.trackStore.setGap(binding.Destination, "watermark_not_covered")
-		var active []ConversationTurn
-		for _, turn := range snapshot.Turns {
-			if delivery := e.trackStore.delivery(binding.Destination, binding.ThreadID, turn.ID, "primary"); delivery != nil && !delivery.Terminal {
-				active = append(active, turn)
-			}
-		}
-		return e.deliverConversationCandidates(ctx, mirror, binding, snapshot, active, sessions, p)
-	}
-	if err := e.trackStore.clearGap(binding.Destination); err != nil {
+	return e.reconcileConversationTurns(ctx, mirror, binding, snapshot, coverageProven, sessions, p)
+}
+
+func (e *Engine) reconcileConversationTurns(ctx context.Context, mirror *conversationMirror, binding *trackBindingState, snapshot *ConversationSnapshot, covered bool, sessions *SessionManager, p Platform) error {
+	if err := e.checkConversationMirrorBinding(ctx, mirror, binding); err != nil {
 		return err
 	}
-
 	turns := snapshot.Turns
-	var candidates []ConversationTurn
+	watermarkIndex := -1
 	if !binding.Initialized {
-		watermark := ""
+		mirror.rollback = nil
 		recent := make([]string, 0, len(turns))
-		for _, turn := range turns {
-			recent = append(recent, turn.ID)
+		watermark := ""
+		for i, turn := range turns {
 			if conversationTurnTerminal(turn.Status) || turn.Status == ConversationTurnUnknown {
+				recent = append(recent, turn.ID)
 				watermark = turn.ID
+				watermarkIndex = i
 			}
 		}
-		if err := e.trackStore.setInitialized(binding.Destination, watermark, recent); err != nil {
+		if err := e.trackStore.setInitialized(binding, watermark, recent); err != nil {
 			return err
 		}
 		binding = e.trackStore.binding(binding.Destination)
-		for _, turn := range turns {
+		// A live turn older than the baseline still needs a card, but must not
+		// move the checkpoint backwards or become an unprocessed anchor.
+		for _, turn := range turns[:watermarkIndex+1] {
 			if !conversationTurnTerminal(turn.Status) && turn.Status != ConversationTurnUnknown {
-				candidates = append(candidates, turn)
+				if _, err := e.deliverConversationTurn(ctx, mirror, binding, snapshot, turn, sessions, p); err != nil {
+					return err
+				}
 			}
 		}
 	} else {
-		watermarkIndex := -1
 		if binding.Watermark != "" {
 			for i := range turns {
 				if turns[i].ID == binding.Watermark {
@@ -1108,30 +1121,145 @@ func (e *Engine) reconcileConversationMirror(ctx context.Context, mirror *conver
 					break
 				}
 			}
-			if watermarkIndex < 0 {
-				_ = e.trackStore.setGap(binding.Destination, "watermark_not_covered")
-				// Existing active deliveries may still be safely refreshed, but do
-				// not advance across an unproven history gap.
-				for _, turn := range turns {
-					if delivery := e.trackStore.delivery(binding.Destination, binding.ThreadID, turn.ID, "primary"); delivery != nil && !delivery.Terminal {
-						candidates = append(candidates, turn)
-					}
-				}
-				return e.deliverConversationCandidates(ctx, mirror, binding, snapshot, candidates, sessions, p)
-			}
 		}
-		candidates = append(candidates, turns[watermarkIndex+1:]...)
-		for _, turn := range turns {
-			if delivery := e.trackStore.delivery(binding.Destination, binding.ThreadID, turn.ID, "primary"); delivery != nil && !delivery.Terminal && !containsConversationTurn(candidates, turn.ID) {
-				candidates = append(candidates, turn)
+		if binding.Watermark != "" && watermarkIndex < 0 {
+			var err error
+			watermarkIndex, err = e.recoverConversationWatermark(ctx, mirror, binding, snapshot)
+			if err != nil {
+				return err
+			}
+			if watermarkIndex < 0 {
+				return e.refreshConversationDeliveries(ctx, mirror, binding, snapshot, turns, sessions, p)
+			}
+			binding = e.trackStore.binding(binding.Destination)
+		} else if !covered {
+			mirror.rollback = nil
+			if err := e.setConversationMirrorGap(ctx, mirror, binding, "watermark_not_covered"); err != nil {
+				return err
+			}
+			return e.refreshConversationDeliveries(ctx, mirror, binding, snapshot, turns, sessions, p)
+		} else {
+			mirror.rollback = nil
+		}
+	}
+	if err := e.setConversationMirrorGap(ctx, mirror, binding, ""); err != nil {
+		return err
+	}
+	if err := e.refreshConversationDeliveries(ctx, mirror, binding, snapshot, turns[:watermarkIndex+1], sessions, p); err != nil {
+		return err
+	}
+	return e.deliverConversationCandidates(ctx, mirror, binding, snapshot, turns[watermarkIndex+1:], sessions, p)
+}
+
+func (e *Engine) checkConversationMirrorBinding(ctx context.Context, mirror *conversationMirror, binding *trackBindingState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if binding == nil || binding.Destination != mirror.destination || binding.SessionKey != mirror.sessionKey ||
+		binding.ThreadID != mirror.threadID || binding.Generation != mirror.generation {
+		return errTrackBindingChanged
+	}
+	current := e.trackStore.binding(binding.Destination)
+	if !trackCheckpointMatches(current, binding) || !e.effectiveTrackEnabled(current) {
+		return errTrackBindingChanged
+	}
+	return nil
+}
+
+func (e *Engine) setConversationMirrorGap(ctx context.Context, mirror *conversationMirror, binding *trackBindingState, gap string) error {
+	if err := e.checkConversationMirrorBinding(ctx, mirror, binding); err != nil {
+		return err
+	}
+	if err := e.trackStore.setGap(binding, gap); err != nil {
+		return err
+	}
+	if binding.Gap != gap {
+		slog.Info("track: mirror recovery state changed", "destination", binding.Destination,
+			"thread_id", binding.ThreadID, "watermark", binding.Watermark, "gap", gap)
+	}
+	return nil
+}
+
+func (e *Engine) refreshConversationDeliveries(ctx context.Context, mirror *conversationMirror, binding *trackBindingState, snapshot *ConversationSnapshot, turns []ConversationTurn, sessions *SessionManager, p Platform) error {
+	for _, turn := range turns {
+		if delivery := e.trackStore.delivery(binding.Destination, binding.ThreadID, turn.ID, "primary"); delivery != nil && !delivery.Terminal {
+			if _, err := e.deliverConversationTurn(ctx, mirror, binding, snapshot, turn, sessions, p); err != nil {
+				return err
 			}
 		}
 	}
-	return e.deliverConversationCandidates(ctx, mirror, binding, snapshot, candidates, sessions, p)
+	return nil
+}
+
+func (e *Engine) recoverConversationWatermark(ctx context.Context, mirror *conversationMirror, binding *trackBindingState, snapshot *ConversationSnapshot) (int, error) {
+	previous := mirror.rollback
+	mirror.rollback = nil
+	if !snapshot.HistoryComplete {
+		return -1, e.setConversationMirrorGap(ctx, mirror, binding, "watermark_not_covered")
+	}
+	// Legacy baselines also recorded live turns after the checkpoint. Those
+	// merely observed IDs are not evidence that their delivery was processed.
+	known := make(map[string]bool)
+	for i, id := range binding.RecentTurnIDs {
+		if id == binding.Watermark {
+			for _, acknowledged := range binding.RecentTurnIDs[:i+1] {
+				known[acknowledged] = true
+			}
+			break
+		}
+	}
+	ids := make([]string, 0, len(snapshot.Turns))
+	seen := make(map[string]bool)
+	var recent []string
+	anchor := -1
+	for i, turn := range snapshot.Turns {
+		if turn.ID == "" || seen[turn.ID] {
+			return -1, fmt.Errorf("track: invalid complete conversation history")
+		}
+		seen[turn.ID] = true
+		ids = append(ids, turn.ID)
+		if known[turn.ID] {
+			anchor = i
+			recent = append(recent, turn.ID)
+		}
+	}
+	if anchor < 0 {
+		return -1, e.setConversationMirrorGap(ctx, mirror, binding, "rollback_no_anchor")
+	}
+	// A stale synchronized prefix is insufficient. Recovery needs a replacement
+	// successor and a second complete read agreeing on the entire first prefix.
+	confirmed := anchor < len(ids)-1 && previous != nil && trackCheckpointMatches(previous.binding, binding) &&
+		len(previous.turnIDs) <= len(ids)
+	if confirmed {
+		for i, id := range previous.turnIDs {
+			if ids[i] != id {
+				confirmed = false
+				break
+			}
+		}
+	}
+	if !confirmed {
+		if anchor < len(ids)-1 {
+			mirror.rollback = &conversationRollbackCandidate{binding: binding, turnIDs: ids}
+		}
+		return -1, e.setConversationMirrorGap(ctx, mirror, binding, "rollback_pending")
+	}
+	if err := e.checkConversationMirrorBinding(ctx, mirror, binding); err != nil {
+		return -1, err
+	}
+	if err := e.trackStore.rewindWatermark(binding, ids[anchor], recent); err != nil {
+		return -1, err
+	}
+	slog.Info("track: recovered conversation rollback", "destination", binding.Destination,
+		"thread_id", binding.ThreadID, "old_watermark", binding.Watermark, "anchor", ids[anchor])
+	return anchor, nil
 }
 
 func (e *Engine) markConversationMirrorUnverifiedLocked(ctx context.Context, mirror *conversationMirror, binding *trackBindingState, p Platform) {
 	if mirror == nil || binding == nil {
+		return
+	}
+	if err := e.checkConversationMirrorBinding(ctx, mirror, binding); err != nil {
 		return
 	}
 	now := time.Now()
@@ -1158,15 +1286,6 @@ func (e *Engine) markConversationMirrorUnverifiedLocked(ctx context.Context, mir
 	}
 }
 
-func containsConversationTurn(turns []ConversationTurn, turnID string) bool {
-	for _, turn := range turns {
-		if turn.ID == turnID {
-			return true
-		}
-	}
-	return false
-}
-
 func (e *Engine) deliverConversationCandidates(ctx context.Context, mirror *conversationMirror, binding *trackBindingState, snapshot *ConversationSnapshot, turns []ConversationTurn, sessions *SessionManager, p Platform) error {
 	for _, turn := range turns {
 		if strings.TrimSpace(turn.ID) == "" {
@@ -1181,9 +1300,13 @@ func (e *Engine) deliverConversationCandidates(ctx context.Context, mirror *conv
 			// leave the watermark untouched until a later event/snapshot.
 			return nil
 		}
-		if err := e.trackStore.markTurnObserved(binding.Destination, turn.ID); err != nil {
+		if err := e.checkConversationMirrorBinding(ctx, mirror, binding); err != nil {
 			return err
 		}
+		if err := e.trackStore.markTurnObserved(binding, turn.ID); err != nil {
+			return err
+		}
+		binding = e.trackStore.binding(binding.Destination)
 	}
 	return nil
 }
@@ -1206,6 +1329,9 @@ func foregroundReservationMatchesBinding(reservation *trackForegroundReservation
 }
 
 func (e *Engine) deliverConversationTurn(ctx context.Context, mirror *conversationMirror, binding *trackBindingState, snapshot *ConversationSnapshot, turn ConversationTurn, sessions *SessionManager, p Platform) (bool, error) {
+	if err := e.checkConversationMirrorBinding(ctx, mirror, binding); err != nil {
+		return false, err
+	}
 	delivery := e.trackStore.delivery(binding.Destination, binding.ThreadID, turn.ID, "primary")
 	if delivery != nil && delivery.Source == "foreground" {
 		_, err := e.trackStore.setDeliveryRender(delivery.Key, "", string(turn.Status), conversationTurnTerminal(turn.Status) || turn.Status == ConversationTurnUnknown)
@@ -1244,6 +1370,9 @@ func (e *Engine) deliverConversationTurn(ctx context.Context, mirror *conversati
 		if err := e.trackStore.confirmForegroundTurn(clientID, binding.ThreadID, turn.ID); err != nil {
 			return false, err
 		}
+		if err := e.checkConversationMirrorBinding(ctx, mirror, binding); err != nil {
+			return false, err
+		}
 		claimed, _, err := e.trackStore.claimDelivery(binding, turn.ID, "primary", "foreground", clientID)
 		if err != nil {
 			return false, err
@@ -1257,6 +1386,9 @@ func (e *Engine) deliverConversationTurn(ctx context.Context, mirror *conversati
 		return false, nil
 	}
 	if delivery == nil {
+		if err := e.checkConversationMirrorBinding(ctx, mirror, binding); err != nil {
+			return false, err
+		}
 		var err error
 		delivery, _, err = e.trackStore.claimDelivery(binding, turn.ID, "primary", "external", clientID)
 		if err != nil {
@@ -2059,6 +2191,15 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 	}
 
 	e.cancelConversationTracker(interactiveKey)
+	destination, _ := mirrorDestinationKey(p, msg.SessionKey)
+	defer func() {
+		binding := e.trackStore.binding(destination)
+		if binding != nil && binding.ThreadID == sessionID {
+			if guidance := e.trackGapGuidance(binding); guidance != "" {
+				e.reply(p, msg.ReplyCtx, guidance)
+			}
+		}
+	}()
 	snapshot, err := provider.GetConversation(e.ctx, sessionID, 1)
 	if err != nil {
 		slog.Error("track: initial backend read failed", "session", sessionID, "error", err)
@@ -2070,7 +2211,6 @@ func (e *Engine) cmdTrack(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgTrackNoTurns))
 		return
 	}
-	destination, _ := mirrorDestinationKey(p, msg.SessionKey)
 	if card := e.turnCards.byTurn(p.Name(), msg.SessionKey, destination, sessionID, turn.ID); card != nil {
 		monitor := e.nativeTurnCardMonitor(card.Token)
 		if monitor == nil {
@@ -2342,7 +2482,26 @@ func (e *Engine) cmdTrackStatus(p Platform, msg *Message, args []string) {
 	report := e.i18n.Tf(MsgTrackStatusReport,
 		effective, defaultLabel, override, threadID, lastTurn, gap, realtime, pagedReconcile, clientMarker,
 		cardRecovery, exactSteer, daemonQueue, sharedWrite, exactInterrupt)
+	if guidance := e.trackGapGuidance(binding); guidance != "" {
+		report += "\n\n" + guidance
+	}
 	e.reply(p, msg.ReplyCtx, report)
+}
+
+func (e *Engine) trackGapGuidance(binding *trackBindingState) string {
+	if binding == nil || !e.effectiveTrackEnabled(binding) {
+		return ""
+	}
+	switch binding.Gap {
+	case "watermark_not_covered":
+		return e.i18n.T(MsgTrackGapIncomplete)
+	case "rollback_pending":
+		return e.i18n.T(MsgTrackGapPending)
+	case "rollback_no_anchor":
+		return e.i18n.T(MsgTrackGapNoAnchor)
+	default:
+		return ""
+	}
 }
 
 func capabilityLabel(available bool) string {

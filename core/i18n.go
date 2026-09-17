@@ -739,6 +739,9 @@ const (
 	MsgTrackProjectDisabled               MsgKey = "track_project_disabled"
 	MsgTrackDisabled                      MsgKey = "track_disabled"
 	MsgTrackStatusReport                  MsgKey = "track_status_report"
+	MsgTrackGapIncomplete                 MsgKey = "track_gap_incomplete"
+	MsgTrackGapPending                    MsgKey = "track_gap_pending"
+	MsgTrackGapNoAnchor                   MsgKey = "track_gap_no_anchor"
 	MsgTrackPersistFailed                 MsgKey = "track_persist_failed"
 	MsgTrackRefreshed                     MsgKey = "track_refreshed"
 	MsgTrackNativeCardSynced              MsgKey = "track_native_card_synced"
@@ -1808,6 +1811,27 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "**外部任務鏡像**\n目前生效：`%s`\n專案預設：`%s`\n手動覆寫：`%s`\nThread：`%s`\n最近 turn：`%s`\n復原缺口：`%s`\n即時事件：`%s`\n分頁對帳：`%s`\n用戶端標記：`%s`\n卡片復原：`%s`\n精確追加：`%s`\nDaemon 佇列：`%s`\n共用寫入策略：`%s`\n精確中止：`%s`",
 		LangJapanese:           "**外部ターンミラー**\n有効状態: `%s`\nプロジェクト既定値: `%s`\n上書き: `%s`\nThread: `%s`\n最新ターン: `%s`\n復旧ギャップ: `%s`\nリアルタイムイベント: `%s`\nページング照合: `%s`\nクライアントマーカー: `%s`\nカード復旧: `%s`\n厳密な steer: `%s`\nDaemon キュー: `%s`\n共有書き込み方針: `%s`\n厳密な中止: `%s`",
 		LangSpanish:            "**Reflejo de turnos externos**\nEfectivo: `%s`\nPredeterminado del proyecto: `%s`\nAnulación: `%s`\nThread: `%s`\nÚltimo turno: `%s`\nBrecha de recuperación: `%s`\nEventos en tiempo real: `%s`\nConciliación paginada: `%s`\nMarcador del cliente: `%s`\nRecuperación de tarjeta: `%s`\nSteer exacto: `%s`\nCola del daemon: `%s`\nPolítica de escritura compartida: `%s`\nInterrupción exacta: `%s`",
+	},
+	MsgTrackGapIncomplete: {
+		LangEnglish:            "External mirroring is paused: the synchronization checkpoint is outside the verified history window. Recovery will retry automatically. /track only refreshes a snapshot.",
+		LangChinese:            "外部任务镜像已暂停：同步检查点不在已验证的历史范围内。系统会自动重试恢复；/track 仅刷新快照。",
+		LangTraditionalChinese: "外部任務鏡像已暫停：同步檢查點不在已驗證的歷史範圍內。系統會自動重試復原；/track 僅重新整理快照。",
+		LangJapanese:           "外部ターンミラーを一時停止しています。同期チェックポイントが検証済みの履歴範囲外です。復旧は自動的に再試行されます。/track はスナップショットの更新のみを行います。",
+		LangSpanish:            "El reflejo externo está pausado: el punto de sincronización está fuera del historial verificado. La recuperación se reintentará automáticamente. /track solo actualiza una instantánea.",
+	},
+	MsgTrackGapPending: {
+		LangEnglish:            "External mirroring is paused while a possible history rollback is confirmed. Recovery will retry automatically; refreshing this card does not reset the checkpoint.",
+		LangChinese:            "外部任务镜像已暂停，正在确认历史是否发生回滚。系统会自动重试恢复；刷新此卡片不会重置同步检查点。",
+		LangTraditionalChinese: "外部任務鏡像已暫停，正在確認歷史是否發生回滾。系統會自動重試復原；重新整理此卡片不會重設同步檢查點。",
+		LangJapanese:           "履歴の巻き戻しを確認する間、外部ターンミラーを一時停止しています。復旧は自動的に再試行されます。このカードを更新してもチェックポイントはリセットされません。",
+		LangSpanish:            "El reflejo externo está pausado mientras se confirma una posible reversión del historial. La recuperación se reintentará automáticamente; actualizar esta tarjeta no restablece el punto de sincronización.",
+	},
+	MsgTrackGapNoAnchor: {
+		LangEnglish:            "External mirroring is paused because no safe synchronized turn survives in the returned history. Recovery will retry automatically. To start from current history, use /track off then /track on; completed turns missed during the gap will not be replayed.",
+		LangChinese:            "外部任务镜像已暂停：返回的历史中没有可安全续接的已同步 turn。系统会自动重试恢复。如需从当前历史重新开始，请先执行 /track off，再执行 /track on；缺口期间已完成的 turn 不会补发。",
+		LangTraditionalChinese: "外部任務鏡像已暫停：傳回的歷史中沒有可安全續接的已同步 turn。系統會自動重試復原。如需從目前歷史重新開始，請先執行 /track off，再執行 /track on；缺口期間已完成的 turn 不會補發。",
+		LangJapanese:           "取得した履歴に安全に再開できる同期済みターンがないため、外部ターンミラーを一時停止しています。復旧は自動的に再試行されます。現在の履歴から再開するには /track off、次に /track on を実行してください。欠落期間中に完了したターンは再送されません。",
+		LangSpanish:            "El reflejo externo está pausado porque no queda ningún turno sincronizado seguro en el historial recibido. La recuperación se reintentará automáticamente. Para empezar desde el historial actual, usa /track off y luego /track on; no se reenviarán los turnos completados durante la interrupción.",
 	},
 	MsgTrackPersistFailed: {
 		LangEnglish:            "❌ Failed to persist the mirror setting: %v",

@@ -1925,6 +1925,53 @@ func TestCUJ_I6_DefaultMirrorCardReplyLifecycle(t *testing.T) {
 	if cardCount != 2 || resultCount != 2 {
 		t.Fatalf("promptless sequence created duplicates: progress_cards=%d results=%d", cardCount, resultCount)
 	}
+
+	t.Run("rollback resumes external mirroring", func(t *testing.T) {
+		status := func(id string) string {
+			t.Helper()
+			p.clearSent()
+			e.ReceiveMessage(p, &Message{SessionKey: key, Platform: p.Name(), MessageID: id,
+				UserID: "admin", Content: "/track status", ReplyCtx: "ctx"})
+			return strings.Join(p.getSent(), "\n")
+		}
+		// Action 1: tracking is healthy before the user edits the last turn.
+		if got := status("i6-rollback-before"); !strings.Contains(got, "Recovery gap: `none`") {
+			t.Fatalf("initial status = %q", got)
+		}
+		replacement := rollbackTurn("replacement", ConversationTurnInProgress)
+		agent.setSnapshot(rollbackSnapshot(completed, shell, replacement))
+		agent.events <- Event{Type: EventTurnStarted, ThreadID: "thread-1", TurnID: replacement.ID}
+		// Action 2: status explains why the replacement is not delivered yet.
+		waitMirrorTest(t, "visible rollback confirmation", func() bool {
+			return strings.Contains(status("i6-rollback-pending"), "possible history rollback")
+		})
+		p.clearSent()
+		replacement.Status = ConversationTurnCompleted
+		agent.setSnapshot(rollbackSnapshot(completed, shell, replacement))
+		agent.events <- Event{Type: EventResult, ThreadID: "thread-1", TurnID: replacement.ID, Done: true}
+		waitMirrorTest(t, "automatic replacement result", func() bool {
+			return strings.Contains(strings.Join(p.getSent(), "\n"), "result replacement")
+		})
+		if got := strings.Count(strings.Join(p.getSent(), "\n"), "result replacement"); got != 1 {
+			t.Fatalf("replacement result delivered %d times", got)
+		}
+		// Action 3: recovery is visible without an off/on reset or manual replay.
+		if got := status("i6-rollback-after"); !strings.Contains(got, "Recovery gap: `none`") {
+			t.Fatalf("recovered status = %q", got)
+		}
+		next := rollbackTurn("after-rollback", ConversationTurnCompleted)
+		agent.setSnapshot(rollbackSnapshot(completed, shell, replacement, next))
+		agent.events <- Event{Type: EventResult, ThreadID: "thread-1", TurnID: next.ID, Done: true}
+		waitMirrorTest(t, "automatic later result", func() bool {
+			return strings.Contains(strings.Join(p.getSent(), "\n"), "result after-rollback")
+		})
+		p.trackMu.Lock()
+		cards, results := len(p.starts), len(p.notificationKey)
+		p.trackMu.Unlock()
+		if cards != 4 || results != 4 {
+			t.Fatalf("rollback created duplicates: cards=%d results=%d", cards, results)
+		}
+	})
 }
 
 // CUJ-I8 · A Feishu-originated Codex turn exposes controls only after the

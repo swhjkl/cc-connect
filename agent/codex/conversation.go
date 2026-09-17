@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,6 +39,7 @@ type appServerConversationTurn struct {
 	StartedAt   int64                       `json:"startedAt"`
 	CompletedAt int64                       `json:"completedAt"`
 	Items       []map[string]any            `json:"items"`
+	ItemsView   string                      `json:"itemsView"`
 	Error       *appServerConversationError `json:"error"`
 }
 
@@ -51,7 +53,7 @@ type appServerThreadReadResponse struct {
 
 type appServerTurnsListResponse struct {
 	Data       []appServerConversationTurn `json:"data"`
-	NextCursor *string                     `json:"nextCursor"`
+	NextCursor json.RawMessage             `json:"nextCursor"`
 }
 
 type appServerTurnSteerResponse struct {
@@ -99,7 +101,7 @@ func (a *Agent) GetConversation(ctx context.Context, sessionID string, limit int
 		return nil, err
 	}
 
-	snapshot, err := readAppServerConversation(client, sessionID, workDir, limit)
+	snapshot, err := readAppServerConversation(ctx, client, sessionID, workDir, limit)
 	if err != nil && !client.Alive() {
 		_ = client.Close()
 		a.conversationClient = nil
@@ -135,11 +137,14 @@ func (a *Agent) GetConversationWindow(ctx context.Context, sessionID, watermark 
 
 	a.conversationMu.Lock()
 	defer a.conversationMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	client, err := a.ensureConversationClientLocked(socket, codexHome, workDir, extraEnv)
 	if err != nil {
 		return nil, false, err
 	}
-	snapshot, covered, err := readAppServerConversationWindow(client, sessionID, workDir, watermark, maxTurns)
+	snapshot, covered, err := readAppServerConversationWindow(ctx, client, sessionID, workDir, watermark, maxTurns)
 	if err != nil && !client.Alive() {
 		_ = client.Close()
 		a.conversationClient = nil
@@ -247,7 +252,7 @@ func (a *Agent) SteerConversationTurn(ctx context.Context, sessionID, expectedTu
 		return err
 	}
 	defer client.Close()
-	if _, err := readAppServerConversation(client, sessionID, workDir, 1); err != nil {
+	if _, err := readAppServerConversation(ctx, client, sessionID, workDir, 1); err != nil {
 		return err
 	}
 	if err := client.bindReadOnlyThread(sessionID); err != nil {
@@ -361,7 +366,7 @@ func (a *Agent) openConversationObserver(ctx context.Context, sessionID string, 
 	client.observerInput = interactive
 	// Validate identity and workspace on this exact connection before allowing
 	// it to relay any notification to core.
-	if _, err := readAppServerConversation(client, sessionID, workDir, 1); err != nil {
+	if _, err := readAppServerConversation(ctx, client, sessionID, workDir, 1); err != nil {
 		_ = client.Close()
 		return nil, err
 	}
@@ -488,64 +493,60 @@ func newAppServerConversationClientWithOptions(socketPath, workDir string, event
 	return s, nil
 }
 
-func readAppServerConversation(client *appServerSession, sessionID, workDir string, limit int) (*core.ConversationSnapshot, error) {
-	snapshot, _, err := readAppServerConversationWindow(client, sessionID, workDir, "", limit)
+func readAppServerConversation(ctx context.Context, client *appServerSession, sessionID, workDir string, limit int) (*core.ConversationSnapshot, error) {
+	snapshot, _, err := readAppServerConversationWindow(ctx, client, sessionID, workDir, "", limit)
 	return snapshot, err
 }
 
-func readAppServerConversationWindow(client *appServerSession, sessionID, workDir, watermark string, maxTurns int) (*core.ConversationSnapshot, bool, error) {
+func readConversationRequest(ctx context.Context, client *appServerSession, method string, params any, out any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeout := appServerConversationReadTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = min(timeout, time.Until(deadline))
+		if timeout <= 0 {
+			return context.DeadlineExceeded
+		}
+	}
+	err := client.requestWithTimeout(method, params, out, timeout)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
+func validateConversationTurns(turns []appServerConversationTurn, seen map[string]bool) error {
+	if turns == nil {
+		return fmt.Errorf("codex: missing conversation turns")
+	}
+	for _, turn := range turns {
+		id := strings.TrimSpace(turn.ID)
+		if id == "" || seen[id] || turn.Items == nil || (turn.ItemsView != "" && turn.ItemsView != "full") {
+			return fmt.Errorf("codex: invalid or partial conversation turn %q", id)
+		}
+		seen[id] = true
+	}
+	return nil
+}
+
+func readAppServerConversationWindow(ctx context.Context, client *appServerSession, sessionID, workDir, watermark string, maxTurns int) (*core.ConversationSnapshot, bool, error) {
 	const defaultMaxTurns = 512
 	if maxTurns <= 0 {
 		maxTurns = defaultMaxTurns
 	}
 	watermark = strings.TrimSpace(watermark)
 	var readResp appServerThreadReadResponse
-	if err := client.requestWithTimeout("thread/read", map[string]any{
+	if err := readConversationRequest(ctx, client, "thread/read", map[string]any{
 		"threadId": sessionID, "includeTurns": false,
-	}, &readResp, appServerConversationReadTimeout); err != nil {
+	}, &readResp); err != nil {
 		return nil, false, fmt.Errorf("codex: read thread %q: %w", sessionID, err)
 	}
 	if err := validateConversationThread(readResp.Thread, sessionID, workDir); err != nil {
 		return nil, false, err
 	}
 
-	resultsDescending := true
-	covered := watermark == ""
-	var turnData []appServerConversationTurn
-	var cursor string
-	var turnsErr error
-	for len(turnData) < maxTurns {
-		remaining := maxTurns - len(turnData)
-		pageLimit := min(10, remaining)
-		params := map[string]any{
-			"threadId": sessionID, "sortDirection": "desc", "itemsView": "full", "limit": pageLimit,
-		}
-		if cursor != "" {
-			params["cursor"] = cursor
-		}
-		var page appServerTurnsListResponse
-		turnsErr = client.requestWithTimeout("thread/turns/list", params, &page, appServerConversationReadTimeout)
-		if turnsErr != nil {
-			break
-		}
-		turnData = append(turnData, page.Data...)
-		if watermark != "" {
-			for index, turn := range turnData {
-				if strings.TrimSpace(turn.ID) == watermark {
-					turnData = turnData[:index+1]
-					covered = true
-					break
-				}
-			}
-			if covered {
-				break
-			}
-		}
-		if page.NextCursor == nil || strings.TrimSpace(*page.NextCursor) == "" {
-			break
-		}
-		cursor = strings.TrimSpace(*page.NextCursor)
-	}
+	turnData, covered, historyComplete, turnsErr := readAppServerConversationPages(ctx, client, sessionID, watermark, maxTurns)
 	if turnsErr != nil {
 		// Older app-server versions do not expose thread/turns/list. In that
 		// case thread/read remains Codex's authoritative source.
@@ -553,17 +554,21 @@ func readAppServerConversationWindow(client *appServerSession, sessionID, workDi
 			return nil, false, fmt.Errorf("codex: list turns for %q: %w", sessionID, turnsErr)
 		}
 		var fullResp appServerThreadReadResponse
-		if fallbackErr := client.requestWithTimeout("thread/read", map[string]any{
+		if fallbackErr := readConversationRequest(ctx, client, "thread/read", map[string]any{
 			"threadId":     sessionID,
 			"includeTurns": true,
-		}, &fullResp, appServerConversationReadTimeout); fallbackErr != nil {
-			return nil, false, fmt.Errorf("codex: list turns for %q: %w", sessionID, turnsErr)
+		}, &fullResp); fallbackErr != nil {
+			return nil, false, fmt.Errorf("codex: read full thread %q: %w", sessionID, fallbackErr)
 		}
 		if err := validateConversationThread(fullResp.Thread, sessionID, workDir); err != nil {
 			return nil, false, err
 		}
 		readResp = fullResp
 		turnData = fullResp.Thread.Turns
+		if err := validateConversationTurns(turnData, make(map[string]bool)); err != nil {
+			return nil, false, err
+		}
+		historyComplete = len(turnData) <= maxTurns
 		if len(turnData) > maxTurns {
 			turnData = turnData[len(turnData)-maxTurns:]
 		}
@@ -574,26 +579,84 @@ func readAppServerConversationWindow(client *appServerSession, sessionID, workDi
 				break
 			}
 		}
-		resultsDescending = false
 	}
-
 	turns := make([]core.ConversationTurn, 0, len(turnData))
-	if resultsDescending {
-		for i := len(turnData) - 1; i >= 0; i-- {
-			turns = append(turns, mapAppServerConversationTurn(turnData[i]))
-		}
-	} else {
-		for _, turn := range turnData {
-			turns = append(turns, mapAppServerConversationTurn(turn))
-		}
+	for _, turn := range turnData {
+		turns = append(turns, mapAppServerConversationTurn(turn))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
 	}
 	return &core.ConversationSnapshot{
-		SessionID:   sessionID,
-		ThreadState: strings.TrimSpace(readResp.Thread.Status.Type),
-		ActiveFlags: append([]string(nil), readResp.Thread.Status.ActiveFlags...),
-		Turns:       turns,
-		RetrievedAt: time.Now(),
+		SessionID:       sessionID,
+		ThreadState:     strings.TrimSpace(readResp.Thread.Status.Type),
+		ActiveFlags:     append([]string(nil), readResp.Thread.Status.ActiveFlags...),
+		Turns:           turns,
+		RetrievedAt:     time.Now(),
+		HistoryComplete: historyComplete,
 	}, covered, nil
+}
+
+func readAppServerConversationPages(ctx context.Context, client *appServerSession, sessionID, watermark string, maxTurns int) ([]appServerConversationTurn, bool, bool, error) {
+	covered := watermark == ""
+	historyComplete := false
+	var turnData []appServerConversationTurn
+	var cursor string
+	seenTurns := make(map[string]bool)
+	seenCursors := make(map[string]bool)
+	for len(turnData) < maxTurns {
+		remaining := maxTurns - len(turnData)
+		pageLimit := min(10, remaining)
+		params := map[string]any{
+			"threadId": sessionID, "sortDirection": "desc", "itemsView": "full", "limit": pageLimit,
+		}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		var page appServerTurnsListResponse
+		if err := readConversationRequest(ctx, client, "thread/turns/list", params, &page); err != nil {
+			return nil, false, false, err
+		}
+		if len(page.Data) > pageLimit {
+			return nil, false, false, fmt.Errorf("codex: conversation page exceeds requested limit")
+		}
+		if err := validateConversationTurns(page.Data, seenTurns); err != nil {
+			return nil, false, false, err
+		}
+		// Missing nextCursor is not evidence that pagination reached its end.
+		var nextCursor *string
+		if err := json.Unmarshal(page.NextCursor, &nextCursor); err != nil {
+			return nil, false, false, fmt.Errorf("codex: invalid conversation pagination cursor: %w", err)
+		}
+		historyComplete = nextCursor == nil
+		if nextCursor != nil {
+			next := strings.TrimSpace(*nextCursor)
+			if next == "" || seenCursors[next] || len(page.Data) == 0 {
+				return nil, false, false, fmt.Errorf("codex: invalid conversation pagination cursor")
+			}
+			seenCursors[next] = true
+		}
+		turnData = append(turnData, page.Data...)
+		if watermark != "" {
+			for index, turn := range turnData {
+				if strings.TrimSpace(turn.ID) == watermark {
+					historyComplete = historyComplete && index+1 == len(turnData)
+					turnData = turnData[:index+1]
+					covered = true
+					break
+				}
+			}
+			if covered {
+				break
+			}
+		}
+		if nextCursor == nil {
+			break
+		}
+		cursor = strings.TrimSpace(*nextCursor)
+	}
+	slices.Reverse(turnData)
+	return turnData, covered, historyComplete, nil
 }
 
 func appServerMethodUnavailable(err error) bool {
